@@ -1,7 +1,17 @@
-# Sensitive inputs
+# Sensitive inputs and local-only documentation
+README.local.md
+template.json
+subscriptions.yaml
+config.json
+config.next.json
+nodes-report.json
 subscriptions/
 .subscription-cache/
 cache.clean.db
+
+# Public sanitized examples
+!template.example.json
+!subscriptions.example.yaml
 
 # Runtime output and local backups
 logs/
