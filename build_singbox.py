@@ -364,7 +364,7 @@ def load_subscription_manifest(path: Path, default_subscription_file: str) -> Li
     if not path.exists():
         return [
             {
-                "name": "mikasa机场",
+                "name": "example-provider",
                 "parser": "clash",
                 "source": "url_file",
                 "path": default_subscription_file,
@@ -961,9 +961,9 @@ def main() -> None:
     parser.add_argument("--subscriptions", default="subscriptions.yaml", help="订阅组清单，默认 subscriptions.yaml")
     parser.add_argument("--sub-url", default=None, help="兼容旧用法：单个 Clash 订阅链接")
     parser.add_argument("--sub-file", default=None, help="兼容旧用法：本地 Clash YAML 文件")
-    parser.add_argument("--sub-name", default="mikasa机场", help="兼容旧用法下的订阅组名称")
+    parser.add_argument("--sub-name", default="example-provider", help="兼容旧用法下的订阅组名称")
     parser.add_argument("--sub-parser", default="clash", help="兼容旧用法下的解析器，默认 clash")
-    parser.add_argument("--subscription-file", default="subscriptions/Provider-mikasa机场.txt", help="默认订阅链接文件")
+    parser.add_argument("--subscription-file", default="subscriptions/example-provider.txt", help="默认订阅链接文件")
     parser.add_argument("--template", default="template.json", help="模板文件路径")
     parser.add_argument("--output", default="config.json", help="输出文件路径")
     parser.add_argument("--report", default="nodes-report.json", help="节点报告输出路径，默认 nodes-report.json")
