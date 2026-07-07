@@ -1,0 +1,21 @@
+# Sensitive inputs
+subscriptions/
+.subscription-cache/
+cache.clean.db
+
+# Runtime output and local backups
+logs/
+backups/
+*.bak
+
+# Downloaded/runtime binaries and extracted release artifacts
+*.exe
+*.dll
+*.zip
+.downloads/
+dashboard/
+
+# Local Python/runtime files
+.venv/
+__pycache__/
+*.pyc

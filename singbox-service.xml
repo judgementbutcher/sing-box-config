@@ -1,0 +1,20 @@
+<service>
+  <id>sing-box</id>
+  <name>sing-box</name>
+  <description>sing-box 本地代理服务</description>
+
+  <executable>%BASE%\sing-box.exe</executable>
+  <arguments>run -c "%BASE%\config.json"</arguments>
+
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <stoptimeout>15sec</stoptimeout>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+</service>
