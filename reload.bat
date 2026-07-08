@@ -32,7 +32,7 @@ echo === [1/3] Generate config.json ===
 set "NEXT_CONFIG=config.next.json"
 set "CHECK_CONFIG=%NEXT_CONFIG%"
 del "%NEXT_CONFIG%" >nul 2>nul
-%PYTHON_RUN% build_singbox.py --template template.json --output "%NEXT_CONFIG%" --fetch-proxy http://127.0.0.1:7890 --discard-info-nodes
+%PYTHON_RUN% build_singbox.py --template templates\desktop-windows-sing-box-1.14.json --output "%NEXT_CONFIG%" --fetch-proxy http://127.0.0.1:7890 --keep-info-nodes
 
 if errorlevel 1 (
     echo.

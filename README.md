@@ -13,16 +13,19 @@ runtime configs, logs, caches, or local binaries.
 - `build_singbox.py`: generates a sing-box config from a template and a
   subscription manifest.
 - `parsers/`: parsers for common proxy subscription formats.
+- `templates/`: local sing-box templates named by platform/version.
 - `template.example.json`: sanitized sing-box template for public reference.
 - `subscriptions.example.yaml`: sanitized subscription manifest example.
 - `reload.bat`: local Windows helper for generating, checking, and restarting.
+- `build_android.bat`: local Windows helper for generating Android config.
 
 ## Local Files
 
 Create local private files from the examples:
 
 ```powershell
-Copy-Item .\template.example.json .\template.json
+New-Item -ItemType Directory -Force .\templates
+Copy-Item .\template.example.json .\templates\desktop-windows-sing-box-1.14.json
 Copy-Item .\subscriptions.example.yaml .\subscriptions.yaml
 ```
 
@@ -30,10 +33,13 @@ Local-only files are ignored by git:
 
 - `README.local.md`
 - `template.json`
+- `templates/*.json`
 - `subscriptions.yaml`
 - `config.json`
 - `config.next.json`
+- `config.*.json`
 - `nodes-report.json`
+- `nodes-report*.json`
 - `subscriptions/`
 - `.subscription-cache/`
 - `logs/`
@@ -48,13 +54,20 @@ subscription URLs, node credentials, custom domains, and other private data.
 Generate a config:
 
 ```powershell
-python .\build_singbox.py --template .\template.json --output .\config.json
+python .\build_singbox.py --output .\config.json
 ```
 
-Generate a config and keep subscription info entries in the `Info` selector:
+Without `--template`, the script lists `templates/*.json` and asks which
+template to use. To bypass the prompt, pass the template explicitly:
 
 ```powershell
-python .\build_singbox.py --template .\template.json --output .\config.json --keep-info-nodes
+python .\build_singbox.py --template .\templates\desktop-windows-sing-box-1.14.json --output .\config.json
+```
+
+Generate a config and keep subscription info entries in their provider groups:
+
+```powershell
+python .\build_singbox.py --template .\templates\desktop-windows-sing-box-1.14.json --output .\config.json --keep-info-nodes
 ```
 
 When the provider returns a `Subscription-Userinfo` response header, the
@@ -72,6 +85,28 @@ Use the reload helper on Windows:
 ```bat
 reload.bat
 ```
+
+`reload.bat` is pinned to `templates\desktop-windows-sing-box-1.14.json`
+because it checks and restarts the local Windows sing-box service.
+
+## Android
+
+The Android template is `templates\mobile-android-sing-box-1.13.14.json`.
+Generate a phone config on the PC:
+
+```bat
+build_android.bat
+```
+
+Manual equivalent:
+
+```powershell
+python .\build_singbox.py --template .\templates\mobile-android-sing-box-1.13.14.json --output .\config.android.json --report .\nodes-report.android.json --keep-info-nodes
+```
+
+Then import `config.android.json` into the Android sing-box app. The phone does
+not need to run this Python generator in normal use; rerun the generator on the
+PC when subscriptions or rules change, then replace the config on the phone.
 
 ## sing-box 1.14 Notes
 

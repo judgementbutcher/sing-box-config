@@ -43,6 +43,8 @@ configure_stdio()
 DEFAULT_MAX_NODES_PER_REGION = 0
 DEFAULT_MAX_OTHER_NODES = 0
 DEFAULT_SUBSCRIPTION_CACHE_DIR = ".subscription-cache"
+DEFAULT_TEMPLATE_DIR = "templates"
+LEGACY_TEMPLATE_PATH = "template.json"
 DEFAULT_KEEP_INFO_NODES = False
 HOME_NODE_KEYWORDS = ["家宽", "home", "residential"]
 COUNTRY_CODE_RE = re.compile(r"\b([A-Z]{2})\b")
@@ -333,6 +335,59 @@ def resolve_path(path: str, base_dir: Path) -> Path:
     if p.is_absolute():
         return p
     return base_dir / p
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        return str(path)
+
+
+def discover_templates(template_dir: Path) -> List[Path]:
+    if not template_dir.exists() or not template_dir.is_dir():
+        return []
+    return sorted(
+        [path for path in template_dir.glob("*.json") if path.is_file()],
+        key=lambda path: path.name.lower(),
+    )
+
+
+def print_template_choices(templates: List[Path]) -> None:
+    print("可用模板:")
+    for index, template_path in enumerate(templates, start=1):
+        print(f"  {index}. {display_path(template_path)}")
+
+
+def choose_template_interactively(template_dir: Path) -> Path:
+    templates = discover_templates(template_dir)
+    if not templates:
+        legacy_path = Path(LEGACY_TEMPLATE_PATH)
+        if legacy_path.exists():
+            print(f"[WARN] 未找到 {display_path(template_dir)}/*.json，退回使用 {display_path(legacy_path)}")
+            return legacy_path
+        raise FileNotFoundError(f"未找到模板文件。请在 {display_path(template_dir)} 放入 *.json 模板")
+
+    print_template_choices(templates)
+    if len(templates) == 1:
+        print(f"只有 1 个模板，默认使用: {display_path(templates[0])}")
+        return templates[0]
+
+    default_index = 1
+    while True:
+        try:
+            choice = input(f"请选择模板编号 [默认 {default_index}]: ").strip()
+        except EOFError:
+            print(f"\n[WARN] 未读取到输入，默认使用第 {default_index} 个模板。")
+            return templates[default_index - 1]
+
+        if not choice:
+            return templates[default_index - 1]
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(templates):
+                return templates[index - 1]
+        print(f"无效选择: {choice}")
 
 
 def make_unique_tag(base_tag: str, used: Set[str]) -> str:
@@ -802,6 +857,7 @@ def build_provider_group(
     control_outbounds: List[Dict[str, Any]] = []
     if parse_bool(item.get("flat_group", item.get("flat")), default=False):
         node_tags = [node["tag"] for node in selected_nodes]
+        info_tags = [info["tag"] for info in active_info_outbounds]
         if parse_bool(item.get("urltest", item.get("auto_select")), default=False):
             urltest_url = str(
                 item.get("urltest_url")
@@ -810,17 +866,32 @@ def build_provider_group(
             ).strip()
             urltest_interval = str(item.get("urltest_interval") or "3m").strip()
             urltest_tolerance = parse_priority(item.get("urltest_tolerance"), default=50)
-            control_outbounds.append(
-                build_urltest(
-                    provider_tag,
-                    node_tags,
-                    url=urltest_url,
-                    interval=urltest_interval,
-                    tolerance=urltest_tolerance,
+            if info_tags:
+                auto_tag = make_unique_tag(f"{provider_tag}/Auto", used_tags)
+                control_outbounds.append(
+                    build_selector(provider_tag, info_tags + [auto_tag] + node_tags + ["direct"], default=auto_tag)
                 )
-            )
+                control_outbounds.append(
+                    build_urltest(
+                        auto_tag,
+                        node_tags,
+                        url=urltest_url,
+                        interval=urltest_interval,
+                        tolerance=urltest_tolerance,
+                    )
+                )
+            else:
+                control_outbounds.append(
+                    build_urltest(
+                        provider_tag,
+                        node_tags,
+                        url=urltest_url,
+                        interval=urltest_interval,
+                        tolerance=urltest_tolerance,
+                    )
+                )
         else:
-            control_outbounds.append(build_selector(provider_tag, node_tags + ["direct"], default=node_tags[0]))
+            control_outbounds.append(build_selector(provider_tag, info_tags + node_tags + ["direct"], default=node_tags[0]))
         return {
             "name": name,
             "role": str(item.get("role") or "default"),
@@ -850,7 +921,8 @@ def build_provider_group(
         region_selector_tags[region]
         for region in ALL_REGIONS
         if region in region_selector_tags
-    ] + ["direct"]
+    ]
+    provider_choices = [info["tag"] for info in active_info_outbounds] + provider_choices + ["direct"]
     provider_default = choose_default(
         provider_choices,
         [
@@ -1014,12 +1086,6 @@ def build_config_from_subscriptions(
             if outbound_region(node_ob) == "US":
                 append_unique(ai_groups, str(node_ob["tag"]))
 
-    info_tags = [
-        info_ob["tag"]
-        for group in built_groups
-        for info_ob in group["info_outbounds"]
-    ]
-
     outbounds: List[Dict[str, Any]] = []
     available_default = provider_default
     outbounds.append(build_selector("Available", available_choices, default=available_default))
@@ -1040,8 +1106,6 @@ def build_config_from_subscriptions(
         )
         outbounds.append(build_selector("Public", public_choices, default=public_default))
     outbounds.append(build_selector("Provider", provider_groups + ["direct"], default=provider_default))
-    if info_tags:
-        outbounds.append(build_selector("Info", info_tags, default=info_tags[0]))
 
     outbounds.extend(public_control_outbounds)
     for group in built_groups:
@@ -1155,6 +1219,8 @@ def get_clash_ui_url(conf: Dict[str, Any]) -> Optional[str]:
         conf.get("experimental", {})
         .get("clash_api", {})
     )
+    if not str(clash_api.get("external_ui") or "").strip():
+        return None
     controller = str(clash_api.get("external_controller") or "").strip()
     if not controller:
         return None
@@ -1197,7 +1263,10 @@ def print_config_summary(
         print(f"主分组: {', '.join(main_selectors)}")
     if ui_url:
         print(f"面板: {ui_url}")
-    print(f"下一步: .\\sing-box.exe check -c {output_path}，通过后运行 .\\singbox-service.exe restart")
+    if "android" in template_path.name.lower():
+        print(f"下一步: 将 {output_path} 导入 Android sing-box；本机可先运行 .\\sing-box.exe check -c {output_path} 做基础校验")
+    else:
+        print(f"下一步: .\\sing-box.exe check -c {output_path}，通过后运行 .\\singbox-service.exe restart")
 
 
 def main() -> None:
@@ -1208,7 +1277,9 @@ def main() -> None:
     parser.add_argument("--sub-name", default="example-provider", help="兼容旧用法下的订阅组名称")
     parser.add_argument("--sub-parser", default="clash", help="兼容旧用法下的解析器，默认 clash")
     parser.add_argument("--subscription-file", default="subscriptions/example-provider.txt", help="默认订阅链接文件")
-    parser.add_argument("--template", default="template.json", help="模板文件路径")
+    parser.add_argument("--template", default=None, help="模板文件路径；未指定时从 templates/ 交互选择")
+    parser.add_argument("--template-dir", default=DEFAULT_TEMPLATE_DIR, help="模板目录，默认 templates")
+    parser.add_argument("--list-templates", action="store_true", help="列出可用模板后退出")
     parser.add_argument("--output", default="config.json", help="输出文件路径")
     parser.add_argument("--report", default="nodes-report.json", help="节点报告输出路径，默认 nodes-report.json")
     parser.add_argument("--no-report", action="store_true", help="不生成节点报告")
@@ -1246,6 +1317,14 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.list_templates:
+        templates = discover_templates(Path(args.template_dir))
+        if templates:
+            print_template_choices(templates)
+        else:
+            print(f"未找到模板文件: {Path(args.template_dir)}/*.json")
+        return
+
     if args.max_nodes_per_region < 0:
         print("--max-nodes-per-region 必须 >= 0", file=sys.stderr)
         sys.exit(1)
@@ -1254,7 +1333,7 @@ def main() -> None:
         print("--max-other-nodes 必须 >= 0", file=sys.stderr)
         sys.exit(1)
 
-    template_path = Path(args.template)
+    template_path = Path(args.template) if args.template else choose_template_interactively(Path(args.template_dir))
     if not template_path.exists():
         print(f"模板文件不存在: {template_path}", file=sys.stderr)
         sys.exit(1)

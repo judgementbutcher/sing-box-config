@@ -1,10 +1,14 @@
 # Sensitive inputs and local-only documentation
 README.local.md
 template.json
+templates/*.json
+!templates/*.example.json
 subscriptions.yaml
 config.json
 config.next.json
+config.*.json
 nodes-report.json
+nodes-report*.json
 subscriptions/
 .subscription-cache/
 cache.clean.db
