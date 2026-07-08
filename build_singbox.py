@@ -7,6 +7,8 @@ import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -45,6 +47,20 @@ DEFAULT_KEEP_INFO_NODES = False
 HOME_NODE_KEYWORDS = ["家宽", "home", "residential"]
 COUNTRY_CODE_RE = re.compile(r"\b([A-Z]{2})\b")
 NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "block", "dns"}
+SUBSCRIPTION_USERINFO_HEADER = "Subscription-Userinfo"
+PROFILE_HEADER_MAP = {
+    "profile_update_interval": "Profile-Update-Interval",
+    "profile_web_page_url": "Profile-Web-Page-Url",
+    "support_url": "Support-Url",
+    "profile_title": "Profile-Title",
+}
+
+
+@dataclass
+class SubscriptionContent:
+    text: str
+    userinfo: Dict[str, Any]
+    from_cache: bool = False
 
 
 def load_json(path: str) -> Dict[str, Any]:
@@ -62,22 +78,157 @@ def load_yaml(path: str) -> Any:
         return yaml.safe_load(f)
 
 
+def parse_header_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        pass
+    try:
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    amount = float(max(value, 0))
+    unit = units[0]
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            break
+        amount /= 1024
+    if unit == "B":
+        return f"{int(amount)} {unit}"
+    return f"{amount:.2f} {unit}"
+
+
+def format_expire_timestamp(expire: int) -> Dict[str, Any]:
+    if expire <= 0:
+        return {}
+    utc_dt = datetime.fromtimestamp(expire, timezone.utc)
+    local_dt = utc_dt.astimezone()
+    now = datetime.now(timezone.utc)
+    return {
+        "expires_at": local_dt.isoformat(timespec="seconds"),
+        "expires_at_utc": utc_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "expires_at_display": local_dt.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "days_remaining": round((utc_dt - now).total_seconds() / 86400, 2),
+    }
+
+
+def parse_subscription_userinfo(header_value: Optional[str]) -> Dict[str, Any]:
+    raw_header = str(header_value or "").strip()
+    if not raw_header:
+        return {}
+
+    raw_fields: Dict[str, str] = {}
+    numeric_fields: Dict[str, int] = {}
+    for part in raw_header.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if not key:
+            continue
+        raw_fields[key] = value
+        parsed_value = parse_header_int(value)
+        if parsed_value is not None:
+            numeric_fields[key] = parsed_value
+
+    info: Dict[str, Any] = {
+        "raw": raw_header,
+        "fields": raw_fields,
+    }
+    for key in ("upload", "download", "total", "expire"):
+        if key in numeric_fields:
+            info[key] = numeric_fields[key]
+
+    upload = info.get("upload")
+    download = info.get("download")
+    if upload is not None or download is not None:
+        used = int(upload or 0) + int(download or 0)
+        info["used"] = used
+        info["used_human"] = format_bytes(used)
+
+    for key in ("upload", "download", "total"):
+        if key in info:
+            info[f"{key}_human"] = format_bytes(int(info[key]))
+
+    total = info.get("total")
+    used = info.get("used")
+    if total is not None and used is not None:
+        remaining = max(int(total) - int(used), 0)
+        info["remaining"] = remaining
+        info["remaining_human"] = format_bytes(remaining)
+        if int(total) > 0:
+            info["used_percent"] = round(int(used) * 100 / int(total), 2)
+
+    expire = info.get("expire")
+    if expire is not None:
+        info.update(format_expire_timestamp(int(expire)))
+
+    return info
+
+
+def subscription_metadata_from_headers(headers: Any) -> Dict[str, Any]:
+    info = parse_subscription_userinfo(headers.get(SUBSCRIPTION_USERINFO_HEADER))
+    for field_name, header_name in PROFILE_HEADER_MAP.items():
+        value = headers.get(header_name)
+        if value is None or str(value).strip() == "":
+            continue
+        if field_name == "profile_update_interval":
+            parsed_value = parse_header_int(value)
+            info[field_name] = parsed_value if parsed_value is not None else str(value).strip()
+        else:
+            info[field_name] = str(value).strip()
+    return info
+
+
+def subscription_request_headers(user_agent: Optional[str] = None) -> Dict[str, str]:
+    return {
+        "Accept": "text/yaml,text/plain,application/x-yaml,application/octet-stream,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+        "User-Agent": user_agent or "clash-verge/v2.4.7",
+    }
+
+
+def fetch_subscription_content(
+    url: str,
+    timeout: int = 30,
+    user_agent: Optional[str] = None,
+    fetch_proxy: Optional[str] = None,
+) -> SubscriptionContent:
+    headers = subscription_request_headers(user_agent)
+    proxies = {"http": fetch_proxy, "https": fetch_proxy} if fetch_proxy else None
+    r = requests.get(url, headers=headers, timeout=timeout, proxies=proxies)
+    r.raise_for_status()
+    return SubscriptionContent(
+        text=r.text,
+        userinfo=subscription_metadata_from_headers(r.headers),
+        from_cache=False,
+    )
+
+
 def fetch_text(
     url: str,
     timeout: int = 30,
     user_agent: Optional[str] = None,
     fetch_proxy: Optional[str] = None,
 ) -> str:
-    headers = {
-        "Accept": "text/yaml,text/plain,application/x-yaml,application/octet-stream,*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "User-Agent": user_agent or "clash-verge/v2.4.7",
-    }
-    proxies = {"http": fetch_proxy, "https": fetch_proxy} if fetch_proxy else None
-    r = requests.get(url, headers=headers, timeout=timeout, proxies=proxies)
-    r.raise_for_status()
-    return r.text
+    content = fetch_subscription_content(
+        url,
+        timeout=timeout,
+        user_agent=user_agent,
+        fetch_proxy=fetch_proxy,
+    )
+    return content.text
 
 
 def subscription_cache_path(cache_dir: Path, url: str) -> Path:
@@ -85,23 +236,55 @@ def subscription_cache_path(cache_dir: Path, url: str) -> Path:
     return cache_dir / f"{digest}.txt"
 
 
-def read_cached_subscription(cache_path: Path) -> Optional[str]:
+def subscription_cache_meta_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(".json")
+
+
+def read_cached_subscription_userinfo(cache_path: Path) -> Dict[str, Any]:
+    meta_path = subscription_cache_meta_path(cache_path)
+    try:
+        if not meta_path.exists() or not meta_path.is_file():
+            return {}
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        userinfo = data.get("subscription_userinfo")
+        return userinfo if isinstance(userinfo, dict) else {}
+    except Exception as e:
+        print(f"[WARN] 读取订阅缓存元数据失败 {meta_path}: {e}", file=sys.stderr)
+    return {}
+
+
+def read_cached_subscription(cache_path: Path) -> Optional[SubscriptionContent]:
     try:
         if cache_path.exists() and cache_path.is_file():
             text = cache_path.read_text(encoding="utf-8")
             if text.strip():
-                return text
+                return SubscriptionContent(
+                    text=text,
+                    userinfo=read_cached_subscription_userinfo(cache_path),
+                    from_cache=True,
+                )
     except Exception as e:
         print(f"[WARN] 读取订阅缓存失败 {cache_path}: {e}", file=sys.stderr)
     return None
 
 
-def write_cached_subscription(cache_path: Path, text: str) -> None:
-    if not text.strip():
+def write_cached_subscription(cache_path: Path, content: SubscriptionContent) -> None:
+    if not content.text.strip():
         return
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(text, encoding="utf-8")
+        cache_path.write_text(content.text, encoding="utf-8")
+        meta_path = subscription_cache_meta_path(cache_path)
+        meta_path.write_text(
+            json.dumps(
+                {"subscription_userinfo": content.userinfo or {}},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     except Exception as e:
         print(f"[WARN] 写入订阅缓存失败 {cache_path}: {e}", file=sys.stderr)
 
@@ -112,11 +295,11 @@ def fetch_text_with_cache(
     label: str,
     user_agent: Optional[str] = None,
     fetch_proxy: Optional[str] = None,
-) -> str:
+) -> SubscriptionContent:
     cache_path = subscription_cache_path(cache_dir, url) if cache_dir else None
     try:
-        text = fetch_text(url, user_agent=user_agent, fetch_proxy=fetch_proxy)
-        if not text.strip():
+        content = fetch_subscription_content(url, user_agent=user_agent, fetch_proxy=fetch_proxy)
+        if not content.text.strip():
             raise ValueError("订阅下载结果为空")
     except Exception as e:
         if cache_path:
@@ -127,8 +310,8 @@ def fetch_text_with_cache(
         raise
 
     if cache_path:
-        write_cached_subscription(cache_path, text)
-    return text
+        write_cached_subscription(cache_path, content)
+    return content
 
 
 def read_text(path: Path) -> str:
@@ -213,6 +396,46 @@ def retag_outbound(outbound: Dict[str, Any], tag_prefix: str, used_tags: Set[str
 
 def outbound_name(outbound: Dict[str, Any]) -> str:
     return str(outbound.get("_meta_name") or outbound.get("tag") or "").strip()
+
+
+def build_info_outbound(name: str) -> Dict[str, Any]:
+    return {
+        "type": "block",
+        "tag": name,
+        "_meta_name": name,
+        "_meta_info": True,
+    }
+
+
+def subscription_userinfo_summary(name: str, userinfo: Dict[str, Any]) -> str:
+    parts = [f"{name} 订阅信息"]
+    used_human = userinfo.get("used_human")
+    total_human = userinfo.get("total_human")
+    remaining_human = userinfo.get("remaining_human")
+
+    if used_human and total_human:
+        parts.append(f"流量 {used_human}/{total_human}")
+    elif used_human:
+        parts.append(f"已用 {used_human}")
+    elif total_human:
+        parts.append(f"总量 {total_human}")
+
+    if remaining_human:
+        parts.append(f"剩余 {remaining_human}")
+    if userinfo.get("used_percent") is not None:
+        parts.append(f"已用 {userinfo['used_percent']}%")
+    if userinfo.get("expires_at_display"):
+        parts.append(f"到期 {userinfo['expires_at_display']}")
+    elif userinfo.get("expire") == 0:
+        parts.append("到期 长期有效")
+
+    return re.sub(r"\s+", " ", " | ".join(parts)).strip()
+
+
+def build_subscription_userinfo_outbound(name: str, userinfo: Dict[str, Any]) -> Dict[str, Any]:
+    outbound = build_info_outbound(subscription_userinfo_summary(name, userinfo))
+    outbound["_meta_subscription_userinfo"] = userinfo
+    return outbound
 
 
 def is_home_node(outbound: Dict[str, Any]) -> bool:
@@ -453,6 +676,17 @@ def make_single_subscription_from_args(args: argparse.Namespace) -> Optional[Lis
     return None
 
 
+def attach_subscription_content(item: Dict[str, Any], content: SubscriptionContent) -> str:
+    if content.userinfo:
+        item["_subscription_userinfo"] = {
+            **content.userinfo,
+            "fetched_from": "cache" if content.from_cache else "remote",
+        }
+    else:
+        item.pop("_subscription_userinfo", None)
+    return content.text
+
+
 def load_source_text(
     item: Dict[str, Any],
     base_dir: Path,
@@ -467,19 +701,22 @@ def load_source_text(
         url = str(item.get("url") or "").strip()
         if not url:
             raise ValueError(f"订阅组 {item['name']} 缺少 url")
-        return fetch_text_with_cache(url, cache_dir, name, user_agent=user_agent, fetch_proxy=fetch_proxy)
+        content = fetch_text_with_cache(url, cache_dir, name, user_agent=user_agent, fetch_proxy=fetch_proxy)
+        return attach_subscription_content(item, content)
 
     if source == "url_file":
         path = str(item.get("path") or "").strip()
         if not path:
             raise ValueError(f"订阅组 {item['name']} 缺少 path")
         url = read_subscription_url(resolve_path(path, base_dir))
-        return fetch_text_with_cache(url, cache_dir, name, user_agent=user_agent, fetch_proxy=fetch_proxy)
+        content = fetch_text_with_cache(url, cache_dir, name, user_agent=user_agent, fetch_proxy=fetch_proxy)
+        return attach_subscription_content(item, content)
 
     if source == "file":
         path = str(item.get("path") or "").strip()
         if not path:
             raise ValueError(f"订阅组 {item['name']} 缺少 path")
+        item.pop("_subscription_userinfo", None)
         return read_text(resolve_path(path, base_dir))
 
     raise ValueError(f"订阅组 {item['name']} 的 source 不支持: {source}")
@@ -534,6 +771,9 @@ def build_provider_group(
     )
     include_in_available = parse_bool(item.get("include_in_available", item.get("available")), default=False)
     include_in_selectors = parse_string_list(item.get("include_in_selectors"))
+    active_info_outbounds: List[Dict[str, Any]] = []
+    if keep_info_nodes and info_outbounds:
+        active_info_outbounds = [retag_outbound(ob, provider_tag, used_tags) for ob in info_outbounds]
 
     grouped: Dict[str, List[Dict[str, Any]]] = {region: [] for region in ALL_REGIONS}
     for ob in node_outbounds:
@@ -590,7 +830,7 @@ def build_provider_group(
             "region_selector_tags": region_selector_tags,
             "control_outbounds": control_outbounds,
             "node_outbounds": selected_nodes,
-            "info_outbounds": [],
+            "info_outbounds": active_info_outbounds,
             "include_in_available": include_in_available,
             "include_in_selectors": include_in_selectors,
             "region_counts": {region: len(grouped.get(region, [])) for region in ALL_REGIONS},
@@ -620,10 +860,6 @@ def build_provider_group(
         ] + ["direct"],
     )
     control_outbounds.insert(0, build_selector(provider_tag, provider_choices, default=provider_default))
-
-    active_info_outbounds: List[Dict[str, Any]] = []
-    if keep_info_nodes and info_outbounds:
-        active_info_outbounds = [retag_outbound(ob, provider_tag, used_tags) for ob in info_outbounds]
 
     return {
         "name": name,
@@ -702,6 +938,10 @@ def build_config_from_subscriptions(
 
         for warning in warnings:
             print(f"[WARN] {name}: {warning}", file=sys.stderr)
+
+        subscription_userinfo = item.get("_subscription_userinfo")
+        if isinstance(subscription_userinfo, dict) and subscription_userinfo:
+            info_outbounds.append(build_subscription_userinfo_outbound(name, subscription_userinfo))
 
         if not node_outbounds:
             raise RuntimeError(f"订阅组 {name} 没有解析出任何可用节点")
@@ -873,15 +1113,19 @@ def write_nodes_report(
             # Re-detect from the visible node suffix so the report stays independent of stripped metadata.
             region_counts[detect_region(tag.removeprefix(prefix))] += 1
 
-        subscription_reports.append(
-            {
-                "name": name,
-                "role": str(item.get("role") or "default"),
-                "priority": int(item.get("priority", 100)),
-                "nodes": node_count,
-                "regions": {region: region_counts.get(region, 0) for region in ALL_REGIONS},
-            }
-        )
+        subscription_report: Dict[str, Any] = {
+            "name": name,
+            "role": str(item.get("role") or "default"),
+            "priority": int(item.get("priority", 100)),
+            "nodes": node_count,
+            "regions": {region: region_counts.get(region, 0) for region in ALL_REGIONS},
+            "subscription_userinfo": None,
+        }
+        subscription_userinfo = item.get("_subscription_userinfo")
+        if isinstance(subscription_userinfo, dict) and subscription_userinfo:
+            subscription_report["subscription_userinfo"] = subscription_userinfo
+
+        subscription_reports.append(subscription_report)
 
     report = {
         "subscriptions": subscription_reports,

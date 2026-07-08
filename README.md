@@ -51,6 +51,16 @@ Generate a config:
 python .\build_singbox.py --template .\template.json --output .\config.json
 ```
 
+Generate a config and keep subscription info entries in the `Info` selector:
+
+```powershell
+python .\build_singbox.py --template .\template.json --output .\config.json --keep-info-nodes
+```
+
+When the provider returns a `Subscription-Userinfo` response header, the
+generated `nodes-report.json` includes `subscription_userinfo` with upload,
+download, total, remaining traffic, and expiration fields.
+
 Check the config:
 
 ```powershell
