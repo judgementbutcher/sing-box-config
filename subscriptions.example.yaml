@@ -6,7 +6,7 @@ subscriptions:
     parser: clash
     source: url_file
     path: subscriptions/example-provider.txt
-    group_tag: Provider/example
+    group_tag: example
     hot_regions_only: true
     flat_group: true
     include_in_available: true

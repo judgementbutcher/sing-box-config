@@ -46,6 +46,9 @@ DEFAULT_SUBSCRIPTION_CACHE_DIR = ".subscription-cache"
 DEFAULT_TEMPLATE_DIR = "templates"
 LEGACY_TEMPLATE_PATH = "template.json"
 DEFAULT_KEEP_INFO_NODES = False
+DEFAULT_AVAILABLE_URLTEST_URL = "https://cp.cloudflare.com/generate_204"
+DEFAULT_AVAILABLE_URLTEST_INTERVAL = "3m"
+DEFAULT_AVAILABLE_URLTEST_TOLERANCE = 50
 HOME_NODE_KEYWORDS = ["家宽", "home", "residential"]
 COUNTRY_CODE_RE = re.compile(r"\b([A-Z]{2})\b")
 NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "block", "dns"}
@@ -633,9 +636,9 @@ def configured_group_tag(item: Dict[str, Any], default_name: str) -> str:
         item.get("group_tag")
         or item.get("provider_tag")
         or item.get("tag")
-        or f"Provider/{default_name}"
+        or default_name
     ).strip()
-    return tag or f"Provider/{default_name}"
+    return tag or default_name
 
 
 def load_subscription_manifest(path: Path, default_subscription_file: str) -> List[Dict[str, Any]]:
@@ -995,8 +998,14 @@ def build_config_from_subscriptions(
     user_agent: str = "clash-verge/v2.4.7",
     cache_dir: Optional[Path] = Path(DEFAULT_SUBSCRIPTION_CACHE_DIR),
     fetch_proxy: Optional[str] = None,
+    available_urltest: bool = False,
+    available_urltest_url: str = DEFAULT_AVAILABLE_URLTEST_URL,
+    available_urltest_interval: str = DEFAULT_AVAILABLE_URLTEST_INTERVAL,
+    available_urltest_tolerance: int = DEFAULT_AVAILABLE_URLTEST_TOLERANCE,
+    available_urltest_exclude_roles: Optional[Set[str]] = None,
+    provider_default_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
-    used_tags: Set[str] = {"Available", "AI", "Info", "Provider", "Public", "direct", "block"}
+    used_tags: Set[str] = {"Available", "AI", "Info", "Public", "direct", "block"}
     built_groups: List[Dict[str, Any]] = []
 
     for item in subscriptions:
@@ -1036,8 +1045,13 @@ def build_config_from_subscriptions(
     if not any(group["node_outbounds"] for group in built_groups):
         raise RuntimeError("没有可用节点")
 
-    provider_groups = [str(group["provider_tag"]) for group in built_groups]
     provider_default = choose_provider_default(built_groups)
+    provider_default_tag = str(provider_default_tag or "").strip()
+    if provider_default_tag:
+        if any(str(group["provider_tag"]) == provider_default_tag for group in built_groups):
+            provider_default = provider_default_tag
+        else:
+            print(f"[WARN] 未找到指定默认订阅组: {provider_default_tag}", file=sys.stderr)
     provider_default_group = next(
         (group for group in built_groups if str(group["provider_tag"]) == provider_default),
         built_groups[0],
@@ -1071,6 +1085,45 @@ def build_config_from_subscriptions(
         available_choices = [provider_default]
     append_unique(available_choices, "direct")
 
+    all_proxy_node_tags = [
+        str(node_ob["tag"])
+        for group in built_groups
+        for node_ob in group["node_outbounds"]
+        if node_ob.get("tag")
+    ]
+    all_proxy_node_tag_set = set(all_proxy_node_tags)
+    available_urltest_exclude_roles = {
+        str(role).strip().lower()
+        for role in (available_urltest_exclude_roles or set())
+        if str(role).strip()
+    }
+    available_auto_groups = [
+        group
+        for group in available_groups
+        if str(group.get("role") or "").strip().lower() not in available_urltest_exclude_roles
+    ] or available_groups
+    excluded_auto_node_tags = {
+        str(node_ob["tag"])
+        for group in available_groups
+        if str(group.get("role") or "").strip().lower() in available_urltest_exclude_roles
+        for node_ob in group["node_outbounds"]
+        if node_ob.get("tag")
+    }
+    available_auto_tag: Optional[str] = None
+    available_auto_nodes: List[str] = []
+    if available_urltest:
+        available_auto_nodes = [
+            str(node_ob["tag"])
+            for group in available_auto_groups
+            for node_ob in group["node_outbounds"]
+            if node_ob.get("tag")
+        ] or all_proxy_node_tags
+        if available_auto_nodes:
+            available_auto_tag = make_unique_tag("Available/Auto", used_tags)
+            available_choices = [available_auto_tag] + [
+                choice for choice in available_choices if choice != available_auto_tag
+            ]
+
     paid_ai_groups = []
     if not is_public_role(provider_default_group.get("role")):
         paid_ai_groups = [
@@ -1086,10 +1139,42 @@ def build_config_from_subscriptions(
             if outbound_region(node_ob) == "US":
                 append_unique(ai_groups, str(node_ob["tag"]))
 
+    ai_auto_tag: Optional[str] = None
+    ai_auto_nodes: List[str] = []
+    if available_urltest:
+        ai_auto_nodes = [
+            tag
+            for tag in ai_groups
+            if tag in all_proxy_node_tag_set and tag not in excluded_auto_node_tags
+        ] or [tag for tag in ai_groups if tag in all_proxy_node_tag_set]
+        if ai_auto_nodes:
+            ai_auto_tag = make_unique_tag("AI/Auto", used_tags)
+            ai_groups = [ai_auto_tag] + [tag for tag in ai_groups if tag != ai_auto_tag]
+
     outbounds: List[Dict[str, Any]] = []
-    available_default = provider_default
+    available_default = available_auto_tag or provider_default
     outbounds.append(build_selector("Available", available_choices, default=available_default))
-    outbounds.append(build_selector("AI", ai_groups, default=ai_groups[0]))
+    if available_auto_tag:
+        outbounds.append(
+            build_urltest(
+                available_auto_tag,
+                available_auto_nodes,
+                url=available_urltest_url,
+                interval=available_urltest_interval,
+                tolerance=available_urltest_tolerance,
+            )
+        )
+    outbounds.append(build_selector("AI", ai_groups, default=ai_auto_tag or ai_groups[0]))
+    if ai_auto_tag:
+        outbounds.append(
+            build_urltest(
+                ai_auto_tag,
+                ai_auto_nodes,
+                url=available_urltest_url,
+                interval=available_urltest_interval,
+                tolerance=available_urltest_tolerance,
+            )
+        )
     if public_nodes:
         public_choices = [
             public_region_selector_tags[region]
@@ -1105,8 +1190,6 @@ def build_config_from_subscriptions(
             ] + ["direct"],
         )
         outbounds.append(build_selector("Public", public_choices, default=public_default))
-    outbounds.append(build_selector("Provider", provider_groups + ["direct"], default=provider_default))
-
     outbounds.extend(public_control_outbounds)
     for group in built_groups:
         outbounds.extend(group["control_outbounds"])
@@ -1205,7 +1288,7 @@ def write_nodes_report(
         },
         "main_selectors": [
             tag
-            for tag in ["Available", "AI", "Public", "Provider", "Info"]
+            for tag in ["Available", "AI", "Public", "Info"]
             if tag in selector_tags
         ],
     }
@@ -1251,7 +1334,7 @@ def print_config_summary(
         for ob in outbounds
         if isinstance(ob, dict) and str(ob.get("type")) not in NON_PROXY_OUTBOUND_TYPES
     )
-    main_selectors = [tag for tag in ("Available", "AI", "Public", "Provider", "Info") if tag in selector_tags]
+    main_selectors = [tag for tag in ("Available", "AI", "Public", "Info") if tag in selector_tags]
     ui_url = get_clash_ui_url(conf)
 
     print(f"完成: 已根据 {template_path} 生成 {output_path}")
@@ -1312,6 +1395,29 @@ def main() -> None:
         default=None,
         help="下载订阅时使用的 HTTP/SOCKS 代理，例如 http://127.0.0.1:7890",
     )
+    parser.add_argument("--available-urltest", action="store_true", help="为 Available/AI 增加自动测速默认组")
+    parser.add_argument(
+        "--available-urltest-url",
+        default=DEFAULT_AVAILABLE_URLTEST_URL,
+        help=f"自动测速地址，默认 {DEFAULT_AVAILABLE_URLTEST_URL}",
+    )
+    parser.add_argument(
+        "--available-urltest-interval",
+        default=DEFAULT_AVAILABLE_URLTEST_INTERVAL,
+        help=f"自动测速间隔，默认 {DEFAULT_AVAILABLE_URLTEST_INTERVAL}",
+    )
+    parser.add_argument(
+        "--available-urltest-tolerance",
+        type=int,
+        default=DEFAULT_AVAILABLE_URLTEST_TOLERANCE,
+        help=f"自动测速容差，默认 {DEFAULT_AVAILABLE_URLTEST_TOLERANCE}",
+    )
+    parser.add_argument(
+        "--available-urltest-exclude-roles",
+        default="",
+        help="自动测速组排除的订阅角色，逗号分隔，例如 primary",
+    )
+    parser.add_argument("--provider-default-tag", default=None, help="覆盖默认订阅组标签，例如 example-provider")
     parser.add_argument("--keep-info-nodes", action="store_true", help="保留订阅信息节点（默认不保留）")
     parser.add_argument("--discard-info-nodes", action="store_true", help="兼容旧参数：不保留订阅信息节点")
 
@@ -1331,6 +1437,10 @@ def main() -> None:
 
     if args.max_other_nodes < 0:
         print("--max-other-nodes 必须 >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    if args.available_urltest_tolerance < 0:
+        print("--available-urltest-tolerance 必须 >= 0", file=sys.stderr)
         sys.exit(1)
 
     template_path = Path(args.template) if args.template else choose_template_interactively(Path(args.template_dir))
@@ -1367,6 +1477,12 @@ def main() -> None:
             user_agent=args.user_agent,
             cache_dir=cache_dir,
             fetch_proxy=args.fetch_proxy,
+            available_urltest=args.available_urltest,
+            available_urltest_url=args.available_urltest_url,
+            available_urltest_interval=args.available_urltest_interval,
+            available_urltest_tolerance=args.available_urltest_tolerance,
+            available_urltest_exclude_roles=set(parse_string_list(args.available_urltest_exclude_roles)),
+            provider_default_tag=args.provider_default_tag,
         )
         save_json(args.output, conf)
         if not args.no_report:

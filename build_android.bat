@@ -32,6 +32,10 @@ set "TEMPLATE=templates\mobile-android-sing-box-1.13.14.json"
 set "FINAL_CONFIG=config.android.json"
 set "NEXT_CONFIG=config.android.next.json"
 set "REPORT=nodes-report.android.json"
+set "CHECK_EXE=sing-box.exe"
+set "CHECK_113=.downloads\sing-box-1.13.14-windows-amd64\sing-box-1.13.14-windows-amd64\sing-box.exe"
+
+if exist "%CHECK_113%" set "CHECK_EXE=%CHECK_113%"
 
 if not exist "%TEMPLATE%" (
     echo [ERROR] Android template not found: %TEMPLATE%
@@ -51,9 +55,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo === [2/3] Basic local check ===
-if exist "sing-box.exe" (
-    sing-box.exe check -c "%NEXT_CONFIG%"
+echo === [2/3] Check with sing-box core ===
+if exist "%CHECK_EXE%" (
+    "%CHECK_EXE%" check -c "%NEXT_CONFIG%"
     if errorlevel 1 (
         echo.
         echo [ERROR] Config check failed. Existing %FINAL_CONFIG% was not changed.
