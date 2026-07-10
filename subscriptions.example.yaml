@@ -1,13 +1,5 @@
 subscriptions:
   - name: example-provider
-    enabled: true
-    priority: 10
-    role: default
     parser: clash
     source: url_file
     path: subscriptions/example-provider.txt
-    group_tag: example
-    hot_regions_only: true
-    flat_group: true
-    include_in_available: true
-    available_priority: 10

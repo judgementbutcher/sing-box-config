@@ -1,5 +1,7 @@
 # Sensitive inputs and local-only documentation
 README.local.md
+android_apps.yaml
+policy_aliases.yaml
 template.json
 templates/*.json
 !templates/*.example.json
@@ -11,15 +13,22 @@ nodes-report.json
 nodes-report*.json
 subscriptions/
 .subscription-cache/
+.health/
+.secrets/
 cache.clean.db
+cache.*.db
 
 # Public sanitized examples
 !template.example.json
 !subscriptions.example.yaml
 
 # Runtime output and local backups
+runtime/
 logs/
 backups/
+cores/
+dist/
+validation/
 *.bak
 
 # Downloaded/runtime binaries and extracted release artifacts

@@ -3,18 +3,18 @@
   <name>sing-box</name>
   <description>sing-box 本地代理服务</description>
 
-  <executable>%BASE%\sing-box.exe</executable>
-  <arguments>run -c "%BASE%\config.json"</arguments>
+  <executable>%BASE%\cores\1.14.0-alpha.41\sing-box.exe</executable>
+  <arguments>run --disable-color -c "%BASE%\dist\desktop\config.json"</arguments>
 
   <workingdirectory>%BASE%</workingdirectory>
 
-  <logpath>%BASE%\logs</logpath>
+  <logpath>%BASE%\runtime\logs</logpath>
   <log mode="roll-by-size">
-    <sizeThreshold>10240</sizeThreshold>
-    <keepFiles>5</keepFiles>
+    <sizeThreshold>5120</sizeThreshold>
+    <keepFiles>3</keepFiles>
   </log>
 
-  <stoptimeout>15sec</stoptimeout>
+  <stoptimeout>20sec</stoptimeout>
   <startmode>Automatic</startmode>
   <delayedAutoStart>true</delayedAutoStart>
 </service>
