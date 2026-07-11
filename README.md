@@ -1,22 +1,43 @@
 # sing-box 配置生成器
 
-这个项目只做一件事：根据你的订阅生成两份可导入的 sing-box 配置。
+这个项目根据你的订阅生成桌面端和安卓端 sing-box 配置。
 
 - 桌面端：`dist\desktop\config.json`
 - 安卓端：`dist\android\config.json`
 
-不会再把日常使用拆成多个 profile，也不会自动部署 Windows 服务、回滚服务或打包 Android 发布物。
+不会再把日常使用拆成多个 profile，也不会在日常刷新时重复部署 Windows 服务、管理回滚服务或打包 Android 发布物；Windows 服务只由首次初始化脚本安装。
+
+## 新电脑恢复
+
+公开仓库不包含订阅，但包含从空白 Windows 环境恢复所需的其余内容。新电脑只需：
+
+```powershell
+git clone https://github.com/judgementbutcher/sing-box-config.git
+cd sing-box-config
+.\setup.bat
+```
+
+按提示粘贴订阅链接即可。脚本会在本机保存订阅、创建 Python 虚拟环境、安装依赖、下载并校验固定版本的 sing-box 与 Windows 服务包装器、生成配置，然后请求管理员权限安装并启动服务。订阅链接不会作为命令行参数传递，也不会被 Git 跟踪。
+
+如果只需要生成桌面和 Android 配置，不安装 Windows 服务：
+
+```powershell
+.\setup.ps1 -SkipService
+```
+
+默认按 Clash YAML 解析订阅；sing-box JSON 或 URI 列表可分别使用 `-Parser singbox-json` 或 `-Parser uri`。订阅下载需要经过已有代理时可加 `-FetchProxy http://127.0.0.1:7890`。
 
 ## 日常使用
 
-双击 `reload.bat`，它会生成桌面端和安卓端配置。
+双击 `reload.bat`，它会生成桌面端配置，然后重启 sing-box Windows 服务。
 
-也可以只生成一个目标：
+安卓配置使用独立脚本生成：
 
 ```bat
-reload.bat desktop
-reload.bat android
+build_android.bat
 ```
+
+两个脚本都可以接收生成器选项，例如 `reload.bat --offline` 或 `build_android.bat --offline`。
 
 命令行等价写法：
 
@@ -26,11 +47,13 @@ python .\generate_config.py desktop
 python .\generate_config.py android
 ```
 
-生成完成后，把对应的 `config.json` 导入桌面或 Android 的 sing-box 客户端即可。
+桌面服务读取 `dist\desktop\config.json`；安卓配置生成后，将 `dist\android\config.json` 导入 sing-box for Android。
 
 桌面配置默认开启本机仪表板。启动桌面端配置或 Windows 服务后，可访问 `http://127.0.0.1:9090`。
 
 ## 首次设置
+
+推荐直接运行 `setup.bat`。以下是需要管理多个订阅或本地自建节点时的手工方式。
 
 1. 准备订阅清单：
 
@@ -95,4 +118,20 @@ subscriptions:
 
 ```powershell
 python -m pytest
+python .\check_public_repo.py
 ```
+
+## 可推送边界
+
+可以推送：Python 生成器与解析器、测试、脱敏的 `*.example.*`、启动/初始化脚本、服务 XML、依赖锁定文件和 CI。初始化脚本只保存版本号、公开下载地址和文件校验值，不包含任何订阅信息。
+
+不能推送：`subscriptions.yaml`、`subscriptions\`、订阅缓存、`template.json` 与私有模板、生成配置、节点报告、数据库、日志、二进制、虚拟环境、`.secrets\` 和本地说明。这些路径均由 `.gitignore` 排除，CI 还会运行 `check_public_repo.py` 阻止误提交。
+
+推送前运行：
+
+```powershell
+python .\check_public_repo.py
+git status --short
+```
+
+注意：`.gitignore` 和检查脚本只能保护新提交。如果 Git 历史中曾提交过真实订阅链接或节点凭据，应先在服务商处轮换订阅链接，再重写远端历史；仅删除当前文件不足以清除旧提交。
