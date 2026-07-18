@@ -3,7 +3,7 @@
   <name>sing-box</name>
   <description>sing-box 本地代理服务</description>
 
-  <executable>%BASE%\cores\1.14.0-alpha.41\sing-box.exe</executable>
+  <executable>%BASE%\cores\1.14.0-alpha.45\sing-box.exe</executable>
   <arguments>run --disable-color -c "%BASE%\dist\desktop\config.json"</arguments>
 
   <workingdirectory>%BASE%</workingdirectory>

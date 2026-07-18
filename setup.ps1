@@ -11,8 +11,8 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 Set-Location -LiteralPath $PSScriptRoot
 
-$CoreVersion = "1.14.0-alpha.41"
-$CoreExecutableHash = "C68FDB0FBB8A8CEC1A9ED563469D2A5884EDEC7A5989B261DFB2B93D038B4146"
+$CoreVersion = "1.14.0-alpha.45"
+$CoreExecutableHash = "694CA8EC38E8E81B623D8B141B9AF28E677C3490DF1EFA8273F432DA28B4B805"
 $CronetHash = "C7434CFA93C3041321DD19111C4DE6C52B8A9531A65661BA45425D3C51EC69E2"
 $ServiceVersion = "2.12.0"
 $ServiceHash = "05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA"
@@ -179,8 +179,24 @@ if (-not $SkipService) {
             throw "Windows service start failed with exit code $($process.ExitCode)."
         }
     }
+
+    Write-Host "=== Installing traffic attribution service ==="
+    $trafficServiceExe = Join-Path $PSScriptRoot "singbox-traffic-service.exe"
+    Copy-Item -LiteralPath $serviceExe -Destination $trafficServiceExe -Force
+    $trafficService = Get-Service -Name "sing-box-traffic" -ErrorAction SilentlyContinue
+    $trafficAction = if ($trafficService) { "restart" } else { "install" }
+    $process = Start-Process -FilePath $trafficServiceExe -ArgumentList $trafficAction -WorkingDirectory $PSScriptRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+        throw "Traffic monitor service action '$trafficAction' failed with exit code $($process.ExitCode)."
+    }
+    if (-not $trafficService) {
+        $process = Start-Process -FilePath $trafficServiceExe -ArgumentList "start" -WorkingDirectory $PSScriptRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "Traffic monitor service start failed with exit code $($process.ExitCode)."
+        }
+    }
 }
 
 Write-Host ""
-Write-Host "Setup complete. Desktop proxy: 127.0.0.1:7890; dashboard: http://127.0.0.1:9090"
-Write-Host "Use reload.bat for future subscription refreshes."
+Write-Host "Setup complete. Desktop proxy: 127.0.0.1:7890; live dashboard: http://127.0.0.1:9090; traffic attribution: http://127.0.0.1:9091"
+Write-Host "Use manage.bat for future subscription refreshes."

@@ -31,6 +31,10 @@ def template():
 
 
 def test_android_profile_removes_desktop_only_features_and_uses_113_download_detour():
+    base = template()
+    base["dns"].update({"optimistic": True, "timeout": "8s"})
+    base["inbounds"][0]["dns_mode"] = "hijack"
+    base["experimental"]["cache_file"]["store_dns"] = True
     profile = {
         "name": "android-test",
         "platform": "android",
@@ -40,29 +44,39 @@ def test_android_profile_removes_desktop_only_features_and_uses_113_download_det
             "dns_strategy": "prefer_ipv4",
             "dns_cache_capacity": 4096,
             "tun_stack": "system",
-            "tun_mtu": 1420,
+            "tun_mtu": 1360,
             "udp_timeout": "2m",
             "rule_set_update_interval": "7d",
             "cache_path": "cache.android.db",
         },
         "clash_api": {"enabled": False},
     }
-    conf = apply_profile_to_template(template(), profile)
+    conf = apply_profile_to_template(base, profile)
     assert len(conf["inbounds"]) == 1
+    assert conf["inbounds"][0]["mtu"] == 1360
     assert "route_address" not in conf["inbounds"][0]
     assert conf["dns"]["servers"][0]["detour"] == "DNS-Out"
     assert conf["route"]["rule_set"][0]["download_detour"] == "Update-Out"
     assert "http_clients" not in conf
     assert "clash_api" not in conf["experimental"]
+    assert "optimistic" not in conf["dns"]
+    assert "timeout" not in conf["dns"]
+    assert "dns_mode" not in conf["inbounds"][0]
+    assert "store_dns" not in conf["experimental"]["cache_file"]
 
 
 def test_114_profile_uses_http_client_and_secret():
     profile = {
         "name": "desktop-test",
         "platform": "windows",
-        "core": {"version": "1.14.0-alpha.41"},
+        "core": {"version": "1.14.0-alpha.45"},
         "control": {"dns_detour": "DNS-Out", "update_detour": "Update-Out"},
-        "tuning": {},
+        "tuning": {
+            "tun_dns_mode": "hijack",
+            "dns_optimistic": True,
+            "dns_timeout": "8s",
+            "cache_store_dns": True,
+        },
         "clash_api": {"enabled": True, "external_ui": True},
     }
     conf = apply_profile_to_template(template(), profile, clash_secret="secret-value")
@@ -70,6 +84,10 @@ def test_114_profile_uses_http_client_and_secret():
     assert conf["route"]["default_http_client"] == "rule-set-downloader"
     assert conf["route"]["rule_set"][0]["http_client"] == "rule-set-downloader"
     assert conf["experimental"]["clash_api"]["secret"] == "secret-value"
+    assert conf["dns"]["optimistic"] is True
+    assert conf["dns"]["timeout"] == "8s"
+    assert conf["inbounds"][0]["dns_mode"] == "hijack"
+    assert conf["experimental"]["cache_file"]["store_dns"] is True
 
 
 def test_profile_removes_tun_ipv6_address():
@@ -78,7 +96,7 @@ def test_profile_removes_tun_ipv6_address():
     profile = {
         "name": "desktop-test",
         "platform": "windows",
-        "core": {"version": "1.14.0-alpha.41"},
+        "core": {"version": "1.14.0-alpha.45"},
         "control": {},
         "tuning": {},
         "clash_api": {"enabled": False},

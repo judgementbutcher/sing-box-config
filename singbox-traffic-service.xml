@@ -1,0 +1,20 @@
+<service>
+  <id>sing-box-traffic</id>
+  <name>sing-box traffic monitor</name>
+  <description>sing-box 本地流量去向统计面板</description>
+
+  <executable>%BASE%\.venv\Scripts\python.exe</executable>
+  <arguments>"%BASE%\traffic_monitor.py" --host 127.0.0.1 --port 9091</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <logpath>%BASE%\runtime\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>2048</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+
+  <stoptimeout>15sec</stoptimeout>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <onfailure action="restart" delay="10 sec" />
+</service>

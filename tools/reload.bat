@@ -1,23 +1,24 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-cd /d "%~dp0" || exit /b 1
+set "ROOT=%~dp0.."
+cd /d "%ROOT%" || exit /b 1
 
 set "INTERACTIVE="
 if "%~1"=="" set "INTERACTIVE=1"
 if /I "%~1"=="--help" goto :help
 if /I "%~1"=="-h" goto :help
-if not exist "%~dp0subscriptions.yaml" (
+if not exist "%ROOT%\subscriptions.yaml" (
     echo [ERROR] This checkout has not been initialized.
     echo Run setup.bat and paste your subscription URL first.
     goto :fail
 )
 
 echo === [1/2] Generate desktop config ===
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0generate_config.py" desktop %*
+if exist "%ROOT%\.venv\Scripts\python.exe" (
+    "%ROOT%\.venv\Scripts\python.exe" "%ROOT%\generate_config.py" desktop %*
 ) else (
-    py -3 "%~dp0generate_config.py" desktop %*
+    py -3 "%ROOT%\generate_config.py" desktop %*
 )
 if errorlevel 1 (
     echo.
@@ -27,10 +28,10 @@ if errorlevel 1 (
 
 echo.
 echo === [2/2] Restart sing-box service ===
-if not exist "%~dp0runtime\logs" mkdir "%~dp0runtime\logs"
-set "RESTART_LOG=%~dp0runtime\logs\reload-restart.log"
+if not exist "%ROOT%\runtime\logs" mkdir "%ROOT%\runtime\logs"
+set "RESTART_LOG=%ROOT%\runtime\logs\reload-restart.log"
 set "RESTART_FAILED="
-"%~dp0singbox-service.exe" restart > "%RESTART_LOG%" 2>&1
+"%ROOT%\singbox-service.exe" restart > "%RESTART_LOG%" 2>&1
 if errorlevel 1 set "RESTART_FAILED=1"
 type "%RESTART_LOG%"
 findstr /I /C:"FATAL" /C:"Unknown error" "%RESTART_LOG%" >nul 2>nul
@@ -57,9 +58,9 @@ if defined INTERACTIVE pause
 exit /b 1
 
 :help
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0generate_config.py" desktop %*
+if exist "%ROOT%\.venv\Scripts\python.exe" (
+    "%ROOT%\.venv\Scripts\python.exe" "%ROOT%\generate_config.py" desktop %*
 ) else (
-    py -3 "%~dp0generate_config.py" desktop %*
+    py -3 "%ROOT%\generate_config.py" desktop %*
 )
 exit /b %ERRORLEVEL%

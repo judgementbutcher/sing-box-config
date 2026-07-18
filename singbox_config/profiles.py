@@ -120,6 +120,10 @@ def apply_profile_to_template(
         dns["cache_capacity"] = int(tuning["dns_cache_capacity"])
     if tuning.get("dns_reverse_mapping") is not None:
         dns["reverse_mapping"] = bool(tuning["dns_reverse_mapping"])
+    if tuning.get("dns_optimistic") is not None:
+        dns["optimistic"] = bool(tuning["dns_optimistic"])
+    if tuning.get("dns_timeout"):
+        dns["timeout"] = str(tuning["dns_timeout"])
     if tuning.get("dns_final"):
         dns["final"] = str(tuning["dns_final"])
     if bool(tuning.get("force_local_dns")):
@@ -135,6 +139,7 @@ def apply_profile_to_template(
     for key, profile_key in (
         ("stack", "tun_stack"),
         ("mtu", "tun_mtu"),
+        ("dns_mode", "tun_dns_mode"),
         ("udp_timeout", "udp_timeout"),
         ("auto_route", "auto_route"),
         ("strict_route", "strict_route"),
@@ -173,6 +178,16 @@ def apply_profile_to_template(
         conf["inbounds"] = [tun]
 
     route = conf.setdefault("route", {})
+    if platform == "android":
+        # Windows-only process matching has no meaning on Android and forces the
+        # core to enumerate processes.  Drop find_process and any process rules
+        # so the single authoritative desktop template can also feed Android.
+        route.pop("find_process", None)
+        route["rules"] = [
+            rule
+            for rule in route.get("rules", [])
+            if not (isinstance(rule, dict) and rule.get("process_name"))
+        ]
     if tuning.get("route_final"):
         route["final"] = str(tuning["route_final"])
     if bool(tuning.get("force_direct")):
@@ -213,6 +228,15 @@ def apply_profile_to_template(
     cache_file["enabled"] = bool(tuning.get("cache_enabled", True))
     if tuning.get("cache_path"):
         cache_file["path"] = str(tuning["cache_path"])
+    if tuning.get("cache_store_dns") is not None:
+        cache_file["store_dns"] = bool(tuning["cache_store_dns"])
+
+    if _version_tuple(core_version) < (1, 14, 0):
+        dns.pop("optimistic", None)
+        dns.pop("timeout", None)
+        tun.pop("dns_mode", None)
+        tun.pop("dns_address", None)
+        cache_file.pop("store_dns", None)
 
     if bool(clash.get("enabled", platform == "windows")):
         clash_api = experimental.setdefault("clash_api", {})
