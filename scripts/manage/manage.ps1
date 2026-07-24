@@ -1,24 +1,28 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [ValidateSet("menu", "reload", "offline-reload", "desktop", "android", "offline-android", "all")]
+    [string]$Action = "menu"
+)
 
 # 交互式 sing-box 管理菜单。用自然语言选项管理配置生成与 Windows 服务。
-# 双击 manage.bat 即可运行；也可直接 powershell -File manage.ps1。
+# 双击 manage.bat 即可运行；细分批处理通过 -Action 复用这里的操作。
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-Set-Location -LiteralPath $PSScriptRoot
+$ProjectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+Set-Location -LiteralPath $ProjectRoot
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 
 $ServiceName = "sing-box"
-$ServiceExe = Join-Path $PSScriptRoot "singbox-service.exe"
-$VenvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-$Generator = Join-Path $PSScriptRoot "generate_config.py"
-$LogDirectory = Join-Path $PSScriptRoot "runtime\logs"
+$ServiceExe = Join-Path $ProjectRoot "runtime\services\singbox-service.exe"
+$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$Generator = Join-Path $ProjectRoot "scripts\config\generate_config.py"
+$LogDirectory = Join-Path $ProjectRoot "runtime\logs"
 $DashboardUrl = "http://127.0.0.1:9090"
 $TrafficDashboardUrl = "http://127.0.0.1:9091"
-$TrafficMonitor = Join-Path $PSScriptRoot "traffic_monitor.py"
+$TrafficMonitor = Join-Path $ProjectRoot "scripts\monitor\traffic_monitor.py"
 $TrafficServiceName = "sing-box-traffic"
-$TrafficServiceExe = Join-Path $PSScriptRoot "singbox-traffic-service.exe"
+$TrafficServiceExe = Join-Path $ProjectRoot "runtime\services\singbox-traffic-service.exe"
 $ProxyEndpoint = "127.0.0.1:7890"
 
 function Get-PythonCommand {
@@ -33,11 +37,11 @@ function Get-PythonCommand {
     if ($python) {
         return @($python.Source)
     }
-    throw "找不到 Python。请先运行 setup.bat 初始化环境。"
+    throw "找不到 Python。请先运行 scripts\bootstrap\setup.bat 初始化环境。"
 }
 
 function Test-Initialized {
-    return Test-Path -LiteralPath (Join-Path $PSScriptRoot "subscriptions.yaml")
+    return Test-Path -LiteralPath (Join-Path $ProjectRoot "config\local\subscriptions.yaml")
 }
 
 function Get-ServiceStateText {
@@ -56,19 +60,22 @@ function Invoke-Generator {
     param([string]$Target, [switch]$Offline)
 
     if (-not (Test-Initialized)) {
-        Write-Host "[错误] 尚未初始化。请先运行 setup.bat 并粘贴订阅链接。" -ForegroundColor Red
+        Write-Host "[错误] 尚未初始化。请先运行 scripts\bootstrap\setup.bat 并粘贴订阅链接。" -ForegroundColor Red
         return $false
     }
-    $python = Get-PythonCommand
+    # Force an array here: PowerShell unwraps a single returned string, and
+    # indexing that scalar would execute only the first character of the path.
+    $python = @(Get-PythonCommand)
     $arguments = @($Generator, $Target)
     if ($Offline) {
         $arguments += "--offline"
     }
     $executable = $python[0]
     $prefix = @($python | Select-Object -Skip 1)
-    & $executable @prefix @arguments
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[错误] 配置生成失败 (退出码 $LASTEXITCODE)。" -ForegroundColor Red
+    & $executable @prefix @arguments | Out-Host
+    $generatorExitCode = $LASTEXITCODE
+    if ($generatorExitCode -ne 0) {
+        Write-Host "[错误] 配置生成失败 (退出码 $generatorExitCode)。" -ForegroundColor Red
         return $false
     }
     Write-Host "[完成] 配置已生成。" -ForegroundColor Green
@@ -82,13 +89,13 @@ function Invoke-ServiceAction {
     )
 
     if (-not (Test-Path -LiteralPath $ServiceExe)) {
-        Write-Host "[错误] 找不到 singbox-service.exe。请先运行 setup.bat。" -ForegroundColor Red
+        Write-Host "[错误] 找不到 runtime\services\singbox-service.exe。请先运行 scripts\bootstrap\setup.bat。" -ForegroundColor Red
         return $false
     }
     if ($Action -ne "install") {
         $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if (-not $service) {
-            Write-Host "[错误] 服务尚未安装。请先运行 setup.bat 安装服务。" -ForegroundColor Red
+            Write-Host "[错误] 服务尚未安装。请先运行 scripts\bootstrap\setup.bat 安装服务。" -ForegroundColor Red
             return $false
         }
     }
@@ -96,7 +103,7 @@ function Invoke-ServiceAction {
     Write-Host "正在请求管理员权限执行：$Action ..." -ForegroundColor Yellow
     try {
         $process = Start-Process -FilePath $ServiceExe -ArgumentList $Action `
-            -WorkingDirectory $PSScriptRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+            -WorkingDirectory $ProjectRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
     } catch {
         Write-Host "[错误] 提权被拒绝或失败：$($_.Exception.Message)" -ForegroundColor Red
         return $false
@@ -115,16 +122,16 @@ function Invoke-ReloadDesktop {
     Write-Host "=== [1/2] 生成桌面配置 ===" -ForegroundColor Cyan
     if (-not (Invoke-Generator -Target "desktop" -Offline:$Offline)) {
         Write-Host "服务重启已跳过。" -ForegroundColor Yellow
-        return
+        return $false
     }
     Write-Host ""
     Write-Host "=== [2/2] 重启 sing-box 服务 ===" -ForegroundColor Cyan
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $service) {
-        Write-Host "[提示] 服务尚未安装，仅生成了配置。运行 setup.bat 可安装服务。" -ForegroundColor Yellow
-        return
+        Write-Host "[提示] 服务尚未安装，仅生成了配置。运行 scripts\bootstrap\setup.bat 可安装服务。" -ForegroundColor Yellow
+        return $true
     }
-    [void](Invoke-ServiceAction -Action "restart")
+    return Invoke-ServiceAction -Action "restart"
 }
 
 function Invoke-PublishAndroid {
@@ -133,20 +140,21 @@ function Invoke-PublishAndroid {
     Write-Host "=== [1/2] 生成安卓配置 ===" -ForegroundColor Cyan
     if (-not (Invoke-Generator -Target "android" -Offline:$Offline)) {
         Write-Host "局域网发布已跳过。" -ForegroundColor Yellow
-        return
+        return $false
     }
     Write-Host ""
     Write-Host "=== [2/2] 局域网发布（手机 SFA 远程订阅） ===" -ForegroundColor Cyan
-    $serveBat = Join-Path $PSScriptRoot "tools\serve_android.bat"
+    $serveBat = Join-Path $ProjectRoot "scripts\serve\serve_android.bat"
     if (-not (Test-Path -LiteralPath $serveBat)) {
-        Write-Host "[错误] 找不到 tools\serve_android.bat。" -ForegroundColor Red
-        return
+        Write-Host "[错误] 找不到 scripts\serve\serve_android.bat。" -ForegroundColor Red
+        return $false
     }
     # 在新窗口常驻发布，保持本菜单可用；新窗口里会打印手机要用的远程配置 URL。
-    Start-Process -FilePath $serveBat -WorkingDirectory $PSScriptRoot
+    Start-Process -FilePath $serveBat -WorkingDirectory $ProjectRoot
     Write-Host "[完成] 已在新窗口启动局域网发布，窗口内显示手机 SFA 要用的远程配置 URL。" -ForegroundColor Green
     Write-Host "首次：手机 SFA 新建「远程」配置并粘贴该 URL；日后刷新只需在 SFA 点「更新」。" -ForegroundColor DarkGray
     Write-Host "停止发布：关闭那个新窗口，或在其中按 Ctrl+C。" -ForegroundColor DarkGray
+    return $true
 }
 
 function Show-Log {
@@ -192,7 +200,7 @@ function Test-TrafficDashboard {
 
 function Open-TrafficDashboard {
     if (-not (Test-Path -LiteralPath $TrafficMonitor)) {
-        Write-Host "[错误] 找不到 traffic_monitor.py。" -ForegroundColor Red
+        Write-Host "[错误] 找不到 scripts\monitor\traffic_monitor.py。" -ForegroundColor Red
         return
     }
     if (-not (Test-TrafficDashboard)) {
@@ -202,7 +210,7 @@ function Open-TrafficDashboard {
                 Write-Host "正在请求管理员权限启动流量统计服务..." -ForegroundColor Yellow
                 try {
                     $process = Start-Process -FilePath $TrafficServiceExe -ArgumentList "start" `
-                        -WorkingDirectory $PSScriptRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+                        -WorkingDirectory $ProjectRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
                     if ($process.ExitCode -ne 0) {
                         Write-Host "[错误] 流量统计服务启动失败。" -ForegroundColor Red
                         return
@@ -213,11 +221,11 @@ function Open-TrafficDashboard {
                 }
             }
         } else {
-            $python = Get-PythonCommand
+            $python = @(Get-PythonCommand)
             $executable = $python[0]
             $arguments = @($python | Select-Object -Skip 1) + @("`"$TrafficMonitor`"")
             Write-Host "流量统计服务尚未安装，正在以当前用户启动统计器..." -ForegroundColor Yellow
-            Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+            Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden
         }
         for ($attempt = 0; $attempt -lt 15; $attempt++) {
             Start-Sleep -Milliseconds 300
@@ -257,8 +265,21 @@ function Show-Menu {
 }
 
 if (-not (Test-Initialized)) {
-    Write-Host "[警告] 尚未初始化：找不到 subscriptions.yaml。" -ForegroundColor Yellow
-    Write-Host "生成类操作会失败，请先运行 setup.bat 粘贴订阅链接。" -ForegroundColor Yellow
+    Write-Host "[警告] 尚未初始化：找不到 config\local\subscriptions.yaml。" -ForegroundColor Yellow
+    Write-Host "生成类操作会失败，请先运行 scripts\bootstrap\setup.bat 粘贴订阅链接。" -ForegroundColor Yellow
+}
+
+if ($Action -ne "menu") {
+    $succeeded = switch ($Action) {
+        "reload" { Invoke-ReloadDesktop }
+        "offline-reload" { Invoke-ReloadDesktop -Offline }
+        "desktop" { Invoke-Generator -Target "desktop" }
+        "android" { Invoke-Generator -Target "android" }
+        "offline-android" { Invoke-Generator -Target "android" -Offline }
+        "all" { Invoke-Generator -Target "all" }
+    }
+    if ($succeeded -eq $false) { exit 1 }
+    exit 0
 }
 
 while ($true) {
@@ -267,23 +288,27 @@ while ($true) {
     if ($null -eq $raw) { break }  # 输入流结束（EOF），退出循环。
     $choice = $raw.Trim().ToLower()
     Write-Host ""
-    switch ($choice) {
-        "1" { Invoke-ReloadDesktop }
-        "2" { [void](Invoke-Generator -Target "desktop") }
-        "3" { [void](Invoke-Generator -Target "android") }
-        "a" { Invoke-PublishAndroid }
-        "4" { [void](Invoke-Generator -Target "all") }
-        "5" { Invoke-ReloadDesktop -Offline }
-        "6" { [void](Invoke-ServiceAction -Action "start") }
-        "7" { [void](Invoke-ServiceAction -Action "stop") }
-        "8" { [void](Invoke-ServiceAction -Action "restart") }
-        "9" { Write-Host "服务状态：$(Get-ServiceStateText)" -ForegroundColor Cyan }
-        "d" { Open-Dashboard }
-        "t" { Open-TrafficDashboard }
-        "l" { Show-Log }
-        "q" { break }
-        ""  { }
-        default { Write-Host "无效选项：$choice" -ForegroundColor Yellow }
+    try {
+        switch ($choice) {
+            "1" { [void](Invoke-ReloadDesktop) }
+            "2" { [void](Invoke-Generator -Target "desktop") }
+            "3" { [void](Invoke-Generator -Target "android") }
+            "a" { [void](Invoke-PublishAndroid) }
+            "4" { [void](Invoke-Generator -Target "all") }
+            "5" { [void](Invoke-ReloadDesktop -Offline) }
+            "6" { [void](Invoke-ServiceAction -Action "start") }
+            "7" { [void](Invoke-ServiceAction -Action "stop") }
+            "8" { [void](Invoke-ServiceAction -Action "restart") }
+            "9" { Write-Host "服务状态：$(Get-ServiceStateText)" -ForegroundColor Cyan }
+            "d" { Open-Dashboard }
+            "t" { Open-TrafficDashboard }
+            "l" { Show-Log }
+            "q" { break }
+            ""  { }
+            default { Write-Host "无效选项：$choice" -ForegroundColor Yellow }
+        }
+    } catch {
+        Write-Host "[错误] 操作失败：$($_.Exception.Message)" -ForegroundColor Red
     }
     if ($choice -eq "q") { break }
     Write-Host ""

@@ -65,12 +65,39 @@ def test_android_profile_removes_desktop_only_features_and_uses_113_download_det
     assert "store_dns" not in conf["experimental"]["cache_file"]
 
 
+def test_android_114_profile_keeps_optimistic_dns_and_http_client():
+    base = template()
+    profile = {
+        "name": "android-114",
+        "platform": "android",
+        "core": {"version": "1.14.0-beta.1"},
+        "control": {"dns_detour": "Available", "update_detour": "direct"},
+        "tuning": {
+            "tun_stack": "system",
+            "tun_mtu": 1360,
+            "tun_dns_mode": "hijack",
+            "dns_optimistic": {"enabled": True, "timeout": "15m"},
+            "dns_timeout": "5s",
+            "cache_store_dns": False,
+            "cache_path": "cache.android.db",
+        },
+        "clash_api": {"enabled": False},
+    }
+    conf = apply_profile_to_template(base, profile)
+    assert conf["dns"]["optimistic"] == {"enabled": True, "timeout": "15m"}
+    assert conf["dns"]["timeout"] == "5s"
+    assert conf["inbounds"][0]["dns_mode"] == "hijack"
+    assert conf["experimental"]["cache_file"]["store_dns"] is False
+    assert conf["http_clients"][0] == {"tag": "rule-set-downloader"}
+    assert conf["route"]["rule_set"][0]["http_client"] == "rule-set-downloader"
+
+
 def test_114_profile_uses_http_client_and_secret():
     profile = {
         "name": "desktop-test",
         "platform": "windows",
         "core": {"version": "1.14.0-alpha.45"},
-        "control": {"dns_detour": "DNS-Out", "update_detour": "Update-Out"},
+        "control": {"dns_detour": "Available", "update_detour": "direct"},
         "tuning": {
             "tun_dns_mode": "hijack",
             "dns_optimistic": True,
@@ -80,7 +107,7 @@ def test_114_profile_uses_http_client_and_secret():
         "clash_api": {"enabled": True, "external_ui": True},
     }
     conf = apply_profile_to_template(template(), profile, clash_secret="secret-value")
-    assert conf["http_clients"][0]["detour"] == "Update-Out"
+    assert conf["http_clients"][0] == {"tag": "rule-set-downloader"}
     assert conf["route"]["default_http_client"] == "rule-set-downloader"
     assert conf["route"]["rule_set"][0]["http_client"] == "rule-set-downloader"
     assert conf["experimental"]["clash_api"]["secret"] == "secret-value"
@@ -120,6 +147,21 @@ def test_android_profile_applies_per_app_exclusions(tmp_path):
     }
     conf = apply_profile_to_template(template(), profile)
     assert conf["inbounds"][0]["exclude_package"] == ["com.example.local"]
+
+
+def test_android_profile_drops_windows_strict_route():
+    base = template()
+    base["inbounds"][0]["strict_route"] = True
+    profile = {
+        "name": "android-strict-route",
+        "platform": "android",
+        "core": {"version": "1.14.0-beta.1"},
+        "control": {},
+        "tuning": {},
+        "clash_api": {"enabled": False},
+    }
+    conf = apply_profile_to_template(base, profile)
+    assert "strict_route" not in conf["inbounds"][0]
 
 
 def test_force_direct_profile_replaces_policy_routes():

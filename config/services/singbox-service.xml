@@ -3,12 +3,12 @@
   <name>sing-box</name>
   <description>sing-box 本地代理服务</description>
 
-  <executable>%BASE%\cores\1.14.0-alpha.45\sing-box.exe</executable>
-  <arguments>run --disable-color -c "%BASE%\dist\desktop\config.json"</arguments>
+  <executable>%BASE%\..\cores\1.14.0-beta.1\sing-box.exe</executable>
+  <arguments>run --disable-color -c "%BASE%\..\..\dist\desktop\config.json"</arguments>
 
-  <workingdirectory>%BASE%</workingdirectory>
+  <workingdirectory>%BASE%\..\..</workingdirectory>
 
-  <logpath>%BASE%\runtime\logs</logpath>
+  <logpath>%BASE%\..\logs</logpath>
   <log mode="roll-by-size">
     <sizeThreshold>5120</sizeThreshold>
     <keepFiles>3</keepFiles>

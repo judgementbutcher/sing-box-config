@@ -1,0 +1,208 @@
+{
+  "log": {
+    "disabled": false,
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "google",
+        "server": "8.8.8.8",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "dns.google"
+        },
+        "detour": "Available"
+      },
+      {
+        "type": "udp",
+        "tag": "local",
+        "server": "223.5.5.5",
+        "server_port": 53
+      },
+      {
+        "type": "udp",
+        "tag": "local-backup",
+        "server": "119.29.29.29",
+        "server_port": 53
+      }
+    ],
+    "rules": [
+      {
+        "clash_mode": "Proxy",
+        "action": "route",
+        "server": "google"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "server": "local-backup"
+      },
+      {
+        "rule_set": ["geosite-cn"],
+        "action": "route",
+        "server": "local"
+      }
+    ],
+    "final": "google",
+    "strategy": "ipv4_only",
+    "cache_capacity": 32768,
+    "reverse_mapping": true,
+    "optimistic": true,
+    "timeout": "5s"
+  },
+  "http_clients": [
+    {
+      "tag": "rule-set-downloader",
+      "detour": "direct"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.18.0.1/30"],
+      "route_address": ["0.0.0.0/1", "128.0.0.0/1"],
+      "route_exclude_address": [
+        "192.168.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "127.0.0.0/8",
+        "223.5.5.5/32",
+        "119.29.29.29/32",
+        "8.8.8.8/32",
+        "1.1.1.1/32"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "endpoint_independent_nat": true,
+      "udp_timeout": "5m",
+      "mtu": 1400,
+      "stack": "system",
+      "dns_mode": "hijack"
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [],
+  "route": {
+    "auto_detect_interface": true,
+    "find_process": true,
+    "default_http_client": "rule-set-downloader",
+    "default_domain_resolver": "local",
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
+        "update_interval": "1d",
+        "http_client": "rule-set-downloader"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
+        "update_interval": "1d",
+        "http_client": "rule-set-downloader"
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "process_name": [
+          "GuGuai.exe",
+          "guguai.exe",
+          "guguaiwebhelper.exe",
+          "XunYou.exe",
+          "xunyou.exe",
+          "xunyouservice.exe",
+          "xyaccelerator.exe",
+          "UUAccelerator.exe",
+          "uu.exe",
+          "uuassistant.exe",
+          "uuservice.exe",
+          "Leigod.exe",
+          "leigod.exe",
+          "leigodacc.exe",
+          "leigodservice.exe",
+          "Qiyou.exe",
+          "qiyou.exe",
+          "qiyouservice.exe",
+          "biubiu.exe",
+          "biubiuhelper.exe",
+          "biubiuservice.exe",
+          "AKAccelerator.exe",
+          "akaccelerator.exe",
+          "AKService.exe",
+          "Booster.exe",
+          "GameBooster.exe",
+          "WattToolkit.exe"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "Direct",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "Proxy",
+        "action": "route",
+        "outbound": "Available"
+      },
+      {
+        "rule_set": ["geosite-cn"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": ["geoip-cn"],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "final": "Available"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "dashboard",
+      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
+      "external_ui_download_detour": "direct",
+      "secret": "",
+      "default_mode": "Rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.clean.db",
+      "store_dns": true
+    }
+  }
+}

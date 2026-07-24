@@ -1,3 +1,4 @@
+const REFRESH_INTERVAL_MS = 30_000;
 const state = { period: "today", group: "site", scope: "all" };
 const groupTitles = {
   site: "按站点汇总",
@@ -6,6 +7,14 @@ const groupTitles = {
   rule: "按命中规则汇总",
   outbound: "按实际出口节点汇总",
   chain: "按完整出口链汇总",
+};
+const groupIcons = {
+  site: "icon-globe",
+  destination: "icon-globe",
+  process: "icon-app",
+  rule: "icon-shield",
+  outbound: "icon-route",
+  chain: "icon-layers",
 };
 
 function bytes(value) {
@@ -25,12 +34,53 @@ function relativeTime(value) {
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }
 
-function setText(id, text) { document.getElementById(id).textContent = text; }
+function setText(id, text) {
+  const node = document.getElementById(id);
+  if (node.textContent === String(text)) return;
+  node.textContent = text;
+}
+
+function icon(name, className = "") {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  if (className) svg.setAttribute("class", className);
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#${name}`);
+  svg.append(use);
+  return svg;
+}
 
 async function getJson(url) {
   const response = await fetch(url, { cache: "no-store" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
+}
+
+function renderDistribution(rows) {
+  const root = document.getElementById("distribution");
+  if (!rows.length) {
+    root.innerHTML = '<div class="visual-empty">等待流量数据</div>';
+    return;
+  }
+  const topRows = rows.filter(row => row.total > 0).slice(0, 3);
+  const max = Math.max(...topRows.map(row => row.total), 1);
+  root.replaceChildren(...topRows.map(row => {
+    const item = document.createElement("div");
+    item.className = "distribution-item";
+    const label = document.createElement("span");
+    label.className = "distribution-label";
+    label.textContent = row.label;
+    label.title = row.label;
+    const bar = document.createElement("span");
+    bar.className = "distribution-bar";
+    const fill = document.createElement("i");
+    fill.style.width = `${Math.max(3, row.total / max * 100)}%`;
+    bar.append(fill);
+    const value = document.createElement("span");
+    value.className = "distribution-value";
+    value.textContent = bytes(row.total);
+    item.append(label, bar, value);
+    return item;
+  }));
 }
 
 function renderRows(rows) {
@@ -46,10 +96,37 @@ function renderRows(rows) {
 
     const label = document.createElement("div");
     label.className = "label";
+    const labelLine = document.createElement("div");
+    labelLine.className = "label-line";
+    labelLine.append(icon(groupIcons[state.group], "row-icon"));
     const rank = document.createElement("span");
     rank.className = "rank";
     rank.textContent = String(index + 1).padStart(2, "0");
-    label.append(rank, document.createTextNode(row.label));
+    const labelText = document.createElement("span");
+    labelText.className = "label-text";
+    labelText.textContent = row.label;
+    labelLine.append(rank, labelText);
+    label.append(labelLine);
+
+    const sources = document.createElement("div");
+    sources.className = "source-groups";
+    const sourceGroups = Array.isArray(row.sourceGroups) ? row.sourceGroups : [];
+    sourceGroups.forEach((group, groupIndex) => {
+      const badge = document.createElement("span");
+      badge.className = `source-badge source-${Math.min(groupIndex + 1, 3)}`;
+      badge.title = `${group.label} · ${bytes(group.total)}`;
+      const badgeIcon = icon(group.label === "自建" ? "icon-shield" : "icon-route");
+      const badgeText = document.createElement("span");
+      badgeText.textContent = group.label;
+      badge.append(badgeIcon, badgeText);
+      sources.append(badge);
+    });
+    if (!sourceGroups.length) {
+      const unknown = document.createElement("span");
+      unknown.className = "source-badge source-unknown";
+      unknown.textContent = "未知分组";
+      sources.append(unknown);
+    }
 
     const usage = document.createElement("div");
     usage.className = "usage";
@@ -66,7 +143,7 @@ function renderRows(rows) {
     const amount = document.createElement("div");
     amount.className = "amount";
     amount.textContent = bytes(row.total);
-    item.append(label, usage, amount);
+    item.append(label, sources, usage, amount);
     return item;
   }));
 }
@@ -84,6 +161,14 @@ async function refresh() {
     const knownRate = summary.total ? summary.known / summary.total * 100 : 100;
     setText("knownRate", `可归属 ${knownRate.toFixed(knownRate >= 99 ? 1 : 0)}%`);
     setText("lastUpdate", relativeTime(status.lastSuccess));
+    const totalTransfer = summary.download + summary.upload;
+    const downloadPercent = totalTransfer ? summary.download / totalTransfer * 100 : 50;
+    const ring = document.getElementById("trafficRing");
+    ring.style.setProperty("--download-percent", downloadPercent.toFixed(2));
+    setText("downloadRate", `${Math.round(downloadPercent)}%`);
+    setText("downloadLegend", bytes(summary.download));
+    setText("uploadLegend", bytes(summary.upload));
+    renderDistribution(summary.rows);
     renderRows(summary.rows);
 
     const dot = document.getElementById("statusDot");
@@ -128,5 +213,15 @@ document.getElementById("scopes").addEventListener("click", event => {
   refresh();
 });
 
+document.querySelectorAll(".metric, .visual-panel, .panel").forEach(surface => {
+  surface.addEventListener("pointermove", event => {
+    const bounds = surface.getBoundingClientRect();
+    surface.style.setProperty("--pointer-x", `${event.clientX - bounds.left}px`);
+    surface.style.setProperty("--pointer-y", `${event.clientY - bounds.top}px`);
+  });
+});
+
 refresh();
-setInterval(refresh, 5000);
+setInterval(() => {
+  if (!document.hidden) refresh();
+}, REFRESH_INTERVAL_MS);

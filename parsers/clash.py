@@ -290,11 +290,57 @@ def clash_anytls_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return outbound
 
 
+def clash_hysteria2_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") not in {"hysteria2", "hy2"}:
+        return None
+
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+
+    server = node.get("server")
+    port = node.get("port")
+    password = node.get("password")
+    if not server or not port or password is None:
+        return None
+
+    tls_obj: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": first_non_empty(node.get("sni"), node.get("servername"), str(server)),
+    }
+    if node.get("skip-cert-verify") is True:
+        tls_obj["insecure"] = True
+
+    alpn = parse_alpn(node.get("alpn"))
+    if alpn:
+        tls_obj["alpn"] = alpn
+
+    outbound: Dict[str, Any] = {
+        "type": "hysteria2",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "password": str(password),
+        "domain_resolver": "local",
+        "tls": tls_obj,
+        "_meta_name": name,
+        "_meta_region": detect_region(name),
+    }
+
+    obfs_type = first_non_empty(node.get("obfs"), node.get("obfs-type"), node.get("obfs_type"))
+    obfs_password = first_non_empty(node.get("obfs-password"), node.get("obfs_password"))
+    if obfs_type or obfs_password:
+        outbound["obfs"] = {"type": obfs_type or "salamander", "password": obfs_password or ""}
+
+    return outbound
+
+
 def clash_node_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return (
         clash_vless_to_singbox(node)
         or clash_shadowsocks_to_singbox(node)
         or clash_anytls_to_singbox(node)
+        or clash_hysteria2_to_singbox(node)
     )
 
 

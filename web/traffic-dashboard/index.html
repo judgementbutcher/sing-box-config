@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#050505">
+  <title>sing-box 流量监控</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"><i></i><i></i><i></i></div>
+  <svg class="icon-defs" aria-hidden="true">
+    <defs>
+      <symbol id="icon-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+      <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></symbol>
+      <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 21V9m0 0 4 4m-4-4-4 4M5 3h14"/></symbol>
+      <symbol id="icon-plug" viewBox="0 0 24 24"><path d="m12 22 1-5m-2-3-3-3 3-3 5 5-3 3-2-2Zm4-5 3 3m-1-5 2-2m-7-7 2-2"/></symbol>
+      <symbol id="icon-export" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></symbol>
+      <symbol id="icon-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></symbol>
+      <symbol id="icon-app" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+      <symbol id="icon-route" viewBox="0 0 24 24"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h3a3 3 0 0 0 3-3V8a3 3 0 0 1 3-3"/></symbol>
+      <symbol id="icon-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></symbol>
+      <symbol id="icon-layers" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-9 10 9 5 9-5M3 17l9 5 9-5"/></symbol>
+      <symbol id="icon-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.7 2.7 0 1 1 4.2 2.2c-1.1.7-1.7 1.2-1.7 2.3M12 17h.01"/></symbol>
+      <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+    </defs>
+  </svg>
+
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"><svg><use href="#icon-activity"/></svg></span>
+        <span>sing-box</span>
+        <span class="brand-section">流量监控</span>
+      </div>
+      <div class="status-wrap" role="status"><span id="statusDot" class="dot"></span><span id="statusText">正在连接统计器…</span></div>
+    </header>
+
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">TRAFFIC OVERVIEW</p>
+        <h1>流量概览</h1>
+        <p class="subtitle">查看站点、应用、规则与实际出口的累计流量。</p>
+      </div>
+      <a id="exportLink" class="export" href="/api/export.csv?period=today&group=site&scope=all">
+        <svg aria-hidden="true"><use href="#icon-export"/></svg><span>导出 CSV</span>
+      </a>
+    </section>
+
+    <section class="toolbar" aria-label="统计范围">
+      <div class="segmented" id="periods" aria-label="时间范围">
+        <button data-period="today" class="active">今天</button>
+        <button data-period="yesterday">昨天</button>
+        <button data-period="7d">近 7 天</button>
+        <button data-period="30d">近 30 天</button>
+        <button data-period="all">全部</button>
+      </div>
+      <div class="segmented" id="scopes" aria-label="线路范围">
+        <button data-scope="all" class="active">全部线路</button>
+        <button data-scope="proxy">仅代理</button>
+        <button data-scope="direct">仅直连</button>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="流量总览">
+      <article class="metric metric-total">
+        <div class="metric-top"><span>总流量</span><span class="metric-icon"><svg><use href="#icon-database"/></svg></span></div>
+        <strong id="total">—</strong>
+        <small id="knownRate">等待采样</small>
+      </article>
+      <article class="metric metric-download">
+        <div class="metric-top"><span>下载</span><span class="metric-icon"><svg><use href="#icon-download"/></svg></span></div>
+        <strong id="download">—</strong>
+        <small>接收的数据</small>
+      </article>
+      <article class="metric metric-upload">
+        <div class="metric-top"><span>上传</span><span class="metric-icon"><svg><use href="#icon-upload"/></svg></span></div>
+        <strong id="upload">—</strong>
+        <small>发出的数据</small>
+      </article>
+      <article class="metric metric-connections">
+        <div class="metric-top"><span>当前连接</span><span class="metric-icon"><svg><use href="#icon-plug"/></svg></span></div>
+        <strong id="connections">—</strong>
+        <small id="lastUpdate">尚未采样</small>
+      </article>
+    </section>
+
+    <section class="visuals" aria-label="流量可视化">
+      <article class="visual-panel composition-panel">
+        <div class="visual-head">
+          <div><p class="eyebrow">TRANSFER</p><h2>上下行构成</h2></div>
+          <svg class="head-icon" aria-hidden="true"><use href="#icon-activity"/></svg>
+        </div>
+        <div class="composition">
+          <div id="trafficRing" class="traffic-ring" style="--download-percent: 50">
+            <div><strong id="downloadRate">—</strong><span>下载占比</span></div>
+          </div>
+          <div class="composition-legend">
+            <div><span class="legend-dot download-dot"></span><span>下载</span><strong id="downloadLegend">—</strong></div>
+            <div><span class="legend-dot upload-dot"></span><span>上传</span><strong id="uploadLegend">—</strong></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="visual-panel distribution-panel">
+        <div class="visual-head">
+          <div><p class="eyebrow">DISTRIBUTION</p><h2>去向分布</h2></div>
+          <svg class="head-icon" aria-hidden="true"><use href="#icon-eye"/></svg>
+        </div>
+        <div id="distribution" class="distribution"><div class="visual-empty">等待流量数据</div></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">TOP DESTINATIONS</p>
+          <h2 id="groupTitle">按站点汇总</h2>
+        </div>
+        <div class="segmented groups" id="groups" aria-label="分组方式">
+          <button data-group="site" class="active">站点</button>
+          <button data-group="destination">完整域名</button>
+          <button data-group="process">应用</button>
+          <button data-group="rule">规则</button>
+          <button data-group="outbound">出口</button>
+          <button data-group="chain">出口链</button>
+        </div>
+      </div>
+      <div class="table-head"><span>去向</span><span>来源分组</span><span>下载 / 上传</span><span>合计</span></div>
+      <div id="rows" class="rows"><div class="empty">正在读取数据…</div></div>
+      <p class="note"><svg aria-hidden="true"><use href="#icon-help"/></svg><span>“未识别”表示连接在两次采样之间已经关闭；这部分仍计入“全部”总量，但不纳入“仅代理/仅直连”筛选。</span></p>
+    </section>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

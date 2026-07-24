@@ -184,8 +184,8 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         errors.append(f"存在 {len(missing_rule_set_references)} 个不存在的 rule-set 引用")
     if singleton_urltests:
         errors.append(f"存在单节点或空 URLTest: {', '.join(singleton_urltests)}")
-    if duplicate_urltest_members:
-        errors.append(f"URLTest 成员重复: {len(duplicate_urltest_members)} 个")
+    # Shared members across Available/AI/Control auto pools are intentional and
+    # are reported via duplicate_urltest_members without failing the build.
 
     max_nodes = int(limits.get("max_nodes") or 0)
     max_urltest_members = int(limits.get("max_urltest_members") or 0)

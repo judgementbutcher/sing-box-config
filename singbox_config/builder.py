@@ -62,8 +62,9 @@ configure_stdio()
 DEFAULT_MAX_NODES_PER_REGION = 0
 DEFAULT_MAX_OTHER_NODES = 0
 DEFAULT_SUBSCRIPTION_CACHE_DIR = "runtime/subscription-cache"
-DEFAULT_TEMPLATE_DIR = "templates"
-LEGACY_TEMPLATE_PATH = "template.json"
+DEFAULT_TEMPLATE_DIR = "config/local/templates"
+LEGACY_TEMPLATE_PATH = "config/local/templates/desktop-windows-sing-box-1.14.json"
+EXAMPLE_TEMPLATE_PATH = "config/examples/templates/desktop-windows-sing-box-1.14.json"
 DEFAULT_KEEP_INFO_NODES = False
 DEFAULT_AVAILABLE_URLTEST_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_AVAILABLE_URLTEST_INTERVAL = "10m"
@@ -266,7 +267,7 @@ def subscription_request_headers(user_agent: Optional[str] = None) -> Dict[str, 
         "Accept": "text/yaml,text/plain,application/x-yaml,application/octet-stream,*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
-        "User-Agent": user_agent or "clash-verge/v2.4.7",
+        "User-Agent": user_agent or "clash-verge/v2.5.1",
     }
 
 
@@ -564,10 +565,14 @@ def print_template_choices(templates: List[Path]) -> None:
 def choose_template_interactively(template_dir: Path) -> Path:
     templates = discover_templates(template_dir)
     if not templates:
-        legacy_path = Path(LEGACY_TEMPLATE_PATH)
-        if legacy_path.exists():
-            print(f"[WARN] 未找到 {display_path(template_dir)}/*.json，退回使用 {display_path(legacy_path)}")
-            return legacy_path
+        for fallback in (LEGACY_TEMPLATE_PATH, EXAMPLE_TEMPLATE_PATH):
+            fallback_path = Path(fallback)
+            if fallback_path.exists():
+                print(
+                    f"[WARN] 未找到 {display_path(template_dir)}/*.json，"
+                    f"退回使用 {display_path(fallback_path)}"
+                )
+                return fallback_path
         raise FileNotFoundError(f"未找到模板文件。请在 {display_path(template_dir)} 放入 *.json 模板")
 
     print_template_choices(templates)
@@ -631,6 +636,8 @@ def build_urltest(
     interval: str = DEFAULT_AVAILABLE_URLTEST_INTERVAL,
     tolerance: int = DEFAULT_AVAILABLE_URLTEST_TOLERANCE,
     idle_timeout: str = DEFAULT_AVAILABLE_URLTEST_IDLE_TIMEOUT,
+    *,
+    interrupt_exist_connections: bool = True,
 ) -> Dict[str, Any]:
     unique_outbounds = list(dict.fromkeys(str(value) for value in outbounds if str(value).strip()))
     if len(unique_outbounds) < 2:
@@ -643,7 +650,7 @@ def build_urltest(
         "interval": interval,
         "tolerance": tolerance,
         "idle_timeout": idle_timeout,
-        "interrupt_exist_connections": False,
+        "interrupt_exist_connections": interrupt_exist_connections,
     }
 
 
@@ -1529,7 +1536,7 @@ def build_config_from_subscriptions(
     max_nodes_per_region: int = DEFAULT_MAX_NODES_PER_REGION,
     max_other_nodes: int = DEFAULT_MAX_OTHER_NODES,
     keep_info_nodes: bool = DEFAULT_KEEP_INFO_NODES,
-    user_agent: str = "clash-verge/v2.4.7",
+    user_agent: str = "clash-verge/v2.5.1",
     cache_dir: Optional[Path] = Path(DEFAULT_SUBSCRIPTION_CACHE_DIR),
     fetch_proxy: Optional[str] = None,
     available_urltest: bool = False,
@@ -2006,7 +2013,6 @@ def build_config_from_subscriptions(
         outbounds.extend(strip_meta(group["info_outbounds"]))
 
     outbounds.append({"type": "direct", "tag": "direct"})
-    outbounds.append({"type": "block", "tag": "block"})
 
     conf = copy.deepcopy(template)
     conf["outbounds"] = outbounds
@@ -2163,9 +2169,9 @@ def print_config_summary(
     if ui_url:
         print(f"面板: {ui_url}")
     if str(platform or "").lower() == "android" or "android" in template_path.name.lower():
-        print(f"下一步: 将 {output_path} 导入 Android sing-box；本机可先运行 .\\sing-box.exe check -c {output_path} 做基础校验")
+        print(f"下一步: 将 {output_path} 导入 Android sing-box；本机可用 runtime\\cores\\<版本>\\sing-box.exe check -c {output_path} 做基础校验")
     else:
-        print(f"下一步: .\\sing-box.exe check -c {output_path}，通过后运行 .\\singbox-service.exe restart")
+        print(f"下一步: runtime\\cores\\<版本>\\sing-box.exe check -c {output_path}，通过后运行 runtime\\services\\singbox-service.exe restart")
 
 
 def resolve_profile_file(profile: Dict[str, Any], value: Any) -> Optional[Path]:
@@ -2206,14 +2212,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="生成 sing-box 配置，支持多订阅、地区分组和 AI 分流")
     parser.add_argument("--profile", default=None, help="配置档位 YAML，例如 profiles/desktop-dev.yaml")
     parser.add_argument("--list-profiles", action="store_true", help="列出 profiles/*.yaml 后退出")
-    parser.add_argument("--subscriptions", default="subscriptions.yaml", help="订阅组清单，默认 subscriptions.yaml")
+    parser.add_argument(
+        "--subscriptions",
+        default="config/local/subscriptions.yaml",
+        help="订阅组清单，默认 config/local/subscriptions.yaml",
+    )
     parser.add_argument("--sub-url", default=None, help="兼容旧用法：单个 Clash 订阅链接")
     parser.add_argument("--sub-file", default=None, help="兼容旧用法：本地 Clash YAML 文件")
     parser.add_argument("--sub-name", default="example-provider", help="兼容旧用法下的订阅组名称")
     parser.add_argument("--sub-parser", default="clash", help="兼容旧用法下的解析器，默认 clash")
-    parser.add_argument("--subscription-file", default="subscriptions/example-provider.txt", help="默认订阅链接文件")
-    parser.add_argument("--template", default=None, help="模板文件路径；未指定时从 templates/ 交互选择")
-    parser.add_argument("--template-dir", default=DEFAULT_TEMPLATE_DIR, help="模板目录，默认 templates")
+    parser.add_argument("--subscription-file", default="config/local/subscriptions/example-provider.txt", help="默认订阅链接文件")
+    parser.add_argument("--template", default=None, help="模板文件路径；未指定时从 config/local/templates/ 交互选择")
+    parser.add_argument("--template-dir", default=DEFAULT_TEMPLATE_DIR, help="模板目录，默认 config/local/templates")
     parser.add_argument("--list-templates", action="store_true", help="列出可用模板后退出")
     parser.add_argument("--output", default=None, help="输出文件路径")
     parser.add_argument("--report", default=None, help="节点报告输出路径")
@@ -2233,7 +2243,7 @@ def main() -> None:
     )
     parser.add_argument("--clash-secret", default=None, help="覆盖模板里的 clash_api.secret")
     parser.add_argument("--clash-secret-file", default=None, help="读取或创建 Clash API secret 文件")
-    parser.add_argument("--user-agent", default="clash-verge/v2.4.7", help="自定义请求头 User-Agent")
+    parser.add_argument("--user-agent", default="clash-verge/v2.5.1", help="自定义请求头 User-Agent")
     parser.add_argument(
         "--subscription-cache-dir",
         default=DEFAULT_SUBSCRIPTION_CACHE_DIR,

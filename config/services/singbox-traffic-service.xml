@@ -3,11 +3,11 @@
   <name>sing-box traffic monitor</name>
   <description>sing-box 本地流量去向统计面板</description>
 
-  <executable>%BASE%\.venv\Scripts\python.exe</executable>
-  <arguments>"%BASE%\traffic_monitor.py" --host 127.0.0.1 --port 9091</arguments>
-  <workingdirectory>%BASE%</workingdirectory>
+  <executable>%BASE%\..\..\.venv\Scripts\python.exe</executable>
+  <arguments>"%BASE%\..\..\scripts\monitor\traffic_monitor.py" --host 127.0.0.1 --port 9091</arguments>
+  <workingdirectory>%BASE%\..\..</workingdirectory>
 
-  <logpath>%BASE%\runtime\logs</logpath>
+  <logpath>%BASE%\..\logs</logpath>
   <log mode="roll-by-size">
     <sizeThreshold>2048</sizeThreshold>
     <keepFiles>2</keepFiles>

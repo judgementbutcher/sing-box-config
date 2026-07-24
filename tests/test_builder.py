@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from build_singbox import build_config_from_subscriptions
+from singbox_config.builder import build_config_from_subscriptions
 from singbox_config.audit import audit_config
 
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 
-FORBIDDEN_FILES = {
+ROOT = Path(__file__).resolve().parents[2]
+LEGACY_FORBIDDEN_ROOT_FILES = {
     "subscriptions.yaml",
     "template.json",
     "config.json",
@@ -36,6 +37,7 @@ def public_candidates() -> list[str]:
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         check=True,
         stdout=subprocess.PIPE,
+        cwd=ROOT,
     )
     return [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
 
@@ -43,10 +45,11 @@ def public_candidates() -> list[str]:
 def forbidden_path(path_text: str) -> bool:
     path = PurePosixPath(path_text)
     return (
-        path.name in FORBIDDEN_FILES
+        path_text in LEGACY_FORBIDDEN_ROOT_FILES
+        or path.parts[:2] == ("config", "local")
+        or path_text == "docs/README.local.md"
         or bool(FORBIDDEN_PARTS.intersection(path.parts))
         or path.suffix.lower() in FORBIDDEN_SUFFIXES
-        or (path.parent.name == "templates" and path.suffix == ".json" and not path.name.endswith(".example.json"))
     )
 
 
@@ -64,7 +67,7 @@ def scan_text(text: str) -> list[str]:
 
 def worktree_findings(path_text: str) -> list[str]:
     try:
-        text = open(path_text, encoding="utf-8").read()
+        text = (ROOT / path_text).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return []
     return scan_text(text)
@@ -75,6 +78,7 @@ def index_findings(path_text: str) -> list[str]:
         ["git", "show", f":{path_text}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        cwd=ROOT,
     )
     if result.returncode:
         return []

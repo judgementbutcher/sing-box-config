@@ -1,11 +1,13 @@
 # Sensitive inputs and local-only documentation
 README.local.md
+docs/README.local.md
 android_apps.yaml
 policy_aliases.yaml
 template.json
 templates/*.json
 !templates/*.example.json
 subscriptions.yaml
+config/local/
 config.json
 config.next.json
 config.*.json

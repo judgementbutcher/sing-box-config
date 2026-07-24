@@ -121,7 +121,8 @@ def apply_profile_to_template(
     if tuning.get("dns_reverse_mapping") is not None:
         dns["reverse_mapping"] = bool(tuning["dns_reverse_mapping"])
     if tuning.get("dns_optimistic") is not None:
-        dns["optimistic"] = bool(tuning["dns_optimistic"])
+        optimistic = tuning["dns_optimistic"]
+        dns["optimistic"] = copy.deepcopy(optimistic) if isinstance(optimistic, dict) else bool(optimistic)
     if tuning.get("dns_timeout"):
         dns["timeout"] = str(tuning["dns_timeout"])
     if tuning.get("dns_final"):
@@ -129,9 +130,10 @@ def apply_profile_to_template(
     if bool(tuning.get("force_local_dns")):
         dns["rules"] = []
 
-    dns_detour = str(control.get("dns_detour") or "DNS-Out")
-    update_detour = str(control.get("update_detour") or "Update-Out")
+    dns_detour = str(control.get("dns_detour") or "Available")
+    update_detour = str(control.get("update_detour") or "direct")
     _replace_detour(dns.get("servers", []), "Available", dns_detour)
+    _replace_detour(dns.get("servers", []), "DNS-Out", dns_detour)
 
     tun = _find_tun_inbound(conf)
     if tun is None:
@@ -153,6 +155,9 @@ def apply_profile_to_template(
         conf["inbounds"] = [tun]
         tun.pop("route_address", None)
         tun.pop("route_exclude_address", None)
+        # SFA owns Android's VPN routing and leak protection.  strict_route is
+        # a desktop TUN/WFP concern and should not be inherited from Windows.
+        tun.pop("strict_route", None)
         app_settings = profile.get("android_apps") if isinstance(profile.get("android_apps"), dict) else {}
         app_file = str(app_settings.get("file") or "").strip()
         if app_file:
@@ -207,7 +212,14 @@ def apply_profile_to_template(
 
     if _version_tuple(core_version) >= (1, 14, 0):
         client_tag = "rule-set-downloader"
-        conf["http_clients"] = [{"tag": client_tag, "detour": update_detour}]
+        # sing-box 1.14 rejects an http_client whose detour points at the bare
+        # `direct` outbound ("detour to an empty direct outbound makes no sense").
+        # A client with no detour already dials directly, so only attach a detour
+        # for a real proxy outbound; "direct" is expressed by omitting it.
+        downloader: Dict[str, Any] = {"tag": client_tag}
+        if update_detour and update_detour != "direct":
+            downloader["detour"] = update_detour
+        conf["http_clients"] = [downloader]
         route["default_http_client"] = client_tag
         for rule_set in rule_sets:
             if not isinstance(rule_set, dict) or rule_set.get("type") != "remote":

@@ -22,7 +22,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Sequence
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PORT = 8080
 
 
@@ -67,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not android_config.exists():
         print(
             f"[错误] 找不到 {android_config}。\n"
-            f"       请先生成安卓配置：python generate_config.py android",
+            f"       请先生成安卓配置：python scripts/config/generate_config.py android",
             flush=True,
         )
         return 1
@@ -76,7 +76,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
     except OSError as exc:
-        print(f"[错误] 无法监听 0.0.0.0:{args.port}：{exc}\n       换个端口：serve_android.bat --port 8888", flush=True)
+        print(
+            f"[错误] 无法监听 0.0.0.0:{args.port}：{exc}\n"
+            "       换个端口：scripts/serve/serve_android.bat --port 8888",
+            flush=True,
+        )
         return 1
 
     url = f"http://{lan_ip()}:{args.port}/android/config.json"

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-import build_singbox
-from build_singbox import (
+import singbox_config.builder as build_singbox
+from singbox_config.builder import (
     SubscriptionContent,
     fetch_source_with_cache,
     prepare_subscription,

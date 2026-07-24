@@ -27,12 +27,15 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB = BASE_DIR / "runtime" / "traffic-monitor.db"
-DEFAULT_UI = BASE_DIR / "traffic_dashboard"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DB = PROJECT_ROOT / "runtime" / "traffic-monitor.db"
+DEFAULT_UI = PROJECT_ROOT / "web" / "traffic-dashboard"
 UNKNOWN = "未识别（采样间隙/已关闭连接）"
 GROUPS = {"site", "destination", "process", "rule", "outbound", "chain", "network"}
 SCOPES = {"all", "proxy", "direct"}
+ROUTE_GROUPS = {
+    "Available", "AI", "Emby", "direct", "block",
+}
 COMMON_SECOND_LEVEL_SUFFIXES = {
     "ac.cn", "com.cn", "edu.cn", "gov.cn", "net.cn", "org.cn",
     "co.jp", "ne.jp", "or.jp", "co.kr", "or.kr",
@@ -97,6 +100,32 @@ def connection_dimensions(connection: dict[str, Any]) -> dict[str, str]:
         "chain": chain,
         "network": _text(metadata.get("network"), "未知协议").upper(),
     }
+
+
+def source_group_from_chain(chain: str) -> str:
+    """Infer the provider selector (or self-hosted pool) from a route chain."""
+
+    values = [part.strip() for part in str(chain or "").split("→") if part.strip()]
+    if not values or values[0] in {"未知出口", UNKNOWN}:
+        return "未知分组"
+    node = values[0]
+    if node == "direct":
+        return "直连"
+    node_prefix = node.split("/", 1)[0].strip()
+    # Generated node tags carry the provider before the slash. This is more
+    # precise than the next chain segment, which may be a regional selector.
+    if "/" in node:
+        if "自建" in node or "自建" in node_prefix:
+            return "自建"
+        return node_prefix or node
+    # Normal generated routes are node -> provider -> policy group.
+    if len(values) >= 3 and values[1] not in ROUTE_GROUPS:
+        return values[1]
+    if "自建" in node or "自建" in node_prefix:
+        return "自建"
+    # A two-part chain has no provider selector. Generated node tags retain
+    # the provider prefix, so use it as the best available attribution.
+    return node_prefix or node
 
 
 class TrafficStore:
@@ -299,21 +328,38 @@ class TrafficStore:
             ).fetchone()
             source_group = "destination" if group == "site" else group
             rows = self._db.execute(
-                f"SELECT {source_group} label, SUM(upload) upload, SUM(download) download, "
-                f"MAX(last_seen) last_seen FROM usage {where} GROUP BY {source_group}",
+                f"SELECT {source_group} label, chain, SUM(upload) upload, SUM(download) download, "
+                f"MAX(last_seen) last_seen FROM usage {where} GROUP BY {source_group}, chain",
                 params,
             ).fetchall()
 
         combined: dict[str, dict[str, Any]] = {}
         for row in rows:
             label = site_key(str(row["label"])) if group == "site" else str(row["label"])
-            item = combined.setdefault(label, {"label": label, "upload": 0, "download": 0, "lastSeen": ""})
+            item = combined.setdefault(
+                label,
+                {"label": label, "upload": 0, "download": 0, "lastSeen": "", "sourceTotals": defaultdict(lambda: [0, 0])},
+            )
             item["upload"] += int(row["upload"])
             item["download"] += int(row["download"])
             item["lastSeen"] = max(item["lastSeen"], str(row["last_seen"] or ""))
+            source = source_group_from_chain(str(row["chain"] or ""))
+            item["sourceTotals"][source][0] += int(row["upload"])
+            item["sourceTotals"][source][1] += int(row["download"])
         ordered = sorted(combined.values(), key=lambda item: item["upload"] + item["download"], reverse=True)
         for item in ordered:
             item["total"] = item["upload"] + item["download"]
+            item["sourceGroups"] = [
+                {
+                    "label": source,
+                    "upload": values[0],
+                    "download": values[1],
+                    "total": values[0] + values[1],
+                }
+                for source, values in sorted(
+                    item.pop("sourceTotals").items(), key=lambda pair: sum(pair[1]), reverse=True
+                )
+            ]
         total_up = int(totals["upload"])
         total_down = int(totals["download"])
         return {
@@ -447,9 +493,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 summary = self.app.store.summary(period, group, 500, scope)
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(["排名", "分类", "上传字节", "下载字节", "总字节", "最后活动"])
+                writer.writerow(["排名", "分类", "分组", "上传字节", "下载字节", "总字节", "最后活动"])
                 for index, row in enumerate(summary["rows"], 1):
-                    writer.writerow([index, row["label"], row["upload"], row["download"], row["total"], row["lastSeen"]])
+                    source = " / ".join(group["label"] for group in row.get("sourceGroups", [])) or "未知分组"
+                    writer.writerow([index, row["label"], source, row["upload"], row["download"], row["total"], row["lastSeen"]])
                 body = ("\ufeff" + output.getvalue()).encode("utf-8")
                 self._headers(HTTPStatus.OK, "text/csv; charset=utf-8", len(body))
                 self.wfile.write(body)
