@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "storeedgefd.dsx.mp.microsoft.com",
+        "displaycatalog.md.mp.microsoft.com",
+        "displaycatalog.mp.microsoft.com",
+        "purchase.md.mp.microsoft.com",
+        "licensing.mp.microsoft.com",
+        "dl.delivery.mp.microsoft.com",
+        "tlu.dl.delivery.mp.microsoft.com",
+        "assets1.xboxlive.com",
+        "assets2.xboxlive.com",
+        "dlassets-ssl.xboxlive.com"
+      ]
+    }
+  ]
+}

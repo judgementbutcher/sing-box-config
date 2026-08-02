@@ -74,11 +74,18 @@ DEFAULT_FETCH_WORKERS = 4
 DEFAULT_FETCH_CONNECT_TIMEOUT = 5
 DEFAULT_FETCH_READ_TIMEOUT = 20
 DEFAULT_FETCH_RETRIES = 2
-DEFAULT_CACHE_MAX_STALE = "7d"
-DEFAULT_CACHE_RETENTION = "30d"
+DEFAULT_CACHE_MAX_STALE = "3d"
+DEFAULT_CACHE_RETENTION = "14d"
 HOME_NODE_KEYWORDS = ["家宽", "home", "residential"]
 COUNTRY_CODE_RE = re.compile(r"\b([A-Z]{2})\b")
 NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "block", "dns"}
+MICROSOFT_STORE_PROCESS_NAMES = (
+    "WinStore.App.exe",
+    "MicrosoftStore.exe",
+    "StoreExperienceHost.exe",
+)
+MICROSOFT_STORE_RULE_SET_TAG = "microsoft-store"
+GOOGLE_PLAY_RULE_SET_TAG = "google-play"
 SUBSCRIPTION_USERINFO_HEADER = "Subscription-Userinfo"
 PROFILE_HEADER_MAP = {
     "profile_update_interval": "Profile-Update-Interval",
@@ -665,10 +672,16 @@ def strip_meta(outbounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cleaned
 
 
-def retag_outbound(outbound: Dict[str, Any], tag_prefix: str, used_tags: Set[str]) -> Dict[str, Any]:
+def retag_outbound(
+    outbound: Dict[str, Any],
+    tag_prefix: str,
+    used_tags: Set[str],
+    *,
+    exact_tag: Optional[str] = None,
+) -> Dict[str, Any]:
     ob = copy.deepcopy(outbound)
     name = str(ob.get("_meta_name") or ob.get("tag") or "node").strip()
-    base_tag = f"{tag_prefix}/{name}"
+    base_tag = str(exact_tag or "").strip() or (f"{tag_prefix}/{name}" if tag_prefix else name)
     if base_tag not in used_tags:
         used_tags.add(base_tag)
         ob["tag"] = base_tag
@@ -1333,9 +1346,11 @@ def build_provider_group(
     )
     include_in_available = parse_bool(item.get("include_in_available", item.get("available")), default=False)
     include_in_selectors = parse_string_list(item.get("include_in_selectors"))
+    prefix_node_tags = parse_bool(item.get("prefix_node_tags", item.get("prefix_nodes")), default=True)
+    node_tag_prefix = provider_tag if prefix_node_tags else ""
     active_info_outbounds: List[Dict[str, Any]] = []
     if keep_info_nodes and info_outbounds:
-        active_info_outbounds = [retag_outbound(ob, provider_tag, used_tags) for ob in info_outbounds]
+        active_info_outbounds = [retag_outbound(ob, node_tag_prefix, used_tags) for ob in info_outbounds]
 
     grouped: Dict[str, List[Dict[str, Any]]] = {region: [] for region in ALL_REGIONS}
     for ob in node_outbounds:
@@ -1375,9 +1390,10 @@ def build_provider_group(
         raise RuntimeError(f"订阅组 {name} 没有可用节点")
 
     selected_nodes: List[Dict[str, Any]] = []
+    exact_node_tag = str(item.get("node_tag") or "").strip() or None
     for region in ALL_REGIONS:
         for ob in grouped.get(region, []):
-            node = retag_outbound(ob, provider_tag, used_tags)
+            node = retag_outbound(ob, node_tag_prefix, used_tags, exact_tag=exact_node_tag)
             node["_meta_subscription"] = name
             node["_meta_role"] = str(item.get("role") or "default")
             node["_meta_priority"] = int(item.get("priority", 100))
@@ -1527,6 +1543,173 @@ def choose_provider_default(built_groups: List[Dict[str, Any]]) -> str:
 
 def is_public_role(role: Any) -> bool:
     return str(role or "").strip().lower() in {"public", "free", "community", "backup-public", "公益"}
+
+
+def configure_microsoft_store_rules(conf: Dict[str, Any]) -> None:
+    """Add Microsoft Store process and domain rules to route traffic via proxy.
+
+    Rules are inserted after game accelerator bypass rules but before geosite-cn.
+    """
+    route = conf.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    rule_sets = route.setdefault("rule_set", [])
+
+    # Check if Store process rule already exists
+    store_processes = set(MICROSOFT_STORE_PROCESS_NAMES)
+    has_store_rule = any(
+        isinstance(rule, dict)
+        and isinstance(rule.get("process_name"), list)
+        and store_processes <= set(rule.get("process_name", []))
+        for rule in rules
+    )
+
+    if has_store_rule:
+        return
+
+    # Ensure find_process is enabled
+    route["find_process"] = True
+
+    # Add rule-set if not present
+    has_store_rule_set = any(
+        isinstance(rs, dict) and rs.get("tag") == MICROSOFT_STORE_RULE_SET_TAG
+        for rs in rule_sets
+    )
+
+    if not has_store_rule_set:
+        rule_sets.append({
+            "tag": MICROSOFT_STORE_RULE_SET_TAG,
+            "type": "local",
+            "format": "binary",
+            "path": f"config/rule-sets/{MICROSOFT_STORE_RULE_SET_TAG}.srs"
+        })
+
+    # Find insertion point: after game accelerators, before geosite-cn
+    insert_at = len(rules)
+    for i, rule in enumerate(rules):
+        if isinstance(rule, dict):
+            # If we find geosite-cn, insert before it
+            rule_set_field = rule.get("rule_set", [])
+            if isinstance(rule_set_field, list) and "geosite-cn" in rule_set_field:
+                insert_at = i
+                break
+            elif isinstance(rule_set_field, str) and rule_set_field == "geosite-cn":
+                insert_at = i
+                break
+
+    # Insert Store rules
+    rules.insert(insert_at, {
+        "process_name": list(MICROSOFT_STORE_PROCESS_NAMES),
+        "action": "route",
+        "outbound": "Available"
+    })
+    rules.insert(insert_at + 1, {
+        "rule_set": [MICROSOFT_STORE_RULE_SET_TAG],
+        "action": "route",
+        "outbound": "Available"
+    })
+
+    # Add DNS rule for Store domains
+    dns = conf.setdefault("dns", {})
+    dns_rules = dns.setdefault("rules", [])
+
+    has_store_dns_rule = any(
+        isinstance(rule, dict)
+        and MICROSOFT_STORE_RULE_SET_TAG in (rule.get("rule_set") or [])
+        for rule in dns_rules
+    )
+
+    if not has_store_dns_rule:
+        # Find "google" server
+        dns_servers = dns.get("servers", [])
+        has_google_server = any(
+            isinstance(s, dict) and s.get("tag") == "google"
+            for s in dns_servers
+        )
+
+        if has_google_server:
+            dns_rules.insert(0, {
+                "rule_set": [MICROSOFT_STORE_RULE_SET_TAG],
+                "action": "route",
+                "server": "google"
+            })
+
+
+def configure_google_play_rules(conf: Dict[str, Any]) -> None:
+    """Add Google Play domain rules to route traffic via proxy (Android only).
+
+    Rules are inserted before geosite-cn.
+    """
+    route = conf.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    rule_sets = route.setdefault("rule_set", [])
+
+    # Check if Google Play rule already exists
+    has_play_rule = any(
+        isinstance(rule, dict)
+        and GOOGLE_PLAY_RULE_SET_TAG in (rule.get("rule_set") or [])
+        for rule in rules
+    )
+
+    if has_play_rule:
+        return
+
+    # Add rule-set if not present
+    has_play_rule_set = any(
+        isinstance(rs, dict) and rs.get("tag") == GOOGLE_PLAY_RULE_SET_TAG
+        for rs in rule_sets
+    )
+
+    if not has_play_rule_set:
+        rule_sets.append({
+            "tag": GOOGLE_PLAY_RULE_SET_TAG,
+            "type": "local",
+            "format": "binary",
+            "path": f"config/rule-sets/{GOOGLE_PLAY_RULE_SET_TAG}.srs"
+        })
+
+    # Find insertion point: before geosite-cn
+    insert_at = len(rules)
+    for i, rule in enumerate(rules):
+        if isinstance(rule, dict):
+            rule_set_field = rule.get("rule_set", [])
+            if isinstance(rule_set_field, list) and "geosite-cn" in rule_set_field:
+                insert_at = i
+                break
+            elif isinstance(rule_set_field, str) and rule_set_field == "geosite-cn":
+                insert_at = i
+                break
+
+    # Insert Play Store rule
+    rules.insert(insert_at, {
+        "rule_set": [GOOGLE_PLAY_RULE_SET_TAG],
+        "action": "route",
+        "outbound": "Available"
+    })
+
+    # Add DNS rule for Play Store domains
+    dns = conf.setdefault("dns", {})
+    dns_rules = dns.setdefault("rules", [])
+
+    has_play_dns_rule = any(
+        isinstance(rule, dict)
+        and GOOGLE_PLAY_RULE_SET_TAG in (rule.get("rule_set") or [])
+        for rule in dns_rules
+    )
+
+    if not has_play_dns_rule:
+        # Find "google" server
+        dns_servers = dns.get("servers", [])
+        has_google_server = any(
+            isinstance(s, dict) and s.get("tag") == "google"
+            for s in dns_servers
+        )
+
+        if has_google_server:
+            dns_rules.insert(0, {
+                "rule_set": [GOOGLE_PLAY_RULE_SET_TAG],
+                "action": "route",
+                "server": "google"
+            })
 
 
 def build_config_from_subscriptions(
@@ -2049,20 +2232,41 @@ def write_nodes_report(
         for ob in outbounds
         if isinstance(ob, dict) and ob.get("type") == "selector" and ob.get("tag")
     ]
+    outbound_by_tag = {
+        str(ob["tag"]): ob
+        for ob in outbounds
+        if isinstance(ob, dict) and ob.get("tag")
+    }
+    proxy_tags = {str(ob["tag"]) for ob in proxy_nodes if ob.get("tag")}
+
+    def referenced_proxy_tags(tag: str, seen: Optional[Set[str]] = None) -> List[str]:
+        if tag in proxy_tags:
+            return [tag]
+        seen = set(seen or ())
+        if tag in seen:
+            return []
+        seen.add(tag)
+        outbound = outbound_by_tag.get(tag)
+        if not outbound:
+            return []
+        resolved: List[str] = []
+        for child in outbound.get("outbounds", []):
+            resolved.extend(referenced_proxy_tags(str(child), seen))
+        return list(dict.fromkeys(resolved))
 
     subscription_reports: List[Dict[str, Any]] = []
     for item in subscriptions:
         name = str(item["name"])
-        prefix = f"{configured_group_tag(item, name)}/"
+        group_tag = configured_group_tag(item, name)
+        prefix = f"{group_tag}/"
         region_counts: Counter[str] = Counter()
-        node_count = 0
-        for node in proxy_nodes:
-            tag = str(node.get("tag") or "")
-            if not tag.startswith(prefix):
-                continue
-            node_count += 1
-            # Re-detect from the visible node suffix so the report stays independent of stripped metadata.
-            region_counts[detect_region(tag.removeprefix(prefix))] += 1
+        node_tags = referenced_proxy_tags(group_tag)
+        if not node_tags:
+            node_tags = [tag for tag in proxy_tags if tag.startswith(prefix)]
+        node_count = len(node_tags)
+        for tag in node_tags:
+            visible_tag = tag.removeprefix(prefix) if tag.startswith(prefix) else tag
+            region_counts[detect_region(visible_tag)] += 1
 
         subscription_report: Dict[str, Any] = {
             "name": name,
@@ -2459,6 +2663,14 @@ def main() -> None:
             offline=args.offline,
             policy_aliases=policy_aliases,
         )
+
+        # Add platform-specific app store rules
+        platform = str(profile.get("platform") or "windows").lower()
+        if platform == "windows":
+            configure_microsoft_store_rules(conf)
+        elif platform == "android":
+            configure_google_play_rules(conf)
+
         validation_limits = profile.get("validation") if isinstance(profile.get("validation"), dict) else {}
         audit_report = require_valid_config(conf, validation_limits)
         save_json(str(output_path), conf)

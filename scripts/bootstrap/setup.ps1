@@ -12,8 +12,9 @@ $ProgressPreference = "SilentlyContinue"
 $ProjectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location -LiteralPath $ProjectRoot
 
-$CoreVersion = "1.14.0-beta.1"
-$CoreExecutableHash = "44B66EF3A88F6B8FA2A92607CEF3BD5F4BCFED2C945111730B3F33A9BFCDA101"
+$CoreVersion = "1.14.0-beta.4"
+$CoreExecutableHash = "A78D4CE0D02D97E029DAD6DF42CA1C38F2671C57DDC1FFBBC759104488129708"
+$CoreArchiveHash = "361351090AE3CE6EA7FA8479182311DDB3BAA514082CAFA78B488CF056C89903"
 $CronetHash = "C7434CFA93C3041321DD19111C4DE6C52B8A9531A65661BA45425D3C51EC69E2"
 $ServiceVersion = "2.12.0"
 $ServiceHash = "05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA"
@@ -239,7 +240,7 @@ $archiveUrl = "https://github.com/SagerNet/sing-box/releases/download/v$CoreVers
 $coreExe = Join-Path $CoreDirectory "sing-box.exe"
 $cronetDll = Join-Path $CoreDirectory "libcronet.dll"
 if (-not (Test-FileHash $coreExe $CoreExecutableHash) -or -not (Test-FileHash $cronetDll $CronetHash)) {
-    Invoke-WebRequest -Uri $archiveUrl -OutFile $archive -UseBasicParsing
+    Get-VerifiedFile -Url $archiveUrl -Destination $archive -ExpectedHash $CoreArchiveHash
     $extractDirectory = Join-Path $DownloadDirectory "sing-box-$CoreVersion"
     Remove-Item -LiteralPath $extractDirectory -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -LiteralPath $archive -DestinationPath $extractDirectory -Force
@@ -258,27 +259,55 @@ if (-not (Test-FileHash $coreExe $CoreExecutableHash) -or -not (Test-FileHash $c
 $serviceUrl = "https://github.com/winsw/winsw/releases/download/v$ServiceVersion/WinSW-x64.exe"
 Get-VerifiedFile -Url $serviceUrl -Destination $ServiceExe -ExpectedHash $ServiceHash
 New-Item -ItemType Directory -Force -Path $ServiceDirectory | Out-Null
-Copy-Item -LiteralPath (Join-Path $ProjectRoot "config\services\singbox-service.xml") `
-    -Destination (Join-Path $ServiceDirectory "singbox-service.xml") -Force
 if (-not (Test-FileHash -Path $TrafficServiceExe -ExpectedHash $ServiceHash)) {
     Copy-Item -LiteralPath $ServiceExe -Destination $TrafficServiceExe -Force
 }
-Copy-Item -LiteralPath (Join-Path $ProjectRoot "config\services\singbox-traffic-service.xml") `
-    -Destination (Join-Path $ServiceDirectory "singbox-traffic-service.xml") -Force
 
 Write-Host "=== Generating and checking configurations ==="
-$generatorArguments = @((Join-Path $ProjectRoot "scripts\config\generate_config.py"), "all")
-if ($FetchProxy) {
-    $generatorArguments += @("--fetch-proxy", $FetchProxy)
+$stagingRoot = Join-Path $ProjectRoot "runtime\staging"
+$stagingDirectory = Join-Path $stagingRoot ("setup-{0}" -f [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+try {
+    $generatorArguments = @(
+        (Join-Path $ProjectRoot "scripts\config\generate_config.py"),
+        "all",
+        "--output-dir",
+        $stagingDirectory
+    )
+    if ($FetchProxy) {
+        $generatorArguments += @("--fetch-proxy", $FetchProxy)
+    }
+    & $VenvPython @generatorArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Configuration generation failed. The subscription must include all required regions listed in README.md."
+    }
+    $stagedDesktopConfig = Join-Path $stagingDirectory "desktop\config.json"
+    & $coreExe check -c $stagedDesktopConfig
+    if ($LASTEXITCODE -ne 0) {
+        throw "sing-box rejected the generated desktop configuration; the installed configuration was not changed."
+    }
+    foreach ($target in @("desktop", "android")) {
+        $source = Join-Path $stagingDirectory "$target\config.json"
+        $destination = Join-Path $ProjectRoot "dist\$target\config.json"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+} finally {
+    if (Test-Path -LiteralPath $stagingDirectory) {
+        Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
+    }
+    if ((Test-Path -LiteralPath $stagingRoot) -and -not (Get-ChildItem -LiteralPath $stagingRoot -Force)) {
+        Remove-Item -LiteralPath $stagingRoot -Force
+    }
 }
-& $VenvPython @generatorArguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Configuration generation failed. The subscription must include all required regions listed in README.md."
-}
-& $coreExe check -c (Join-Path $ProjectRoot "dist\desktop\config.json")
-if ($LASTEXITCODE -ne 0) {
-    throw "sing-box rejected the generated desktop configuration."
-}
+
+# Publish service definitions only after the target core has accepted the new
+# desktop config. A failed setup therefore cannot leave the next boot pointing
+# at an unvalidated core/config pair.
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "config\services\singbox-service.xml") `
+    -Destination (Join-Path $ServiceDirectory "singbox-service.xml") -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "config\services\singbox-traffic-service.xml") `
+    -Destination (Join-Path $ServiceDirectory "singbox-traffic-service.xml") -Force
 
 if (-not $SkipService) {
     Write-Host "=== Installing Windows service (administrator approval required) ==="
@@ -288,6 +317,13 @@ if (-not $SkipService) {
     Ensure-WindowsService -Name "sing-box-traffic" -Executable $TrafficServiceExe
 }
 
+# Archives and extracted trees are installation artifacts. The verified core
+# and WinSW copies under runtime\cores / runtime\services are the authority.
+if (Test-Path -LiteralPath $DownloadDirectory) {
+    Remove-Item -LiteralPath $DownloadDirectory -Recurse -Force
+    Write-Host "Removed verified installation downloads."
+}
+
 Write-Host ""
-Write-Host "Setup complete. Desktop proxy: 127.0.0.1:7890; live dashboard: http://127.0.0.1:9090; traffic attribution: http://127.0.0.1:9091"
+Write-Host "Setup complete. Desktop proxy: 127.0.0.1:7890; live dashboard: http://127.0.0.1:9090/ui/; traffic attribution: http://127.0.0.1:9091"
 Write-Host "Use scripts\manage\manage.bat for future subscription refreshes."

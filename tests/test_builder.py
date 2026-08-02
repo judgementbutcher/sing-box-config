@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from singbox_config.builder import build_config_from_subscriptions
+from singbox_config.builder import build_config_from_subscriptions, build_provider_group
 from singbox_config.audit import audit_config
 
 
@@ -21,6 +21,34 @@ def make_node(tag, server, *, insecure=False):
     if insecure:
         node["tls"]["insecure"] = True
     return node
+
+
+def test_provider_can_keep_original_node_tags_and_disambiguate_collisions():
+    used_tags = set()
+    first = build_provider_group(
+        {"name": "airport-a", "prefix_node_tags": False, "flat_group": True},
+        [make_node("HK 1", "1.example")],
+        [],
+        used_tags,
+        0,
+        0,
+        False,
+        preserve_all_nodes=True,
+    )
+    second = build_provider_group(
+        {"name": "airport-b", "prefix_node_tags": False, "flat_group": True},
+        [make_node("HK 1", "2.example")],
+        [],
+        used_tags,
+        0,
+        0,
+        False,
+        preserve_all_nodes=True,
+    )
+
+    assert first["node_outbounds"][0]["tag"] == "HK 1"
+    assert second["node_outbounds"][0]["tag"].startswith("HK 1 [")
+    assert first["control_outbounds"][0]["outbounds"] == ["HK 1", "direct"]
 
 
 def test_builder_deduplicates_limits_and_creates_disjoint_pools(tmp_path):

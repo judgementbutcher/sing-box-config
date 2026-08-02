@@ -195,20 +195,27 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
         return value is True or (isinstance(value, dict) and value.get("enabled") is True)
 
     assert _optimistic_enabled(desktop["dns"]["optimistic"])
-    assert desktop["dns"]["optimistic"]["timeout"] == "30m"
-    assert desktop["dns"]["timeout"] == "5s"
+    assert desktop["$schema"] == "https://sing-box.sagernet.org/schema.json"
+    assert desktop["dns"]["optimistic"]["timeout"] == "2h"
+    assert desktop["dns"]["timeout"] == "8s"
     assert desktop["dns"]["cache_capacity"] == 8192
     assert desktop["inbounds"][0]["dns_mode"] == "hijack"
     assert desktop["experimental"]["cache_file"]["store_dns"] is True
+    assert desktop["experimental"]["cache_file"]["path"] == "runtime/sing-box-cache.db"
     assert [inbound["type"] for inbound in android["inbounds"]] == ["tun"]
     # Android keeps a bounded optimistic-DNS window without persisting DNS cache.
     assert _optimistic_enabled(android["dns"]["optimistic"])
-    assert android["dns"]["optimistic"]["timeout"] == "15m"
-    assert android["dns"]["timeout"] == "5s"
+    assert android["$schema"] == "https://sing-box.sagernet.org/schema.json"
+    assert android["dns"]["optimistic"]["timeout"] == "45m"
+    assert android["dns"]["timeout"] == "8s"
     assert android["dns"]["cache_capacity"] == 4096
+    # WeChat/QQ dial cached IP literals; reverse mapping is what lets those
+    # connections still match the domain rules above the geoip-cn tail.
+    assert android["dns"]["reverse_mapping"] is True
     assert android["inbounds"][0]["dns_mode"] == "hijack"
     assert android["experimental"]["cache_file"]["store_dns"] is False
     assert android["inbounds"][0]["udp_timeout"] == "1m"
+    assert android["inbounds"][0]["endpoint_independent_nat"] is False
     assert all(server["tag"] != "cloudflare" for server in android["dns"]["servers"])
     assert all(server["tag"] != "local-backup" for server in android["dns"]["servers"])
     assert not any("clash_mode" in rule for rule in android["route"]["rules"])
@@ -233,16 +240,15 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
     assert selectors["Available"]["default"] == "provider"
     # No airport urltest in this fixture; AI stays fully manual.
     assert urltests == {}
-    # AI lists US nodes plus explicitly opted-in self-hosted nodes.
+    # AI lists only US nodes, including US self-hosted nodes. ai_include must
+    # not pull a non-US self-hosted node into this selector.
     ai_nodes = selectors["AI"]["outbounds"]
     assert selectors["AI"]["default"] == ai_nodes[0]
-    assert set(self_node_tags) <= set(ai_nodes)
-    assert all(
-        tag in set(self_node_tags) or detect_region(tag) == "US"
-        for tag in ai_nodes
-    )
+    assert "self-hosted/Self-hosted US" in ai_nodes
+    assert "self-hosted/Self-hosted Other" not in ai_nodes
+    assert all(detect_region(tag) == "US" for tag in ai_nodes)
     assert selectors["Emby"]["outbounds"] == ["Available", "provider", *self_node_tags, "direct"]
-    assert set(selectors) == {"provider", "Available", "AI", "Emby"}
+    assert set(selectors) == {"provider", "Available", "DNS-Out", "AI", "Emby"}
     assert not any("auto" in tag.lower() for tag in selectors)
     # Play QUIC (UDP/443) must NOT be rejected: a working airport proxies HTTP/3
     # fine, and rejecting it only forced a slow timeout-then-TCP fallback.
@@ -277,18 +283,24 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
     assert android["dns"]["rules"][0]["domain_suffix"] == play_rule["domain_suffix"]
     route_rules = desktop["route"]["rules"]
     outbounds_in_order = [rule.get("outbound") for rule in route_rules if rule.get("outbound")]
-    # process(accel direct), process(store proxy), store domains, private, dns ips,
-    # ntp, bittorrent, emby, AI, force-proxy rule-sets, telegram IPs, clash modes,
-    # geolocation-!cn, geosite-cn, geoip-cn
-    assert outbounds_in_order[:7] == [
-        "direct",  # game accelerators
-        "Available",  # store processes
-        "Available",  # store domains
-        "direct",  # private
-        "direct",  # local DNS IPs
-        "direct",  # ntp
-        "direct",  # bittorrent
-    ]
+
+    def rule_index(predicate) -> int:
+        return next(index for index, rule in enumerate(route_rules) if predicate(rule))
+
+    # Unconditional prologue first: private IPs, accelerators, domestic DNS,
+    # NTP, BitTorrent, ads.  ip_is_private must outrank the service pins below,
+    # otherwise Store/Play LAN traffic gets dragged into the tunnel.
+    private_index = rule_index(lambda rule: rule.get("ip_is_private") is True)
+    accelerator_index = rule_index(lambda rule: "GuGuai.exe" in rule.get("process_name", []))
+    ntp_index = rule_index(lambda rule: "time.windows.com" in (rule.get("domain_suffix") or []))
+    clash_direct_index = rule_index(lambda rule: rule.get("clash_mode") == "Direct")
+    store_index = rule_index(lambda rule: "MicrosoftStore.exe" in rule.get("process_name", []))
+    cn_tail_index = rule_index(lambda rule: "geosite-cn" in (rule.get("rule_set") or []))
+    assert private_index < accelerator_index < ntp_index < clash_direct_index
+    # Service pins sit below the Clash toggles (so Direct stays authoritative)
+    # but above the China tail (so dl.google.com is not claimed by geosite-cn).
+    assert clash_direct_index < store_index < cn_tail_index
+    assert outbounds_in_order[:6] == ["direct"] * 6
     assert "Emby" in outbounds_in_order
     assert "AI" in outbounds_in_order
     assert outbounds_in_order[-3:] == ["Available", "direct", "direct"]
@@ -308,9 +320,8 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
         for rule in route_rules
     )
     assert any(
-        "geosite-category-ads-all" in (rule.get("rule_set") or [])
-        and rule.get("action") == "route"
-        and rule.get("outbound") == "direct"
+        "geosite-category-ads-all" in ((rule.get("rules") or [{}])[0].get("rule_set") or [])
+        and rule.get("action") == "reject"
         for rule in route_rules
     )
     assert any(
@@ -325,6 +336,7 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
     openai_rs = next(rs for rs in desktop["route"]["rule_set"] if rs.get("tag") == "geosite-openai")
     assert openai_rs.get("type") == "remote"
     assert openai_rs.get("url")
+    assert openai_rs.get("initial_path") == "runtime/rule-set-cache/geosite-openai.srs"
     emby_rule = next(rule for rule in route_rules if rule.get("outbound") == "Emby")
     assert emby_rule["domain_suffix"] == [
         "emby.media",
@@ -348,9 +360,13 @@ def test_simple_generator_groups_airports_self_hosted_regions_and_us_ai(tmp_path
     assert desktop["dns"]["final"] == android["dns"]["final"] == "google"
     google_dns = next(server for server in desktop["dns"]["servers"] if server["tag"] == "google")
     assert google_dns["server"] == "8.8.8.8"
-    assert google_dns["detour"] == "Available"
-    assert desktop["http_clients"] == [{"tag": "rule-set-downloader"}]
-    assert android["http_clients"] == [{"tag": "rule-set-downloader"}]
+    assert google_dns["detour"] == "DNS-Out"
+    # Desktop keeps local startup seeds but updates through DNS-Out, avoiding
+    # direct CDN lookups through the UDP bootstrap resolver. Android has no
+    # on-disk seed and uses Available for the same reason.
+    assert desktop["http_clients"] == [{"tag": "rule-set-downloader", "detour": "DNS-Out"}]
+    assert android["http_clients"] == [{"tag": "rule-set-downloader", "detour": "Available"}]
+    assert desktop["experimental"]["clash_api"]["secret"] == ""
     assert desktop["experimental"]["clash_api"]["external_ui_download_detour"] == "direct"
     accelerator_rule = next(
         rule for rule in route_rules if "GuGuai.exe" in rule.get("process_name", [])
@@ -439,6 +455,92 @@ def test_unknown_dns_uses_clean_resolver_while_cn_domains_stay_local(tmp_path):
     assert desktop["route"]["rules"][non_cn_route_index]["outbound"] == "Available"
 
 
+def test_wechat_survives_ad_blocking_and_a_missing_cn_rule_set(tmp_path):
+    """微信公众号 article pages must stay direct and unrejected.
+
+    Two independent regressions used to break them: geosite-category-ads-all
+    lists WeChat's own telemetry hosts (badjs.weixinbridge.com, tcss.qq.com,
+    log.tbs.qq.com, beacon.qq.com), so a blanket reject stalled the X5 WebView
+    that renders the articles; and with geosite-cn not yet downloaded there was
+    nothing left to hold Tencent traffic on direct, so it went out an overseas
+    exit that Tencent refuses to serve 公众号 content to.
+    """
+
+    nodes = [
+        make_node("Hong Kong HK", 1),
+        make_node("United States US", 2),
+        make_node("Taiwan TW", 3),
+        make_node("Japan JP", 4),
+        make_node("Singapore SG", 5),
+    ]
+    manifest = tmp_path / "subscriptions.yaml"
+    write_manifest(manifest, nodes)
+    desktop_template = tmp_path / "desktop.json"
+    android_template = tmp_path / "android.json"
+    write_template(desktop_template, cn_rule_set=True)
+    write_template(android_template, cn_rule_set=True)
+    generate_configs(
+        ("desktop", "android"),
+        subscriptions_path=manifest,
+        output_dir=tmp_path / "dist",
+        cache_dir=None,
+        policy_aliases_path=None,
+        template_paths={"desktop": desktop_template, "android": android_template},
+    )
+
+    for target in ("desktop", "android"):
+        conf = json.loads((tmp_path / "dist" / target / "config.json").read_text(encoding="utf-8"))
+        rules = conf["route"]["rules"]
+
+        # The ads category may only reject what is neither in geosite-cn nor in
+        # the inline China list, so domestic telemetry hosts are never dropped.
+        ads_rule = next(
+            rule
+            for rule in rules
+            if rule.get("action") == "reject"
+            and any(
+                "geosite-category-ads-all" in (sub.get("rule_set") or [])
+                for sub in (rule.get("rules") or [])
+            )
+        )
+        assert ads_rule["type"] == "logical" and ads_rule["mode"] == "and"
+        guards = [sub for sub in ads_rule["rules"] if sub.get("invert")]
+        assert any("geosite-cn" in (sub.get("rule_set") or []) for sub in guards)
+        assert any("qq.com" in (sub.get("domain_suffix") or []) for sub in guards)
+
+        # The inline China tail works with zero downloads and sits above the
+        # overseas rule-set so a cold start cannot proxy WeChat.
+        cn_inline_index = next(
+            index
+            for index, rule in enumerate(rules)
+            if rule.get("outbound") == "direct" and "qq.com" in (rule.get("domain_suffix") or [])
+        )
+        non_cn_index = next(
+            index
+            for index, rule in enumerate(rules)
+            if "geosite-geolocation-!cn" in (rule.get("rule_set") or [])
+        )
+        assert cn_inline_index < non_cn_index
+        assert {"weixinbridge.com", "qpic.cn", "tencent.com"} <= set(
+            rules[cn_inline_index]["domain_suffix"]
+        )
+
+        # DNS mirrors it: WeChat names resolve domestically before the clean
+        # resolver can hand back an overseas Tencent address.
+        dns_rules = conf["dns"]["rules"]
+        dns_cn_inline = next(
+            index
+            for index, rule in enumerate(dns_rules)
+            if rule.get("server") == "local" and "qq.com" in (rule.get("domain_suffix") or [])
+        )
+        dns_non_cn = next(
+            index
+            for index, rule in enumerate(dns_rules)
+            if "geosite-geolocation-!cn" in (rule.get("rule_set") or [])
+        )
+        assert dns_cn_inline < dns_non_cn
+
+
 def test_simple_generator_keeps_selector_surface_small(tmp_path):
     manifest = tmp_path / "subscriptions.yaml"
     write_manifest(
@@ -474,7 +576,7 @@ def test_simple_generator_keeps_selector_surface_small(tmp_path):
         for outbound in conf["outbounds"]
         if outbound.get("type") == "urltest"
     }
-    assert set(selectors) == {"provider", "Available", "AI", "Emby"}
+    assert set(selectors) == {"provider", "Available", "DNS-Out", "AI", "Emby"}
     # Available is manual; Auto only appears when a subscription opts into
     # urltest (none in this fixture).
     assert selectors["Available"]["outbounds"] == ["provider"]
@@ -510,6 +612,7 @@ def test_provider_urltest_scopes_auto_to_that_airport_only(tmp_path):
         "    source: file\n"
         f"    path: {subscription.name}\n"
         "    urltest: true\n"
+        "    ai_exclude: true\n"
         "  - name: other\n"
         "    parser: singbox-json\n"
         "    source: file\n"
@@ -554,6 +657,7 @@ def test_provider_urltest_scopes_auto_to_that_airport_only(tmp_path):
         assert "other/Auto" not in urltests, target
         assert "Auto" not in urltests, target
         assert "AI/Auto" not in urltests, target
+        assert selectors["AI"]["outbounds"] == ["other/Other United States US"], target
 
 
 def test_desktop_template_routes_accelerator_processes_directly():

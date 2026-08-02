@@ -4,7 +4,7 @@
   <description>sing-box 本地流量去向统计面板</description>
 
   <executable>%BASE%\..\..\.venv\Scripts\python.exe</executable>
-  <arguments>"%BASE%\..\..\scripts\monitor\traffic_monitor.py" --host 127.0.0.1 --port 9091</arguments>
+  <arguments>-m singbox_config.traffic_monitor --host 127.0.0.1 --port 9091</arguments>
   <workingdirectory>%BASE%\..\..</workingdirectory>
 
   <logpath>%BASE%\..\logs</logpath>

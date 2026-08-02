@@ -150,23 +150,30 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         if isinstance(rule_set, dict) and rule_set.get("tag")
     }
     missing_rule_set_references: List[Dict[str, str]] = []
+
+    def collect_rule_set_refs(rule: Any, location: str) -> None:
+        """Walk a rule, descending into ``type: logical`` sub-rules."""
+
+        if not isinstance(rule, dict):
+            return
+        values = rule.get("rule_set")
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            for value in values:
+                if str(value) not in rule_set_tags:
+                    missing_rule_set_references.append(
+                        {"location": f"{location}.rule_set", "tag": str(value)}
+                    )
+        for child_index, child in enumerate(rule.get("rules") or [], 1):
+            collect_rule_set_refs(child, f"{location}.rules[{child_index}]")
+
     for section_name, rules in (
         ("route.rules", conf.get("route", {}).get("rules", [])),
         ("dns.rules", conf.get("dns", {}).get("rules", [])),
     ):
         for index, rule in enumerate(rules, 1):
-            if not isinstance(rule, dict):
-                continue
-            values = rule.get("rule_set")
-            if isinstance(values, str):
-                values = [values]
-            if not isinstance(values, list):
-                continue
-            for value in values:
-                if str(value) not in rule_set_tags:
-                    missing_rule_set_references.append(
-                        {"location": f"{section_name}[{index}].rule_set", "tag": str(value)}
-                    )
+            collect_rule_set_refs(rule, f"{section_name}[{index}]")
 
     errors: List[str] = []
     warnings: List[str] = []

@@ -106,6 +106,9 @@ def apply_profile_to_template(
     clash = profile.get("clash_api") if isinstance(profile.get("clash_api"), dict) else {}
     logging = profile.get("logging") if isinstance(profile.get("logging"), dict) else {}
 
+    if _version_tuple(core_version) >= (1, 14, 0):
+        conf.setdefault("$schema", "https://sing-box.sagernet.org/schema.json")
+
     log = conf.setdefault("log", {})
     if "disabled" in logging:
         log["disabled"] = bool(logging["disabled"])
@@ -204,11 +207,19 @@ def apply_profile_to_template(
         route["rules"] = retained_actions + [{"action": "route", "outbound": "direct"}]
         route["final"] = "direct"
     rule_set_interval = str(tuning.get("rule_set_update_interval") or "").strip()
+    rule_set_initial_dir = str(tuning.get("rule_set_initial_dir") or "").strip().rstrip("/\\")
     rule_sets = route.get("rule_set", [])
     if rule_set_interval:
         for rule_set in rule_sets:
             if isinstance(rule_set, dict) and rule_set.get("type") == "remote":
                 rule_set["update_interval"] = rule_set_interval
+    if rule_set_initial_dir and _version_tuple(core_version) >= (1, 14, 0):
+        for rule_set in rule_sets:
+            if not isinstance(rule_set, dict) or rule_set.get("type") != "remote":
+                continue
+            tag = rule_set.get("tag")
+            if isinstance(tag, str) and tag.strip():
+                rule_set["initial_path"] = f"{rule_set_initial_dir}/{tag.strip()}.srs"
 
     if _version_tuple(core_version) >= (1, 14, 0):
         client_tag = "rule-set-downloader"

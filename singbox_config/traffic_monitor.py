@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = PROJECT_ROOT / "runtime" / "traffic-monitor.db"
 DEFAULT_UI = PROJECT_ROOT / "web" / "traffic-dashboard"
+DEFAULT_SECRET_FILE = PROJECT_ROOT / ".secrets" / "clash-api.txt"
 UNKNOWN = "未识别（采样间隙/已关闭连接）"
 GROUPS = {"site", "destination", "process", "rule", "outbound", "chain", "network"}
 SCOPES = {"all", "proxy", "direct"}
@@ -112,16 +113,18 @@ def source_group_from_chain(chain: str) -> str:
     if node == "direct":
         return "直连"
     node_prefix = node.split("/", 1)[0].strip()
+    self_hosted_markers = ("自建", "拼车", "vmiss", "g双向")
+    is_self_hosted = any(marker in node.casefold() for marker in self_hosted_markers)
     # Generated node tags carry the provider before the slash. This is more
     # precise than the next chain segment, which may be a regional selector.
     if "/" in node:
-        if "自建" in node or "自建" in node_prefix:
+        if is_self_hosted:
             return "自建"
         return node_prefix or node
     # Normal generated routes are node -> provider -> policy group.
     if len(values) >= 3 and values[1] not in ROUTE_GROUPS:
         return values[1]
-    if "自建" in node or "自建" in node_prefix:
+    if is_self_hosted:
         return "自建"
     # A two-part chain has no provider selector. Generated node tags retain
     # the provider prefix, so use it as the best available attribution.
@@ -182,6 +185,18 @@ class TrafficStore:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(value)),
         )
+
+    def cleanup_old_records(self, retention_days: int = 30) -> int:
+        """Delete traffic records older than retention_days to prevent unlimited growth.
+
+        Returns the number of deleted rows.
+        """
+        cutoff_date = (date.today() - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._db:
+            cursor = self._db.execute("DELETE FROM usage WHERE day < ?", (cutoff_date,))
+            deleted = cursor.rowcount
+            self._db.commit()
+        return deleted
 
     @staticmethod
     def _counter_delta(current: int, previous: int | None) -> int:
@@ -424,10 +439,19 @@ class Collector(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self) -> None:
+        cleanup_counter = 0
+        cleanup_interval_cycles = int(86400 / self.interval)  # Run cleanup once per day
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
                 self.store.record_snapshot(self.client.snapshot())
+                # Periodic cleanup to prevent unlimited database growth
+                cleanup_counter += 1
+                if cleanup_counter >= cleanup_interval_cycles:
+                    deleted = self.store.cleanup_old_records(retention_days=30)
+                    if deleted > 0:
+                        print(f"Cleaned up {deleted} old traffic records", flush=True)
+                    cleanup_counter = 0
             except Exception as exc:  # Keep the dashboard alive while sing-box restarts.
                 self.store.record_error(str(exc))
             remaining = max(0.1, self.interval - (time.monotonic() - started))
@@ -527,6 +551,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="sing-box 流量去向统计面板")
     parser.add_argument("--controller", default="http://127.0.0.1:9090")
     parser.add_argument("--secret", default="")
+    parser.add_argument(
+        "--secret-file",
+        type=Path,
+        default=DEFAULT_SECRET_FILE,
+        help="Clash API secret 文件；--secret 为空时读取，缺失则不带认证",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9091)
     parser.add_argument("--interval", type=float, default=1.0)
@@ -538,8 +568,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    secret = args.secret
+    if not secret and args.secret_file and args.secret_file.is_file():
+        secret = args.secret_file.read_text(encoding="utf-8").strip()
     store = TrafficStore(args.database.resolve())
-    client = ClashClient(args.controller, args.secret)
+    client = ClashClient(args.controller, secret)
     if args.once:
         try:
             result = store.record_snapshot(client.snapshot())

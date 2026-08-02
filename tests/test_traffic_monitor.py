@@ -38,6 +38,10 @@ def test_connection_dimensions_and_site_grouping():
 
 def test_source_group_identifies_self_hosted_and_direct_routes():
     assert source_group_from_chain("瓦工自建/合租_gamer1_idc → AI") == "自建"
+    assert source_group_from_chain("megabox拼车 → AI") == "自建"
+    assert source_group_from_chain("白丝云拼车 → Available") == "自建"
+    assert source_group_from_chain("vmiss-tri-la → DNS-Out") == "自建"
+    assert source_group_from_chain("166G双向 → Emby") == "自建"
     assert source_group_from_chain("Lumina机场/香港A02 → Available") == "Lumina机场"
     assert source_group_from_chain("良心云/新加坡高速03 → Emby") == "良心云"
     assert source_group_from_chain("direct") == "直连"
