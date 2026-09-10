@@ -1,5 +1,11 @@
+schema_version: 1
 subscriptions:
   - name: example-provider
-    parser: clash
+    enabled: true
+    format: clash
     source: url_file
     path: subscriptions/example-provider.txt
+    group: example-provider
+    order: 100
+    urltest: true
+    allow_unsupported: false

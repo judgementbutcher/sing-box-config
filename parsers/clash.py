@@ -55,6 +55,95 @@ def first_mapping_value(mapping: Dict[str, Any], *keys: str) -> Optional[str]:
     return None
 
 
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def add_metadata(outbound: Dict[str, Any], name: str) -> Dict[str, Any]:
+    outbound["_meta_name"] = name
+    outbound["_meta_region"] = detect_region(name)
+    return outbound
+
+
+def build_clash_tls(
+    node: Dict[str, Any],
+    server: Any,
+    *,
+    implicit: bool = False,
+) -> Optional[Dict[str, Any]]:
+    reality_opts = node.get("reality-opts") or node.get("reality_opts") or {}
+    if not isinstance(reality_opts, dict):
+        reality_opts = {}
+    public_key = first_mapping_value(reality_opts, "public-key", "public_key", "publicKey")
+    if not implicit and not truthy(node.get("tls")) and not public_key:
+        return None
+
+    tls_obj: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": first_non_empty(node.get("servername"), node.get("sni"), str(server)),
+    }
+    if truthy(first_non_empty(node.get("skip-cert-verify"), node.get("skip_cert_verify"))):
+        tls_obj["insecure"] = True
+
+    fingerprint = first_non_empty(node.get("client-fingerprint"), node.get("client_fingerprint"))
+    if fingerprint:
+        tls_obj["utls"] = {"enabled": True, "fingerprint": fingerprint}
+
+    alpn = parse_alpn(node.get("alpn"))
+    if alpn:
+        tls_obj["alpn"] = alpn
+
+    if public_key:
+        tls_obj["reality"] = {
+            "enabled": True,
+            "public_key": public_key,
+            "short_id": first_mapping_value(reality_opts, "short-id", "short_id", "shortId") or "",
+        }
+    return tls_obj
+
+
+def build_clash_transport(node: Dict[str, Any], protocol: str) -> Optional[Dict[str, Any]]:
+    network = str(node.get("network", "") or "").strip().lower()
+    if not network or network in {"tcp", "raw"}:
+        return None
+    if network == "ws":
+        ws_opts = node.get("ws-opts") or node.get("ws_opts") or {}
+        if not isinstance(ws_opts, dict):
+            ws_opts = {}
+        transport: Dict[str, Any] = {"type": "ws", "path": str(ws_opts.get("path") or "/")}
+        headers = ws_opts.get("headers")
+        if isinstance(headers, dict) and headers:
+            transport["headers"] = {str(key): str(value) for key, value in headers.items()}
+        return transport
+    if network == "grpc":
+        grpc_opts = node.get("grpc-opts") or node.get("grpc_opts") or {}
+        if not isinstance(grpc_opts, dict):
+            grpc_opts = {}
+        transport = {"type": "grpc"}
+        service_name = first_non_empty(
+            grpc_opts.get("grpc-service-name"),
+            grpc_opts.get("grpc_service_name"),
+            grpc_opts.get("service-name"),
+        )
+        if service_name:
+            transport["service_name"] = service_name
+        return transport
+    raise ValueError(f"暂不支持 {protocol} network={network}")
+
+
+def build_clash_multiplex(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    mux_opts = node.get("smux") or node.get("multiplex")
+    if not isinstance(mux_opts, dict) or mux_opts.get("enabled") is False:
+        return None
+    mux_obj: Dict[str, Any] = {"enabled": True}
+    for key in ("protocol", "max_connections", "min_streams", "max_streams", "padding", "brutal"):
+        if key in mux_opts:
+            mux_obj[key] = mux_opts[key]
+    return mux_obj
+
+
 def clash_vless_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if node.get("type") != "vless":
         return None
@@ -335,12 +424,277 @@ def clash_hysteria2_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return outbound
 
 
+def clash_naive_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "naive":
+        return None
+
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    username = node.get("username")
+    password = node.get("password")
+    if not server or not port or username is None or password is None:
+        return None
+
+    outbound: Dict[str, Any] = {
+        "type": "naive",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "username": str(username),
+        "password": str(password),
+        "domain_resolver": "local",
+        "tls": build_clash_tls(node, server, implicit=True),
+    }
+    optional_int = first_non_empty(node.get("insecure-concurrency"), node.get("insecure_concurrency"))
+    if optional_int is not None:
+        outbound["insecure_concurrency"] = int(optional_int)
+    headers = node.get("extra-headers") or node.get("extra_headers")
+    if isinstance(headers, dict) and headers:
+        outbound["extra_headers"] = {str(key): str(value) for key, value in headers.items()}
+    udp_over_tcp = first_non_empty(node.get("udp-over-tcp"), node.get("udp_over_tcp"))
+    if udp_over_tcp is not None:
+        outbound["udp_over_tcp"] = truthy(udp_over_tcp)
+    if "quic" in node:
+        outbound["quic"] = truthy(node.get("quic"))
+    if outbound.get("quic") and int(outbound.get("insecure_concurrency") or 0) > 0:
+        raise ValueError("Naive insecure_concurrency 不能与 QUIC 同时启用")
+    quic_cc = first_non_empty(node.get("quic-congestion-control"), node.get("quic_congestion_control"))
+    if quic_cc:
+        outbound["quic_congestion_control"] = quic_cc
+    return add_metadata(outbound, name)
+
+
+def clash_trojan_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "trojan":
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    password = node.get("password")
+    if not server or not port or password is None:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "trojan",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "password": str(password),
+        "domain_resolver": "local",
+        "tls": build_clash_tls(node, server, implicit=True),
+    }
+    if node.get("udp") is False:
+        outbound["network"] = "tcp"
+    transport = build_clash_transport(node, "Trojan")
+    if transport:
+        outbound["transport"] = transport
+    multiplex = build_clash_multiplex(node)
+    if multiplex:
+        outbound["multiplex"] = multiplex
+    return add_metadata(outbound, name)
+
+
+def clash_vmess_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "vmess":
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    uuid = node.get("uuid")
+    if not server or not port or not uuid:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "vmess",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "uuid": str(uuid),
+        "security": str(first_non_empty(node.get("cipher"), node.get("security")) or "auto"),
+        "alter_id": int(first_non_empty(node.get("alterId"), node.get("alter-id"), node.get("alter_id")) or 0),
+        "domain_resolver": "local",
+    }
+    if node.get("udp") is False:
+        outbound["network"] = "tcp"
+    packet_encoding = normalize_packet_encoding(
+        first_non_empty(node.get("packet-encoding"), node.get("packet_encoding"), node.get("packetEncoding"))
+    )
+    if packet_encoding:
+        outbound["packet_encoding"] = packet_encoding
+    tls_obj = build_clash_tls(node, server)
+    if tls_obj:
+        outbound["tls"] = tls_obj
+    transport = build_clash_transport(node, "VMess")
+    if transport:
+        outbound["transport"] = transport
+    multiplex = build_clash_multiplex(node)
+    if multiplex:
+        outbound["multiplex"] = multiplex
+    return add_metadata(outbound, name)
+
+
+def clash_tuic_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "tuic":
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    uuid = first_non_empty(node.get("uuid"), node.get("username"))
+    password = node.get("password")
+    if not server or not port or not uuid or password is None:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "tuic",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "uuid": uuid,
+        "password": str(password),
+        "domain_resolver": "local",
+        "tls": build_clash_tls(node, server, implicit=True),
+    }
+    congestion = first_non_empty(node.get("congestion-controller"), node.get("congestion_control"))
+    if congestion:
+        outbound["congestion_control"] = congestion
+    relay_mode = first_non_empty(node.get("udp-relay-mode"), node.get("udp_relay_mode"))
+    if relay_mode:
+        outbound["udp_relay_mode"] = relay_mode
+    if "udp-over-stream" in node or "udp_over_stream" in node:
+        outbound["udp_over_stream"] = truthy(first_non_empty(node.get("udp-over-stream"), node.get("udp_over_stream")))
+    if "reduce-rtt" in node or "zero_rtt_handshake" in node:
+        outbound["zero_rtt_handshake"] = truthy(
+            first_non_empty(node.get("reduce-rtt"), node.get("zero_rtt_handshake"))
+        )
+    heartbeat = first_non_empty(node.get("heartbeat-interval"), node.get("heartbeat"))
+    if heartbeat:
+        outbound["heartbeat"] = heartbeat
+    if node.get("udp") is False:
+        outbound["network"] = "tcp"
+    return add_metadata(outbound, name)
+
+
+def clash_hysteria_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "hysteria":
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    if not server or not port:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "hysteria",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "domain_resolver": "local",
+        "tls": build_clash_tls(node, server, implicit=True),
+    }
+    ports = node.get("ports") or node.get("server_ports")
+    if isinstance(ports, list) and ports:
+        outbound["server_ports"] = [str(value) for value in ports]
+    hop_interval = first_non_empty(node.get("hop-interval"), node.get("hop_interval"))
+    if hop_interval:
+        outbound["hop_interval"] = hop_interval
+    up = first_non_empty(node.get("up"), node.get("up-speed"), node.get("up_mbps"))
+    down = first_non_empty(node.get("down"), node.get("down-speed"), node.get("down_mbps"))
+    if up:
+        outbound["up"] = up
+    if down:
+        outbound["down"] = down
+    obfs = first_non_empty(node.get("obfs"), node.get("obfs-password"), node.get("obfs_password"))
+    if obfs:
+        outbound["obfs"] = obfs
+    auth_str = first_non_empty(node.get("auth-str"), node.get("auth_str"), node.get("password"))
+    auth = first_non_empty(node.get("auth"))
+    if auth_str:
+        outbound["auth_str"] = auth_str
+    elif auth:
+        outbound["auth"] = auth
+    if node.get("udp") is False:
+        outbound["network"] = "tcp"
+    return add_metadata(outbound, name)
+
+
+def clash_http_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") != "http":
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    if not server or not port:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "http",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "domain_resolver": "local",
+    }
+    for key in ("username", "password", "path"):
+        if node.get(key) is not None:
+            outbound[key] = str(node[key])
+    headers = node.get("headers")
+    if isinstance(headers, dict) and headers:
+        outbound["headers"] = {str(key): str(value) for key, value in headers.items()}
+    tls_obj = build_clash_tls(node, server)
+    if tls_obj:
+        outbound["tls"] = tls_obj
+    return add_metadata(outbound, name)
+
+
+def clash_socks_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if node.get("type") not in {"socks", "socks5"}:
+        return None
+    name = str(node.get("name", "")).strip()
+    if not name or is_info_node(name):
+        return None
+    server = node.get("server")
+    port = node.get("port")
+    if not server or not port:
+        return None
+    outbound: Dict[str, Any] = {
+        "type": "socks",
+        "tag": name,
+        "server": server,
+        "server_port": int(port),
+        "version": "5",
+        "domain_resolver": "local",
+    }
+    for key in ("username", "password"):
+        if node.get(key) is not None:
+            outbound[key] = str(node[key])
+    if node.get("udp") is False:
+        outbound["network"] = "tcp"
+    udp_over_tcp = first_non_empty(node.get("udp-over-tcp"), node.get("udp_over_tcp"))
+    if udp_over_tcp is not None:
+        outbound["udp_over_tcp"] = truthy(udp_over_tcp)
+    return add_metadata(outbound, name)
+
+
 def clash_node_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return (
         clash_vless_to_singbox(node)
         or clash_shadowsocks_to_singbox(node)
         or clash_anytls_to_singbox(node)
         or clash_hysteria2_to_singbox(node)
+        or clash_naive_to_singbox(node)
+        or clash_trojan_to_singbox(node)
+        or clash_vmess_to_singbox(node)
+        or clash_tuic_to_singbox(node)
+        or clash_hysteria_to_singbox(node)
+        or clash_http_to_singbox(node)
+        or clash_socks_to_singbox(node)
     )
 
 
@@ -380,5 +734,7 @@ def parse(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[s
 
         if outbound is not None:
             nodes.append(outbound)
+        elif name:
+            warnings.append(f"第 {index} 个节点不支持或缺少必要字段: type={node.get('type') or 'unknown'} name={name}")
 
     return nodes, info_nodes, warnings

@@ -7,7 +7,7 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Set
 
 
-NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "block", "dns"}
+NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "bridge", "block", "dns"}
 
 
 class ConfigAuditError(RuntimeError):
@@ -45,6 +45,25 @@ def is_insecure_outbound(outbound: Dict[str, Any]) -> bool:
     return isinstance(tls, dict) and tls.get("insecure") is True
 
 
+def _dns_resolver_tag(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        server = value.get("server")
+        return str(server).strip() if server is not None and str(server).strip() else None
+    return None
+
+
+def _rule_set_tags(rule_set: Dict[str, Any]) -> Set[str]:
+    value = rule_set.get("tag")
+    if isinstance(value, list):
+        return {str(tag).strip() for tag in value if str(tag).strip()}
+    if value is None:
+        return set()
+    tag = str(value).strip()
+    return {tag} if tag else set()
+
+
 def _referenced_outbounds(conf: Dict[str, Any]) -> List[tuple[str, str]]:
     references: List[tuple[str, str]] = []
     route_final = conf.get("route", {}).get("final")
@@ -62,13 +81,6 @@ def _referenced_outbounds(conf: Dict[str, Any]) -> List[tuple[str, str]]:
     for index, rule_set in enumerate(conf.get("route", {}).get("rule_set", []), 1):
         if isinstance(rule_set, dict) and rule_set.get("download_detour"):
             references.append((f"route.rule_set[{index}].download_detour", str(rule_set["download_detour"])))
-    external_ui_detour = (
-        conf.get("experimental", {})
-        .get("clash_api", {})
-        .get("external_ui_download_detour")
-    )
-    if external_ui_detour:
-        references.append(("experimental.clash_api.external_ui_download_detour", str(external_ui_detour)))
     return references
 
 
@@ -88,6 +100,43 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     urltest_member_counts = Counter(urltest_members)
     duplicate_urltest_members = sorted(tag for tag, count in urltest_member_counts.items() if count > 1)
     singleton_urltests = [str(test.get("tag")) for test in urltests if len(test.get("outbounds", [])) < 2]
+
+    # Selector-to-selector references are useful for composing policy groups,
+    # but a cycle makes every affected connection fail at runtime.  Detect it
+    # here instead of relying on the core to report an opaque startup error.
+    strategy_tags = {
+        str(item.get("tag"))
+        for item in [*selectors, *urltests]
+        if item.get("tag")
+    }
+    strategy_graph = {
+        str(item.get("tag")): [
+            str(member)
+            for member in item.get("outbounds", [])
+            if str(member) in strategy_tags
+        ]
+        for item in [*selectors, *urltests]
+        if item.get("tag")
+    }
+    selector_cycles: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(tag: str, trail: list[str]) -> None:
+        if tag in visiting:
+            start = trail.index(tag) if tag in trail else 0
+            selector_cycles.append(" -> ".join([*trail[start:], tag]))
+            return
+        if tag in visited:
+            return
+        visiting.add(tag)
+        for member in strategy_graph.get(tag, []):
+            visit(member, [*trail, tag])
+        visiting.remove(tag)
+        visited.add(tag)
+
+    for tag in strategy_graph:
+        visit(tag, [])
 
     missing_references: List[Dict[str, str]] = []
     for location, reference in _referenced_outbounds(conf):
@@ -114,17 +163,31 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
             missing_dns_references.append(
                 {"location": f"dns.rules[{index}].server", "tag": str(rule["server"])}
             )
-    default_resolver = conf.get("route", {}).get("default_domain_resolver")
-    if default_resolver and str(default_resolver) not in dns_servers:
+    default_resolver = _dns_resolver_tag(conf.get("route", {}).get("default_domain_resolver"))
+    if default_resolver and default_resolver not in dns_servers:
         missing_dns_references.append(
-            {"location": "route.default_domain_resolver", "tag": str(default_resolver)}
+            {"location": "route.default_domain_resolver", "tag": default_resolver}
         )
     for index, server in enumerate(conf.get("dns", {}).get("servers", []), 1):
-        resolver = server.get("domain_resolver") if isinstance(server, dict) else None
-        if resolver and str(resolver) not in dns_servers:
+        resolver = _dns_resolver_tag(server.get("domain_resolver")) if isinstance(server, dict) else None
+        if resolver and resolver not in dns_servers:
             missing_dns_references.append(
-                {"location": f"dns.servers[{index}].domain_resolver", "tag": str(resolver)}
+                {"location": f"dns.servers[{index}].domain_resolver", "tag": resolver}
             )
+    for section_name, values in (
+        ("outbounds", conf.get("outbounds", [])),
+        ("http_clients", conf.get("http_clients", [])),
+    ):
+        for index, value in enumerate(values, 1):
+            resolver = (
+                _dns_resolver_tag(value.get("domain_resolver"))
+                if isinstance(value, dict)
+                else None
+            )
+            if resolver and resolver not in dns_servers:
+                missing_dns_references.append(
+                    {"location": f"{section_name}[{index}].domain_resolver", "tag": resolver}
+                )
 
     http_clients = {
         str(client.get("tag"))
@@ -145,9 +208,10 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
             )
 
     rule_set_tags = {
-        str(rule_set.get("tag"))
+        tag
         for rule_set in conf.get("route", {}).get("rule_set", [])
-        if isinstance(rule_set, dict) and rule_set.get("tag")
+        if isinstance(rule_set, dict)
+        for tag in _rule_set_tags(rule_set)
     }
     missing_rule_set_references: List[Dict[str, str]] = []
 
@@ -179,8 +243,10 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     warnings: List[str] = []
     if duplicate_tags:
         errors.append(f"存在重复 outbound tag: {', '.join(duplicate_tags)}")
-    if duplicate_node_entries:
+    if duplicate_node_entries and not limits.get("allow_duplicate_nodes"):
         errors.append(f"仍有 {duplicate_node_entries} 个完全重复节点")
+    elif duplicate_node_entries:
+        warnings.append(f"按订阅设置保留了 {duplicate_node_entries} 个连接参数相同的节点")
     if missing_references:
         errors.append(f"存在 {len(missing_references)} 个不存在的 outbound 引用")
     if missing_dns_references:
@@ -191,6 +257,8 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         errors.append(f"存在 {len(missing_rule_set_references)} 个不存在的 rule-set 引用")
     if singleton_urltests:
         errors.append(f"存在单节点或空 URLTest: {', '.join(singleton_urltests)}")
+    if selector_cycles:
+        errors.append(f"策略组存在循环引用: {'; '.join(selector_cycles)}")
     # Shared members across Available/AI/Control auto pools are intentional and
     # are reported via duplicate_urltest_members without failing the build.
 
@@ -222,6 +290,7 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         "duplicate_tags": duplicate_tags,
         "duplicate_urltest_members": duplicate_urltest_members,
         "singleton_urltests": singleton_urltests,
+        "selector_cycles": selector_cycles,
         "missing_references": missing_references,
         "missing_dns_references": missing_dns_references,
         "missing_http_client_references": missing_http_client_references,

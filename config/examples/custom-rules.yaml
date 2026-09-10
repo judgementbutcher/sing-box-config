@@ -1,0 +1,22 @@
+schema_version: 1
+
+route_rules_front:
+  # - process_name: [example.exe]
+  #   action: route
+  #   outbound: direct
+
+route_rules:
+  # - domain_suffix: [example.com]
+  #   action: route
+  #   outbound: Available
+
+dns_rules:
+  # - domain_suffix: [example.com]
+  #   action: route
+  #   server: google
+
+rule_sets:
+  # - tag: geosite-category-public-tracker
+  #   type: remote
+  #   format: binary
+  #   url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-category-public-tracker.srs

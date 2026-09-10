@@ -1,0 +1,60 @@
+schema_version: 1
+platform: windows
+resolve_node_ipv4: true
+embed_local_rule_sets: true
+strip_rule_set_initial_path: true
+
+config:
+  dns:
+    cache_capacity: 8192
+    optimistic:
+      enabled: true
+      timeout: 2h
+  inbounds:
+    - type: tun
+      tag: tun-in
+      address:
+        - 172.18.0.1/30
+        - fdfe:dcba:9876::1/126
+      auto_route: true
+      strict_route: true
+      udp_timeout: 5m
+      mtu: 1400
+      stack: system
+      dns_mode: hijack
+      # Keep domestic direct sockets out of the TUN so sing-box cannot capture
+      # its own Windows connections recursively.
+      route_exclude_address_set: [geoip-cn]
+    - type: mixed
+      tag: mixed-in
+      listen: 127.0.0.1
+      listen_port: 7890
+  route:
+    find_process: true
+  experimental:
+    cache_file:
+      enabled: true
+      path: cache.db
+      store_dns: true
+
+route_rules:
+  - process_name:
+      - WinStore.App.exe
+      - MicrosoftStore.exe
+      - StoreExperienceHost.exe
+    action: route
+    outbound: Available
+  - rule_set: microsoft-store
+    action: route
+    outbound: Available
+
+dns_rules:
+  - rule_set: microsoft-store
+    action: route
+    server: google
+
+rule_sets:
+  - tag: microsoft-store
+    type: local
+    format: source
+    path: config/rule-sets/microsoft-store.json

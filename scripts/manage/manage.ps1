@@ -1,711 +1,921 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet("menu", "reload", "offline-reload", "desktop", "android", "offline-android", "publish", "offline-publish", "stop-publish", "all", "check", "status")]
-    [string]$Action = "menu"
+    [ValidateSet("menu", "desktop", "android", "all", "quick-add", "remove", "delete", "disable", "enable", "publisher", "check", "show-info", "rotate-credentials")]
+    [string]$Action = "menu",
+    [switch]$Offline,
+    [string]$Name,
+    [string]$Link,
+    [string]$Pattern,
+    [ValidateSet("auto", "uri", "clash", "sing-box-json")]
+    [string]$Format = "auto"
 )
-
-# 交互式 sing-box 管理菜单。用自然语言选项管理配置生成与 Windows 服务。
-# 双击 manage.bat 即可运行；细分批处理通过 -Action 复用这里的操作。
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ProjectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location -LiteralPath $ProjectRoot
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
-$ServiceName = "sing-box"
-$ServiceExe = Join-Path $ProjectRoot "runtime\services\singbox-service.exe"
-$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-$Generator = Join-Path $ProjectRoot "scripts\config\generate_config.py"
-$LogDirectory = Join-Path $ProjectRoot "runtime\logs"
-$DashboardUrl = "http://127.0.0.1:9090/ui/"
-$TrafficDashboardUrl = "http://127.0.0.1:9091"
-$TrafficMonitor = Join-Path $ProjectRoot "scripts\monitor\traffic_monitor.py"
-$TrafficServiceName = "sing-box-traffic"
-$TrafficServiceExe = Join-Path $ProjectRoot "runtime\services\singbox-traffic-service.exe"
-$ProxyEndpoint = "127.0.0.1:7890"
-$AndroidPublisherPort = 8888
-$AndroidPublisherDirectory = Join-Path $ProjectRoot "runtime\publish"
-$AndroidPublisherReadyFile = Join-Path $AndroidPublisherDirectory "android-publisher.url"
-$AndroidPublisherPidFile = Join-Path $AndroidPublisherDirectory "android-publisher.pid"
-$AndroidPublisherScript = Join-Path $ProjectRoot "scripts\serve\serve_config.py"
+$Subscriptions = Join-Path $ProjectRoot "config\local\subscriptions.yaml"
+$RoutingGroups = Join-Path $ProjectRoot "config\local\routing-groups.json"
+$OutputRoot = Join-Path $ProjectRoot "dist"
+$RuntimeRoot = Join-Path $ProjectRoot "runtime"
 
 function Get-PythonCommand {
-    if (Test-Path -LiteralPath $VenvPython) {
-        return @($VenvPython)
-    }
+    $venv = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venv -PathType Leaf) { return @($venv) }
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($launcher) {
-        return @($launcher.Source, "-3")
-    }
+    if ($launcher) { return @($launcher.Source, "-3") }
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($python) {
-        return @($python.Source)
-    }
-    throw "找不到 Python。请先运行 scripts\bootstrap\setup.bat 初始化环境。"
+    if ($python) { return @($python.Source) }
+    throw "找不到 Python。请先运行 scripts\bootstrap\setup.bat。"
 }
 
-function Test-Initialized {
-    return Test-Path -LiteralPath (Join-Path $ProjectRoot "config\local\subscriptions.yaml")
+function Get-CoreExecutable {
+    if ($env:SING_BOX_CORE -and (Test-Path -LiteralPath $env:SING_BOX_CORE -PathType Leaf)) {
+        return (Resolve-Path -LiteralPath $env:SING_BOX_CORE).Path
+    }
+    $cores = Join-Path $RuntimeRoot "cores"
+    if (Test-Path -LiteralPath $cores) {
+        $candidate = Get-ChildItem -LiteralPath $cores -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($candidate) { return $candidate.FullName }
+    }
+    $command = Get-Command sing-box.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    return $null
 }
 
-function Get-ServiceStateText {
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $service) {
-        return "未安装"
-    }
-    switch ($service.Status) {
-        "Running" { return "运行中" }
-        "Stopped" { return "已停止" }
-        default   { return [string]$service.Status }
-    }
-}
-
-function Invoke-Generator {
-    param(
-        [string]$Target,
-        [switch]$Offline,
-        [string]$OutputDirectory
-    )
-
-    if (-not (Test-Initialized)) {
-        Write-Host "[错误] 尚未初始化。请先运行 scripts\bootstrap\setup.bat 并粘贴订阅链接。" -ForegroundColor Red
-        return $false
-    }
-    # Force an array here: PowerShell unwraps a single returned string, and
-    # indexing that scalar would execute only the first character of the path.
+function Invoke-Python {
+    param([string[]]$Arguments)
     $python = @(Get-PythonCommand)
-    $arguments = @($Generator, $Target)
-    if ($Offline) {
-        $arguments += "--offline"
-    }
-    if ($OutputDirectory) {
-        $arguments += @("--output-dir", $OutputDirectory)
-    }
     $executable = $python[0]
     $prefix = @($python | Select-Object -Skip 1)
-    & $executable @prefix @arguments | Out-Host
-    $generatorExitCode = $LASTEXITCODE
-    if ($generatorExitCode -ne 0) {
-        Write-Host "[错误] 配置生成失败 (退出码 $generatorExitCode)。" -ForegroundColor Red
-        return $false
-    }
-    Write-Host "[完成] 配置已生成。" -ForegroundColor Green
-    return $true
+    & $executable @prefix @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Python 命令失败（退出码 $LASTEXITCODE）。" }
 }
 
-function Invoke-ServiceAction {
-    param(
-        [ValidateSet("install", "uninstall", "start", "stop", "restart")]
-        [string]$Action
-    )
-
-    if (-not (Test-Path -LiteralPath $ServiceExe)) {
-        Write-Host "[错误] 找不到 runtime\services\singbox-service.exe。请先运行 scripts\bootstrap\setup.bat。" -ForegroundColor Red
-        return $false
-    }
-    if ($Action -ne "install") {
-        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if (-not $service) {
-            Write-Host "[错误] 服务尚未安装。请先运行 scripts\bootstrap\setup.bat 安装服务。" -ForegroundColor Red
-            return $false
-        }
-    }
-    # 操作 Windows 服务需要管理员权限，请求提权后隐藏窗口执行。
-    Write-Host "正在请求管理员权限执行：$Action ..." -ForegroundColor Yellow
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
     try {
-        $process = Start-Process -FilePath $ServiceExe -ArgumentList $Action `
-            -WorkingDirectory $ProjectRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
-    } catch {
-        Write-Host "[错误] 提权被拒绝或失败：$($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
-    if ($process.ExitCode -ne 0) {
-        Write-Host "[错误] 服务操作 '$Action' 失败 (退出码 $($process.ExitCode))。查看 $LogDirectory。" -ForegroundColor Red
-        return $false
-    }
-    Write-Host "[完成] 服务操作 '$Action' 成功。当前状态：$(Get-ServiceStateText)" -ForegroundColor Green
-    return $true
-}
-
-function Sync-ServiceDefinition {
-    # manage 的 reload 不会重装服务；若 config\services 里的 XML 更新过（例如核心
-    # 版本升级）而 runtime\services 副本没同步，重启后服务仍然跑旧核心。
-    $sourceXml = Join-Path $ProjectRoot "config\services\singbox-service.xml"
-    $runtimeXml = Join-Path $ProjectRoot "runtime\services\singbox-service.xml"
-    if (-not (Test-Path -LiteralPath $sourceXml)) {
-        return
-    }
-    if ((Test-Path -LiteralPath $runtimeXml) -and
-        (Get-FileHash -LiteralPath $sourceXml).Hash -eq (Get-FileHash -LiteralPath $runtimeXml).Hash) {
-        return
-    }
-    New-Item -ItemType Directory -Path (Split-Path -Parent $runtimeXml) -Force | Out-Null
-    Copy-Item -LiteralPath $sourceXml -Destination $runtimeXml -Force
-    Write-Host "[同步] 服务定义已更新：config\services\singbox-service.xml -> runtime\services\" -ForegroundColor Yellow
-}
-
-function Get-ServiceCoreExecutable {
-    param([string]$DefinitionPath)
-
-    # 用服务 XML 里声明的核心跑校验，保证「check 的核心」就是「服务将要跑的核心」。
-    if (-not $DefinitionPath) {
-        $DefinitionPath = Join-Path $ProjectRoot "runtime\services\singbox-service.xml"
-    }
-    if (Test-Path -LiteralPath $DefinitionPath) {
-        $match = [regex]::Match((Get-Content -LiteralPath $DefinitionPath -Raw), 'cores\\([^\\]+)\\sing-box\.exe')
-        if ($match.Success) {
-            $exe = Join-Path $ProjectRoot ("runtime\cores\{0}\sing-box.exe" -f $match.Groups[1].Value)
-            if (Test-Path -LiteralPath $exe) {
-                return $exe
-            }
-            # XML 已明确指定核心时不猜测其他版本，否则可能用 A 版本校验、
-            # 重启后却让服务尝试运行缺失的 B 版本。
-            return $null
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $sha.Dispose()
         }
-    }
-    $latest = Get-ChildItem -LiteralPath (Join-Path $ProjectRoot "runtime\cores") -Directory -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending | Select-Object -First 1
-    if ($latest) {
-        $exe = Join-Path $latest.FullName "sing-box.exe"
-        if (Test-Path -LiteralPath $exe) {
-            return $exe
-        }
-    }
-    return $null
-}
-
-function Test-DesktopConfig {
-    param(
-        [string]$ConfigPath = (Join-Path $ProjectRoot "dist\desktop\config.json"),
-        [string]$CoreExecutable
-    )
-
-    $configPath = $ConfigPath
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        Write-Host "[错误] 找不到桌面配置：$configPath" -ForegroundColor Red
-        return $false
-    }
-    $coreExe = $CoreExecutable
-    if (-not $coreExe) {
-        $coreExe = Get-ServiceCoreExecutable
-    }
-    if (-not $coreExe) {
-        Write-Host "[错误] 服务定义引用的 sing-box 核心不存在；拒绝跳过校验。" -ForegroundColor Red
-        return $false
-    }
-    & $coreExe check -c $configPath 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[错误] sing-box check 未通过，已中止重启，当前服务保持原配置运行。" -ForegroundColor Red
-        return $false
-    }
-    Write-Host "[校验] sing-box check 通过（$([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($coreExe)))）。" -ForegroundColor Green
-    return $true
-}
-
-function Test-AndroidConfig {
-    param([string]$ConfigPath = (Join-Path $ProjectRoot "dist\android\config.json"))
-
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        Write-Host "[错误] 找不到安卓配置：$ConfigPath" -ForegroundColor Red
-        return $false
-    }
-    $coreExe = Get-ServiceCoreExecutable
-    if (-not $coreExe) {
-        Write-Host "[错误] 找不到与当前配置版本匹配的 sing-box 核心，无法校验安卓配置。" -ForegroundColor Red
-        return $false
-    }
-    & $coreExe check -c $ConfigPath 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[错误] 安卓配置未通过 sing-box check，旧配置保持不变。" -ForegroundColor Red
-        return $false
-    }
-    Write-Host "[校验] 安卓配置通过 sing-box check。" -ForegroundColor Green
-    return $true
-}
-
-function Invoke-BuildAndroid {
-    param([switch]$Offline)
-
-    $stagingRoot = Join-Path $ProjectRoot "runtime\staging"
-    $stagingDirectory = Join-Path $stagingRoot ("android-build-{0}" -f [Guid]::NewGuid().ToString("N"))
-    $stagedConfig = Join-Path $stagingDirectory "android\config.json"
-    $liveConfig = Join-Path $ProjectRoot "dist\android\config.json"
-    $previousConfig = Join-Path $stagingDirectory "previous-config.json"
-
-    New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
-    try {
-        if (-not (Invoke-Generator -Target "android" -Offline:$Offline -OutputDirectory $stagingDirectory)) {
-            return $false
-        }
-        if (-not (Test-AndroidConfig -ConfigPath $stagedConfig)) {
-            return $false
-        }
-
-        New-Item -ItemType Directory -Path (Split-Path -Parent $liveConfig) -Force | Out-Null
-        if (Test-Path -LiteralPath $liveConfig) {
-            [IO.File]::Replace($stagedConfig, $liveConfig, $previousConfig, $true)
-        } else {
-            Move-Item -LiteralPath $stagedConfig -Destination $liveConfig
-        }
-        Write-Host "[完成] 安卓配置已校验并发布：$liveConfig" -ForegroundColor Green
-        return $true
     } finally {
-        if (Test-Path -LiteralPath $stagingDirectory) {
-            Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
-        }
-        if ((Test-Path -LiteralPath $stagingRoot) -and -not (Get-ChildItem -LiteralPath $stagingRoot -Force)) {
-            Remove-Item -LiteralPath $stagingRoot -Force
-        }
+        $stream.Dispose()
     }
 }
 
-function Test-ServiceHealthy {
-    param([int]$TimeoutSeconds = 10)
+function Write-ValidationStamp {
+    param([string]$ConfigPath, [string]$StampPath, [string]$Validator)
+    $stamp = [ordered]@{
+        schema_version = 1
+        sha256 = (Get-Sha256Hex -Path $ConfigPath)
+        validated_at = [DateTimeOffset]::Now.ToString("o")
+        validator = $Validator
+    } | ConvertTo-Json
+    [IO.File]::WriteAllText($StampPath, $stamp + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+}
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($service -and $service.Status -eq "Running") {
+function Publish-File {
+    param([string]$Source, [string]$Destination)
+    $parent = Split-Path -Parent $Destination
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    $temporary = Join-Path $parent ((Split-Path -Leaf $Destination) + ".new-" + [Guid]::NewGuid().ToString("N"))
+    # Staging and dist live under the same project tree.  Move the staged file
+    # into the destination directory instead of copying it first; this avoids
+    # an unnecessary full read/write cycle for large mobile configurations.
+    try {
+        [IO.File]::Move($Source, $temporary)
+    } catch [IO.IOException] {
+        # Keep the workflow usable when a caller stages on another volume.
+        Copy-Item -LiteralPath $Source -Destination $temporary
+    }
+    try {
+        if (Test-Path -LiteralPath $Destination) {
+            $backup = $Destination + ".bak-" + [Guid]::NewGuid().ToString("N")
             try {
-                Invoke-WebRequest -Uri "http://127.0.0.1:9090/version" -UseBasicParsing -TimeoutSec 1 | Out-Null
-                return $true
-            } catch {
-                # 服务已启动但控制接口还在初始化，继续等待。
+                [IO.File]::Replace($temporary, $Destination, $backup)
+            } finally {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
             }
-        }
-        Start-Sleep -Milliseconds 300
-    } while ((Get-Date) -lt $deadline)
-    return $false
-}
-
-function Invoke-ReloadDesktop {
-    param([switch]$Offline)
-
-    $stagingRoot = Join-Path $ProjectRoot "runtime\staging"
-    $stagingDirectory = Join-Path $stagingRoot ("desktop-reload-{0}" -f [Guid]::NewGuid().ToString("N"))
-    $stagedConfig = Join-Path $stagingDirectory "desktop\config.json"
-    $liveConfig = Join-Path $ProjectRoot "dist\desktop\config.json"
-    $previousConfig = Join-Path $stagingDirectory "previous-config.json"
-    $sourceXml = Join-Path $ProjectRoot "config\services\singbox-service.xml"
-    $runtimeXml = Join-Path $ProjectRoot "runtime\services\singbox-service.xml"
-    $previousXml = Join-Path $stagingDirectory "previous-service.xml"
-    $hadLiveConfig = Test-Path -LiteralPath $liveConfig
-    $hadRuntimeXml = Test-Path -LiteralPath $runtimeXml
-    $published = $false
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-
-    New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
-    try {
-        Write-Host "=== [1/4] 临时生成桌面配置 ===" -ForegroundColor Cyan
-        if (-not (Invoke-Generator -Target "desktop" -Offline:$Offline -OutputDirectory $stagingDirectory)) {
-            Write-Host "服务重启已跳过，正式配置未改动。" -ForegroundColor Yellow
-            return $false
-        }
-
-        Write-Host ""
-        Write-Host "=== [2/4] 使用目标核心校验临时配置 ===" -ForegroundColor Cyan
-        $coreExe = Get-ServiceCoreExecutable -DefinitionPath $sourceXml
-        if (-not $coreExe) {
-            Write-Host "[错误] config\services\singbox-service.xml 引用的核心不存在。" -ForegroundColor Red
-            return $false
-        }
-        if (-not (Test-DesktopConfig -ConfigPath $stagedConfig -CoreExecutable $coreExe)) {
-            Write-Host "正式配置未改动。" -ForegroundColor Yellow
-            return $false
-        }
-
-        Write-Host ""
-        Write-Host "=== [3/4] 原子发布配置并同步服务定义 ===" -ForegroundColor Cyan
-        New-Item -ItemType Directory -Path (Split-Path -Parent $liveConfig) -Force | Out-Null
-        if ($hadLiveConfig) {
-            [IO.File]::Replace($stagedConfig, $liveConfig, $previousConfig, $true)
         } else {
-            Move-Item -LiteralPath $stagedConfig -Destination $liveConfig
+            [IO.File]::Move($temporary, $Destination)
         }
-        $published = $true
-        if ($hadRuntimeXml) {
-            Copy-Item -LiteralPath $runtimeXml -Destination $previousXml -Force
-        }
-        Sync-ServiceDefinition
-
-        if (-not $service) {
-            Write-Host "[提示] 配置已校验并发布；服务尚未安装。运行 scripts\bootstrap\setup.bat 可安装服务。" -ForegroundColor Yellow
-            return $true
-        }
-
-        Write-Host ""
-        Write-Host "=== [4/4] 重启并确认 sing-box 健康 ===" -ForegroundColor Cyan
-        if ((Invoke-ServiceAction -Action "restart") -and (Test-ServiceHealthy)) {
-            Write-Host "[完成] 新配置已生效，控制接口健康。" -ForegroundColor Green
-            return $true
-        }
-        throw "服务未能在重启后通过健康检查"
-    } catch {
-        $failure = $_.Exception.Message
-        Write-Host "[错误] 刷新失败：$failure" -ForegroundColor Red
-        if ($published) {
-            Write-Host "正在回滚上一份配置和服务定义..." -ForegroundColor Yellow
-            if ($hadLiveConfig -and (Test-Path -LiteralPath $previousConfig)) {
-                Move-Item -LiteralPath $previousConfig -Destination $liveConfig -Force
-            } elseif (-not $hadLiveConfig -and (Test-Path -LiteralPath $liveConfig)) {
-                Remove-Item -LiteralPath $liveConfig -Force
-            }
-            if ($hadRuntimeXml -and (Test-Path -LiteralPath $previousXml)) {
-                Copy-Item -LiteralPath $previousXml -Destination $runtimeXml -Force
-            } elseif (-not $hadRuntimeXml -and (Test-Path -LiteralPath $runtimeXml)) {
-                Remove-Item -LiteralPath $runtimeXml -Force
-            }
-            if ($service) {
-                if ((Invoke-ServiceAction -Action "restart") -and (Test-ServiceHealthy)) {
-                    Write-Host "[回滚] 旧配置已恢复，服务健康。" -ForegroundColor Green
-                } else {
-                    Write-Host "[严重] 旧配置已恢复，但服务未通过健康检查；请查看 runtime\logs。" -ForegroundColor Red
-                }
-            }
-        }
-        return $false
     } finally {
-        if (Test-Path -LiteralPath $stagingDirectory) {
-            Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
-        }
-        if ((Test-Path -LiteralPath $stagingRoot) -and -not (Get-ChildItem -LiteralPath $stagingRoot -Force)) {
-            Remove-Item -LiteralPath $stagingRoot -Force
-        }
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
     }
 }
 
-function Get-AndroidPublisherUrl {
-    $candidates = @()
-    if (Test-Path -LiteralPath $AndroidPublisherReadyFile) {
-        try {
-            $readyUrl = (Get-Content -LiteralPath $AndroidPublisherReadyFile -Raw).Trim()
-            if ($readyUrl) { $candidates += $readyUrl }
-        } catch {}
+function Invoke-Generate {
+    param([ValidateSet("desktop", "android", "all")][string]$Target)
+    if (-not (Test-Path -LiteralPath $Subscriptions -PathType Leaf)) {
+        throw "找不到 config\local\subscriptions.yaml。请先按 config\examples\subscriptions.yaml 创建本机订阅。"
     }
-    # A prior manager may have been interrupted before it wrote the ready file.
-    # Probe the fixed loopback endpoint so the existing publisher can still be
-    # reused instead of failing on an occupied port.
-    $candidates += "http://127.0.0.1:$AndroidPublisherPort/android/config.json"
-
-    foreach ($candidate in ($candidates | Select-Object -Unique)) {
-        try {
-            $response = Invoke-WebRequest -Uri $candidate -Method Head -UseBasicParsing -TimeoutSec 1
-            if ($response.Headers["X-Sing-Box-Config-Publisher"] -ne "1") { continue }
-            $reportedUrl = [string]$response.Headers["X-Sing-Box-Config-Url"]
-            if ($reportedUrl) {
-                New-Item -ItemType Directory -Path $AndroidPublisherDirectory -Force | Out-Null
-                [IO.File]::WriteAllText($AndroidPublisherReadyFile, $reportedUrl.Trim() + [Environment]::NewLine)
-                $reportedPid = [string]$response.Headers["X-Sing-Box-Config-Pid"]
-                if ($reportedPid -match "^\d+$") {
-                    [IO.File]::WriteAllText($AndroidPublisherPidFile, $reportedPid + [Environment]::NewLine)
-                }
-                return $reportedUrl.Trim()
-            }
-            return $candidate
-        } catch {}
-    }
-
-    Remove-Item -LiteralPath $AndroidPublisherReadyFile -Force -ErrorAction SilentlyContinue
-    return $null
-}
-
-function Stop-AndroidPublisher {
-    # Refresh the PID from the listener itself.  Virtual-environment Python
-    # launchers can have a different PID from the long-running interpreter.
-    [void](Get-AndroidPublisherUrl)
-    $stopped = $false
-    if (Test-Path -LiteralPath $AndroidPublisherPidFile) {
-        try {
-            $processId = [int](Get-Content -LiteralPath $AndroidPublisherPidFile -Raw).Trim()
-            $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-            if ($process) {
-                Stop-Process -Id $processId -Force -ErrorAction Stop
-                $stopped = $true
-            }
-        } catch {
-            Write-Host "[提示] 发布器进程已退出或无法停止：$($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-    Remove-Item -LiteralPath $AndroidPublisherReadyFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $AndroidPublisherPidFile -Force -ErrorAction SilentlyContinue
-    if ($stopped) {
-        Write-Host "[完成] 安卓局域网发布已停止。" -ForegroundColor Green
-    } else {
-        Write-Host "[提示] 没有由当前管理脚本启动的安卓发布器。" -ForegroundColor Yellow
-    }
-    return $true
-}
-
-function Invoke-PublishAndroid {
-    param([switch]$Offline)
-
-    Write-Host "=== [1/2] 生成安卓配置 ===" -ForegroundColor Cyan
-    if (-not (Invoke-BuildAndroid -Offline:$Offline)) {
-        Write-Host "局域网发布已跳过。" -ForegroundColor Yellow
-        return $false
-    }
-    Write-Host ""
-    Write-Host "=== [2/2] 局域网发布（手机 SFA 远程订阅） ===" -ForegroundColor Cyan
-    if (-not (Test-Path -LiteralPath $AndroidPublisherScript)) {
-        Write-Host "[错误] 找不到 scripts\serve\serve_config.py。" -ForegroundColor Red
-        return $false
-    }
-    $publisherUrl = Get-AndroidPublisherUrl
-    if ($publisherUrl) {
-        Write-Host "[复用] 局域网发布器已在运行，本次生成的配置已可供手机更新。" -ForegroundColor Green
-    } else {
-        New-Item -ItemType Directory -Path $AndroidPublisherDirectory -Force | Out-Null
-        Remove-Item -LiteralPath $AndroidPublisherReadyFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $AndroidPublisherPidFile -Force -ErrorAction SilentlyContinue
-        $python = @(Get-PythonCommand)
-        $executable = $python[0]
-        $arguments = @($python | Select-Object -Skip 1) + @(
-            "-X", "utf8",
-            "-u",
-            "`"$AndroidPublisherScript`"",
-            "--port", "$AndroidPublisherPort",
-            "--ready-file", "`"$AndroidPublisherReadyFile`"",
-            "--pid-file", "`"$AndroidPublisherPidFile`""
-        )
-        $stdoutLog = Join-Path $LogDirectory "android-publisher.out.log"
-        $stderrLog = Join-Path $LogDirectory "android-publisher.err.log"
-        New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-        try {
-            $process = Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $ProjectRoot `
-                -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
-        } catch {
-            Write-Host "[错误] 无法启动局域网发布器：$($_.Exception.Message)" -ForegroundColor Red
-            return $false
-        }
-
-        $deadline = (Get-Date).AddSeconds(15)
-        do {
-            Start-Sleep -Milliseconds 150
-            $publisherUrl = Get-AndroidPublisherUrl
-            if ($publisherUrl) { break }
-            if ($process.HasExited) { break }
-        } while ((Get-Date) -lt $deadline)
-        if (-not $publisherUrl) {
-            if (-not $process.HasExited) {
-                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            }
-            Remove-Item -LiteralPath $AndroidPublisherReadyFile -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $AndroidPublisherPidFile -Force -ErrorAction SilentlyContinue
-            Write-Host "[错误] 发布器未能监听固定端口 $AndroidPublisherPort。查看 $stderrLog；如端口被其他程序占用，请释放该端口后重试。" -ForegroundColor Red
-            return $false
-        }
-        Write-Host "[完成] 已在后台启动局域网发布（固定端口 $AndroidPublisherPort）。" -ForegroundColor Green
-    }
-    Write-Host "安卓远程配置 URL：$publisherUrl" -ForegroundColor Cyan
-    Write-Host "首次：手机 SFA 新建「远程」配置并粘贴该 URL；日后刷新只需在 SFA 点「更新」。" -ForegroundColor DarkGray
-    Write-Host "停止发布：管理菜单选择 [x]，或执行 manage.ps1 -Action stop-publish。" -ForegroundColor DarkGray
-    return $true
-}
-
-function Show-Log {
-    if (-not (Test-Path -LiteralPath $LogDirectory)) {
-        Write-Host "[提示] 还没有日志目录。服务运行后才会产生日志。" -ForegroundColor Yellow
-        return
-    }
-    # sing-box 的结构化运行日志写到 stderr；stdout 通常是空文件。
-    # 优先跟随当前核心日志，再退回到任意最近且非空的服务日志。
-    $log = Get-ChildItem -LiteralPath $LogDirectory -Filter "singbox-service.err.log*" -File -ErrorAction SilentlyContinue |
-        Where-Object Length -gt 0 |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $log) {
-        $log = Get-ChildItem -LiteralPath $LogDirectory -Filter "*.log" -File -ErrorAction SilentlyContinue |
-            Where-Object Length -gt 0 |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    }
-    if (-not $log) {
-        Write-Host "[提示] 日志目录里还没有非空日志。" -ForegroundColor Yellow
-        return
-    }
-    Write-Host "正在跟随日志：$($log.FullName)" -ForegroundColor Cyan
-    Write-Host "按 Ctrl+C 停止跟随并返回菜单。" -ForegroundColor DarkGray
-    Write-Host ""
+    [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
+    $stage = Join-Path $RuntimeRoot ("manage-" + [Guid]::NewGuid().ToString("N"))
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
     try {
-        Get-Content -LiteralPath $log.FullName -Tail 40 -Wait
-    } catch [System.Management.Automation.PipelineStoppedException] {
-        # 用户按 Ctrl+C，正常返回菜单。
-    } catch {
-        Write-Host "[提示] 已停止跟随日志。" -ForegroundColor DarkGray
-    }
-}
+        $arguments = @("-m", "singbox_config.simple_generator", $Target, "--output-dir", $stage)
+        if ($Offline) { $arguments += "--offline" }
+        Invoke-Python -Arguments $arguments
 
-function Show-Status {
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    Write-Host "服务：$(Get-ServiceStateText)" -ForegroundColor Cyan
-
-    $coreExe = Get-ServiceCoreExecutable
-    if ($coreExe) {
-        $versionLine = (& $coreExe version 2>$null | Select-Object -First 1)
-        Write-Host "核心：$versionLine" -ForegroundColor Cyan
-        Write-Host "路径：$coreExe" -ForegroundColor DarkGray
-    } else {
-        Write-Host "核心：服务定义引用的文件不存在" -ForegroundColor Red
-    }
-
-    $configValid = Test-DesktopConfig -CoreExecutable $coreExe
-    if ($service -and $service.Status -eq "Running") {
-        try {
-            $api = Invoke-RestMethod -Uri "http://127.0.0.1:9090/proxies" -TimeoutSec 2
-            foreach ($name in @("Available", "DNS-Out", "AI", "Emby")) {
-                $property = $api.proxies.PSObject.Properties[$name]
-                if ($property) {
-                    Write-Host ("选择：{0} -> {1}" -f $name, $property.Value.now) -ForegroundColor DarkGray
-                }
+        $names = if ($Target -eq "all") { @("desktop", "android") } else { @($Target) }
+        $core = Get-CoreExecutable
+        $validator = "内置结构校验"
+        if ($core) {
+            $versionOutput = @(& $core version 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "无法运行校验核心：$core" }
+            $version = $versionOutput | Select-Object -First 1
+            foreach ($name in $names) {
+                & $core check -c (Join-Path $stage "$name\config.json")
+                if ($LASTEXITCODE -ne 0) { throw "$name 配置未通过 sing-box 核心校验。" }
             }
-            Write-Host "控制接口：健康" -ForegroundColor Green
-        } catch {
-            Write-Host "控制接口：不可用（http://127.0.0.1:9090）" -ForegroundColor Red
-            return $false
-        }
-    }
-    return $configValid
-}
-
-function Open-Dashboard {
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $service -or $service.Status -ne "Running") {
-        Write-Host "[提示] 服务未运行，仪表板可能打不开。可先启动服务。" -ForegroundColor Yellow
-    }
-    Write-Host "正在打开仪表板：$DashboardUrl" -ForegroundColor Cyan
-    Start-Process $DashboardUrl
-}
-
-function Test-TrafficDashboard {
-    try {
-        Invoke-WebRequest -Uri "$TrafficDashboardUrl/api/status" -UseBasicParsing -TimeoutSec 2 | Out-Null
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Open-TrafficDashboard {
-    if (-not (Test-Path -LiteralPath $TrafficMonitor)) {
-        Write-Host "[错误] 找不到 scripts\monitor\traffic_monitor.py。" -ForegroundColor Red
-        return
-    }
-    if (-not (Test-TrafficDashboard)) {
-        $trafficService = Get-Service -Name $TrafficServiceName -ErrorAction SilentlyContinue
-        if ($trafficService) {
-            if ($trafficService.Status -ne "Running") {
-                Write-Host "正在请求管理员权限启动流量统计服务..." -ForegroundColor Yellow
-                try {
-                    $process = Start-Process -FilePath $TrafficServiceExe -ArgumentList "start" `
-                        -WorkingDirectory $ProjectRoot -Verb RunAs -WindowStyle Hidden -Wait -PassThru
-                    if ($process.ExitCode -ne 0) {
-                        Write-Host "[错误] 流量统计服务启动失败。" -ForegroundColor Red
-                        return
-                    }
-                } catch {
-                    Write-Host "[错误] 提权被拒绝或失败：$($_.Exception.Message)" -ForegroundColor Red
-                    return
-                }
-            }
+            $validator = [string]$version
         } else {
-            $python = @(Get-PythonCommand)
-            $executable = $python[0]
-            $arguments = @($python | Select-Object -Skip 1) + @("`"$TrafficMonitor`"")
-            Write-Host "流量统计服务尚未安装，正在以当前用户启动统计器..." -ForegroundColor Yellow
-            Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden
+            Write-Host "[提示] 未找到 sing-box CLI 核心，已完成生成器内置结构校验。可用 SING_BOX_CORE 指定核心路径。" -ForegroundColor Yellow
         }
-        for ($attempt = 0; $attempt -lt 15; $attempt++) {
-            Start-Sleep -Milliseconds 300
-            if (Test-TrafficDashboard) { break }
+
+        foreach ($name in $names) {
+            $sourceConfig = Join-Path $stage "$name\config.json"
+            $sourceStamp = Join-Path $stage "$name\config.validated.json"
+            Write-ValidationStamp -ConfigPath $sourceConfig -StampPath $sourceStamp -Validator $validator
+            Publish-File -Source $sourceConfig -Destination (Join-Path $OutputRoot "$name\config.json")
+            Publish-File -Source $sourceStamp -Destination (Join-Path $OutputRoot "$name\config.validated.json")
+            Write-Host "[完成] $name 配置已校验并发布。" -ForegroundColor Green
+        }
+        return $true
+    } finally {
+        if ($stage.StartsWith($RuntimeRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    if (-not (Test-TrafficDashboard)) {
-        Write-Host "[错误] 流量统计面板未能启动。请检查 runtime\logs。" -ForegroundColor Red
-        return
+}
+
+function Invoke-Publisher {
+    param([string[]]$Extra = @())
+    Invoke-Python -Arguments (@("-m", "singbox_config.publisher") + $Extra) | Out-Host
+}
+
+function ConvertTo-SafeFileStem {
+    param([Parameter(Mandatory)][string]$Value)
+    $stem = [Regex]::Replace($Value.Trim(), '[\\/:*?"<>|\r\n]+', '_')
+    $stem = [Regex]::Replace($stem, '\s+', ' ').Trim(' ', '.')
+    if (-not $stem) { $stem = "node" }
+    if ($stem.Length -gt 80) { $stem = $stem.Substring(0, 80).Trim() }
+    return $stem
+}
+
+function Get-LinkFormat {
+    param([Parameter(Mandatory)][string]$Value)
+    $trimmed = $Value.Trim()
+    if ($trimmed -match '(?i)^(ss|ssr|vmess|vless|trojan|hysteria2|hy2|tuic|anytls)://') {
+        return @{ Format = "uri"; Source = "file"; Content = $trimmed }
     }
-    Write-Host "正在打开流量去向面板：$TrafficDashboardUrl" -ForegroundColor Cyan
-    Start-Process $TrafficDashboardUrl
+    if ($trimmed -notmatch '^https?://') {
+        throw "链接必须是 HTTP(S) 订阅地址或支持的单节点 URI。"
+    }
+    $settings = Get-Content -Raw -LiteralPath (Join-Path $ProjectRoot "config\policy.yaml")
+    $timeout = 20
+    if ($settings -match 'timeout_seconds:\s*(\d+)') { $timeout = [int]$Matches[1] }
+    try {
+        $response = Invoke-WebRequest -Uri $trimmed -UseBasicParsing -TimeoutSec $timeout -Headers @{ 'User-Agent' = 'sing-box' }
+    } catch {
+        throw "无法读取订阅以判断格式：$($_.Exception.Message)"
+    }
+    $content = [string]$response.Content
+    $body = $content.Trim()
+    if ($body.StartsWith('{')) {
+        try {
+            $json = $body | ConvertFrom-Json
+            if ($null -ne $json.outbounds) { return @{ Format = "sing-box-json"; Source = "url_file"; Content = $trimmed } }
+        } catch {}
+    }
+    if ($body -match '(?m)^\s*proxies\s*:') {
+        return @{ Format = "clash"; Source = "url_file"; Content = $trimmed }
+    }
+    if ($body -match '(?im)^\s*(ss|ssr|vmess|vless|trojan|hysteria2|hy2|tuic|anytls)://') {
+        return @{ Format = "uri"; Source = "url_file"; Content = $trimmed }
+    }
+    throw "无法识别订阅格式；支持 sing-box JSON、Clash YAML 或 URI 列表。"
+}
+
+function Invoke-QuickAdd {
+    param([string]$ProvidedName, [string]$ProvidedLink, [string]$ProvidedFormat = "auto")
+    $nameValue = if ($ProvidedName) { $ProvidedName.Trim() } else { (Read-Host "节点/订阅名称").Trim() }
+    $linkValue = if ($ProvidedLink) { $ProvidedLink.Trim() } else { (Read-Host "单节点 URI 或订阅链接").Trim() }
+    if (-not $nameValue) { throw "名称不能为空。" }
+    if (-not $linkValue) { throw "链接不能为空。" }
+    $quotedName = [Regex]::Escape($nameValue)
+    $localRoot = Join-Path $ProjectRoot "config\local"
+    $subRoot = Join-Path $localRoot "subscriptions"
+    [IO.Directory]::CreateDirectory($subRoot) | Out-Null
+    if (-not (Test-Path -LiteralPath $Subscriptions -PathType Leaf)) {
+        $example = Join-Path $ProjectRoot "config\examples\subscriptions.yaml"
+        if (-not (Test-Path -LiteralPath $example -PathType Leaf)) {
+            throw "找不到订阅清单模板：$example"
+        }
+        Copy-Item -LiteralPath $example -Destination $Subscriptions
+    }
+    $existingManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $Subscriptions
+    $namePattern = '(?m)^\s*-\s+name:.*' + $quotedName
+    if ($existingManifest -match $namePattern) {
+        throw "名称 [$nameValue] 已存在，请换一个名称。"
+    }
+    if ($ProvidedFormat -and $ProvidedFormat -ne "auto") {
+        if ($ProvidedFormat -eq "uri" -and $linkValue -notmatch '(?i)^(ss|ssr|vmess|vless|trojan|hysteria2|hy2|tuic|anytls)://') {
+            throw "Format=uri 时链接必须是支持的单节点 URI。"
+        }
+        $detected = @{ Format = $ProvidedFormat; Source = if ($linkValue -match '^https?://') { "url_file" } else { "file" }; Content = $linkValue }
+    } else {
+        $detected = Get-LinkFormat -Value $linkValue
+    }
+
+    $stem = ConvertTo-SafeFileStem -Value $nameValue
+    $suffix = if ($detected.Source -eq "url_file") { ".url.txt" } else { ".txt" }
+    $relative = "subscriptions/$stem$suffix"
+    $path = Join-Path $localRoot ($relative -replace '/', '\\')
+    if (Test-Path -LiteralPath $path) {
+        $path = Join-Path $subRoot ((ConvertTo-SafeFileStem -Value ("{0}-{1}" -f $nameValue, (Get-Date -Format "yyyyMMdd-HHmmss"))) + $suffix)
+        $relative = "subscriptions/" + (Split-Path -Leaf $path)
+    }
+    [IO.File]::WriteAllText($path, $detected.Content + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+
+    $manifestText = $existingManifest
+    $escapedName = $nameValue.Replace("'", "''")
+    $escapedFormat = $detected.Format
+    $block = @"
+
+  - name: '$escapedName'
+    enabled: true
+    format: $escapedFormat
+    source: $($detected.Source)
+    path: $relative
+    user_agent: sing-box
+    group: '$escapedName'
+    prefix_node_tags: false
+    node_tag: '$escapedName'
+    order: 60
+    ai: auto
+    urltest: true
+"@
+    try {
+        [IO.File]::WriteAllText($Subscriptions, $manifestText.TrimEnd() + $block + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Write-Host "[完成] 已添加“$nameValue”（$($detected.Format)，$($detected.Source)）。" -ForegroundColor Green
+        Write-Host "[提示] 正在更新桌面和安卓配置；订阅类链接会在每次更新时重新拉取。" -ForegroundColor DarkGray
+        return Invoke-Generate -Target "all"
+    } catch {
+        [IO.File]::WriteAllText($Subscriptions, $manifestText, [Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Invoke-Maintenance {
+ param([string]$Mode, [string]$SelectedName)
+ $text=Get-Content -Raw -Encoding UTF8 $Subscriptions
+ $rx = '(?ms)^  - name:\s*(?<raw>.+?)\s*$.*?(?=^  - name:|\z)'
+ $manifestItems = [Regex]::Matches($text, $rx)
+ $name = if ($SelectedName) { $SelectedName } else { (Read-Host "订阅/节点名称").Trim() }
+ $m = $manifestItems | Where-Object {
+   $candidate = $_.Groups['raw'].Value.Trim()
+   if ($candidate.Length -ge 2 -and $candidate[0] -eq "'" -and $candidate[$candidate.Length - 1] -eq "'") { $candidate = $candidate.Substring(1, $candidate.Length - 2).Replace("''", "'") }
+   elseif ($candidate.Length -ge 2 -and $candidate[0] -eq '"' -and $candidate[$candidate.Length - 1] -eq '"') { $candidate = $candidate.Substring(1, $candidate.Length - 2) }
+   $candidate -eq $name
+ } | Select-Object -First 1
+ if(-not $m){throw "找不到订阅或节点：$name"}
+ if($Mode -eq 'remove'){
+   $pathMatch=[Regex]::Match($m.Value,'(?m)^\s+path:\s*(.+?)\s*$')
+   $enabledCount=0
+   foreach($entry in $manifestItems){if($entry.Value -notmatch '(?m)^\s+enabled:\s*false\s*$'){$enabledCount++}}
+   if($enabledCount -le 1 -and $m.Value -notmatch '(?m)^\s+enabled:\s*false\s*$'){throw "不能删除最后一个启用的节点或订阅。"}
+   $originalText=$text; $text=$text.Remove($m.Index,$m.Length).TrimEnd()+[Environment]::NewLine
+   try {
+     [IO.File]::WriteAllText($Subscriptions,$text,(New-Object Text.UTF8Encoding($false)))
+     [void](Invoke-Generate -Target all)
+   } catch {
+     [IO.File]::WriteAllText($Subscriptions,$originalText,(New-Object Text.UTF8Encoding($false))); throw
+   }
+   if($pathMatch.Success){
+     $localRoot=[IO.Path]::GetFullPath((Split-Path $Subscriptions)); $itemPath=[IO.Path]::GetFullPath((Join-Path $localRoot ($pathMatch.Groups[1].Value.Trim().Trim('"''') -replace '/', '\\')))
+     if($itemPath.StartsWith($localRoot + [IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $itemPath -Force -ErrorAction SilentlyContinue}
+   }
+   Write-Host "[完成] 已删除“$name”。"; return $true
+ }
+ $enabled=if($Mode -eq 'enable'){'true'}else{'false'}
+ if($Mode -eq 'disable'){
+   $enabledCount=0
+   foreach($entry in $manifestItems){if($entry.Groups['raw'].Value.Trim() -ne $m.Groups['raw'].Value.Trim() -and $entry.Value -notmatch '(?m)^\s+enabled:\s*false\s*$'){$enabledCount++}}
+   if($m.Value -notmatch '(?m)^\s+enabled:\s*false\s*$' -and $enabledCount -eq 0){throw "不能禁用最后一个启用的节点或订阅。"}
+ }
+ $block=[Regex]::Replace($m.Value,'(?m)^(\s+enabled:\s*)\S+','$1'+$enabled); $originalText=$text; $text=$text.Remove($m.Index,$m.Length).Insert($m.Index,$block)
+ try {
+   [IO.File]::WriteAllText($Subscriptions,$text,(New-Object Text.UTF8Encoding($false)))
+   [void](Invoke-Generate -Target all)
+ } catch {
+   [IO.File]::WriteAllText($Subscriptions,$originalText,(New-Object Text.UTF8Encoding($false))); throw
+ }
+ Write-Host "[完成] 已更新“$name”。"; return $true
+}
+
+function Show-MaintenanceMenu {
+ $text=Get-Content -Raw -Encoding UTF8 $Subscriptions
+ $rx='(?ms)^  - name:\s*(?<raw>.+?)\s*$.*?(?=^  - name:|\z)'; $items=@([Regex]::Matches($text,$rx))
+ if($items.Count -eq 0){throw "订阅清单中没有可维护的节点或订阅。"}
+ $entries = @(foreach($item in $items){$candidate=$item.Groups['raw'].Value.Trim(); if($candidate.Length -ge 2 -and $candidate[0] -eq "'" -and $candidate[$candidate.Length - 1] -eq "'"){$candidate=$candidate.Substring(1,$candidate.Length-2).Replace("''", "'")} elseif($candidate.Length -ge 2 -and $candidate[0] -eq '"' -and $candidate[$candidate.Length - 1] -eq '"'){$candidate=$candidate.Substring(1,$candidate.Length-2)}; [pscustomobject]@{Name=$candidate; Kind=if($item.Value -match '(?m)^\s+format:\s*uri\s*$'){'单节点'}else{'订阅'}; Enabled=($item.Value -notmatch '(?m)^\s+enabled:\s*false\s*$')} })
+ while($true){ Write-Host "`n--- 删除/禁用维护 ---"; for($i=0;$i -lt $entries.Count;$i++){$state=if($entries[$i].Enabled){'启用'}else{'禁用'}; Write-Host ("[{0}] {1}（{2}，{3}）" -f ($i+1),$entries[$i].Name,$entries[$i].Kind,$state)}; Write-Host "[q] 返回"; $choice=(Read-Host "请选择条目").Trim(); if($choice -eq 'q'){return}; $n=0; if([int]::TryParse($choice,[ref]$n) -and $n -ge 1 -and $n -le $entries.Count){$name=$entries[$n-1].Name; $op=(Read-Host "对 [$name] 执行：1 删除  2 禁用  3 启用  q 返回").Trim(); if($op -in @('1','2','3')){Invoke-Maintenance -Mode (@{'1'='remove';'2'='disable';'3'='enable'}[$op]) -SelectedName $name; return}} else {Write-Host '无效选项。' -ForegroundColor Yellow}}
+}
+
+function Get-PolicyDirectTag {
+    $policyPath = Join-Path $ProjectRoot "config\policy.yaml"
+    if (-not (Test-Path -LiteralPath $policyPath -PathType Leaf)) { return "direct" }
+    $settings = Get-Content -Raw -Encoding UTF8 -LiteralPath $policyPath
+    if ($settings -match '(?m)^\s*direct:\s*([^\r\n#]+)') {
+        $value = $Matches[1].Trim().Trim('"''')
+        if ($value) { return $value }
+    }
+    return "direct"
+}
+
+function ConvertTo-Punycode {
+    param([string]$Value)
+    try { return [Uri]::new("https://" + $Value).IdnHost } catch { return $Value }
+}
+
+function Confirm-DomainValue {
+    param([string]$Value, [string]$Kind)
+    $value = $Value.Trim().TrimEnd('.').ToLowerInvariant()
+    if ($value -match '^\*\.') { $value = $value.Substring(2) }
+    $ascii = ConvertTo-Punycode -Value $value
+    if ($ascii -notmatch '^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$') {
+        throw "域名格式无效：$Value。请粘贴完整链接（如 https://platform.deepseek.com/usage）或输入纯域名（如 deepseek.com）。"
+    }
+    if ($Kind -eq 'suffix' -and $ascii -notmatch '\.') {
+        throw "后缀匹配至少需要一个点号：$Value。请使用完整域名，或改用 domain: 进行精确匹配。"
+    }
+    return $ascii
+}
+
+function Confirm-IpCidr {
+    param([string]$Value)
+    $value = $Value.Trim().Trim('[', ']')
+    if ($value -match '^(\d{1,3}(\.\d{1,3}){3})(/(\d{1,2}))?$') {
+        $ip = $Matches[1]
+        foreach ($octet in $ip.Split('.')) {
+            if ([int]$octet -gt 255) { throw "无效的 IPv4 地址：$Value" }
+        }
+        if ($Matches[4]) {
+            $bits = [int]$Matches[4]
+            if ($bits -gt 32) { throw "IPv4 前缀长度不能超过 32：$Value" }
+            return "$ip/$bits"
+        }
+        return "$ip/32"
+    }
+    if ($value -match ':') {
+        $parts = $value.Split('/', 2)
+        try { [void][System.Net.IPAddress]::Parse($parts[0]) } catch { throw "无效的 IPv6 地址：$Value" }
+        if ($parts.Count -eq 2) {
+            $bits = 0
+            if (-not [int]::TryParse($parts[1], [ref]$bits) -or $bits -lt 0 -or $bits -gt 128) {
+                throw "无效的 IPv6 前缀长度：$Value"
+            }
+            return "$($parts[0])/$bits"
+        }
+        return "$($parts[0])/128"
+    }
+    throw "无法识别 IP 或网段：$Value"
+}
+
+function Get-RuleHost {
+    param([string]$Value)
+    $raw = $Value.Trim()
+    # scheme://user:pass@host[:port]/path
+    if ($raw -match '^(?i)(https?|ftp|socks[45]?)://(.+)$') {
+        $rest = $Matches[2]
+        if ($rest -match '^[^@]+@') { $rest = $rest.Substring($rest.IndexOf('@') + 1) }
+        if ($rest -match '^\[([^\]]+)\]') { return $Matches[1] }
+        $rest = ($rest -split '[/?#]')[0]
+        if ($rest -match '^(.+):\d+$') { $rest = $Matches[1] }
+        return $rest.Trim()
+    }
+    # schemeless input: strip userinfo, brackets, then path/query/fragment and port
+    $hostname = $raw
+    if ($hostname -match '^[^@]+@') { $hostname = $hostname.Substring($hostname.IndexOf('@') + 1) }
+    if ($hostname -match '^\[([^\]]+)\]') { return $Matches[1] }
+    # Keep IP and CIDR literals intact; a slash here is a prefix length, not a path.
+    if ($hostname -match '^[0-9.]+(/\d{1,2})?$' -or ($hostname -match '^[0-9a-fA-F:]+(/\d{1,3})?$' -and $hostname -match ':')) {
+        return $hostname.Trim()
+    }
+    $hostname = ($hostname -split '[/?#]')[0]
+    if ($hostname -match '^(.+):\d+$') { $hostname = $Matches[1] }
+    if ($hostname -match '^\*\.') { $hostname = $hostname.Substring(2) }
+    return $hostname.Trim()
+}
+
+function ConvertTo-RouteMatcher {
+    param([Parameter(Mandatory)][string]$Value)
+    $raw = $Value.Trim()
+    if (-not $raw) { throw "匹配内容不能为空。" }
+    if ($raw -match '^[A-Za-z_]+:') {
+        $colon = $raw.IndexOf(':')
+        $prefix = $raw.Substring(0, $colon).ToLowerInvariant()
+        $payload = $raw.Substring($colon + 1).Trim()
+        switch ($prefix) {
+            "suffix" { return "domain_suffix:" + (Confirm-DomainValue -Value $payload -Kind suffix) }
+            "domain_suffix" { return "domain_suffix:" + (Confirm-DomainValue -Value $payload -Kind suffix) }
+            "domain" { return "domain:" + (Confirm-DomainValue -Value $payload -Kind exact) }
+            "full" { return "domain:" + (Confirm-DomainValue -Value $payload -Kind exact) }
+            "keyword" {
+                if (-not $payload) { throw "keyword: 后缺少关键词。" }
+                return "domain_keyword:" + $payload
+            }
+            "regexp" { return Add-RegexMatcher -Payload $payload }
+            "regex" { return Add-RegexMatcher -Payload $payload }
+            "ip" { return "ip_cidr:" + (Confirm-IpCidr -Value $payload) }
+            "cidr" { return "ip_cidr:" + (Confirm-IpCidr -Value $payload) }
+        }
+    }
+    $hostname = Get-RuleHost -Value $raw
+    if (-not $hostname) { throw "无法从输入中识别域名或 IP。" }
+    if ($hostname -match '^[0-9.]+(/\d{1,2})?$' -or $hostname -match '^[0-9a-fA-F:]+(/\d{1,3})?$') {
+        return "ip_cidr:" + (Confirm-IpCidr -Value $hostname)
+    }
+    return "domain_suffix:" + (Confirm-DomainValue -Value $hostname -Kind suffix)
+}
+
+function Add-RegexMatcher {
+    param([string]$Payload)
+    if (-not $Payload) { throw "regexp: 后缺少正则。" }
+    try { [void][Regex]::new($Payload) } catch { throw "正则无效：$($_.Exception.Message)" }
+    return "domain_regex:" + $Payload
+}
+
+function Split-RuleInput {
+    param([Parameter(Mandatory)][string]$Value)
+    $items = @($Value.Trim() -split '[\s,]+' | Where-Object { $_ })
+    if ($items.Count -eq 0) { throw "未识别到任何内容。" }
+    return $items
+}
+
+function Format-RouteMatcher {
+    param([string]$Matcher)
+    if ($Matcher -match '^domain_suffix:(.+)$') { return $Matches[1] }
+    if ($Matcher -match '^domain:(.+)$') { return "full:$($Matches[1])" }
+    if ($Matcher -match '^domain_keyword:(.+)$') { return "keyword:$($Matches[1])" }
+    if ($Matcher -match '^domain_regex:(.+)$') { return "regexp:$($Matches[1])" }
+    if ($Matcher -match '^ip_cidr:(.+)$') { return $Matches[1] }
+    return $Matcher
+}
+
+function Get-RoutingGroupsData {
+    $strategyTags = @(Get-PolicyStrategyTags)
+    $directTag = Get-PolicyDirectTag
+    if (-not (Test-Path -LiteralPath $RoutingGroups -PathType Leaf)) {
+        $groups = @()
+        foreach ($tag in $strategyTags) {
+            $groups += [pscustomobject]@{ tag = $tag; outbounds = @(); domains = @() }
+        }
+        if ($directTag -and $directTag -notin $strategyTags) {
+            $groups += [pscustomobject]@{ tag = $directTag; outbounds = @(); domains = @() }
+        }
+        return [pscustomobject]@{ schema_version = 1; groups = $groups }
+    }
+    try {
+        $data = Get-Content -Raw -Encoding UTF8 -LiteralPath $RoutingGroups | ConvertFrom-Json
+    } catch {
+        throw "无法读取 routing-groups.json：$($_.Exception.Message)"
+    }
+    if ([int]$data.schema_version -ne 1) { throw "routing-groups.json schema_version 必须为 1。" }
+    if ($null -eq $data.groups) { $data | Add-Member -NotePropertyName groups -NotePropertyValue @() -Force }
+    # Everything in routing-groups.json is owned by this tool; policy-owned
+    # strategy selectors and the direct outbound are kept visible so their
+    # rule-only groups (empty outbounds) are not dropped.
+    $groups = @($data.groups | Where-Object {
+        $tag = [string]$_.tag
+        ($tag -in $strategyTags) -or ($tag -eq $directTag) -or (@($_.outbounds).Count -gt 0) -or (@($_.domains).Count -gt 0)
+    })
+    $known = @($groups | ForEach-Object { [string]$_.tag })
+    foreach ($tag in $strategyTags) {
+        if ($tag -and $tag -notin $known) {
+            $groups += [pscustomobject]@{ tag = $tag; outbounds = @(); domains = @() }
+        }
+    }
+    if ($directTag -and $directTag -notin $known -and $directTag -notin $strategyTags) {
+        $groups += [pscustomobject]@{ tag = $directTag; outbounds = @(); domains = @() }
+    }
+    $data.groups = $groups
+    return $data
+}
+
+function Get-PolicyStrategyTags {
+    $policyPath = Join-Path $ProjectRoot "config\policy.yaml"
+    if (-not (Test-Path -LiteralPath $policyPath -PathType Leaf)) { return @() }
+    $lines = Get-Content -Encoding UTF8 -LiteralPath $policyPath
+    $inSelectors = $false
+    $result = @()
+    foreach ($line in $lines) {
+        if ($line -match '^selectors:\s*$') { $inSelectors = $true; continue }
+        if ($inSelectors -and $line -match '^\S') { break }
+        if (-not $inSelectors) { continue }
+        if ($line -match '^\s{2}(available|ai|emby):\s*(.+?)\s*$') {
+            $value = $Matches[2].Trim().Trim('"''')
+            if ($value -and $value -notin $result) { $result += $value }
+        }
+    }
+    return @($result)
+}
+
+function Save-RoutingGroupsData {
+    param([Parameter(Mandatory)]$Data)
+    $parent = Split-Path -Parent $RoutingGroups
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    $json = $Data | ConvertTo-Json -Depth 8
+    $temporary = $RoutingGroups + ".new-" + [Guid]::NewGuid().ToString("N")
+    try {
+        [IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $RoutingGroups -Force
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-RoutingGroupsUpdate {
+    param([Parameter(Mandatory)]$Data)
+    $existed = Test-Path -LiteralPath $RoutingGroups -PathType Leaf
+    $original = if ($existed) { Get-Content -Raw -Encoding UTF8 -LiteralPath $RoutingGroups } else { $null }
+    try {
+        Save-RoutingGroupsData -Data $Data
+        [void](Invoke-Generate -Target "all")
+    } catch {
+        if ($existed) {
+            [IO.File]::WriteAllText($RoutingGroups, $original, [Text.UTF8Encoding]::new($false))
+        } else {
+            Remove-Item -LiteralPath $RoutingGroups -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+function Read-ListIndex {
+    param(
+        [Parameter(Mandatory)][array]$Items,
+        [Parameter(Mandatory)][string]$Prompt,
+        [scriptblock]$Label = { param($item) [string]$item }
+    )
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        Write-Host ("[{0}] {1}" -f ($i + 1), (& $Label $Items[$i]))
+    }
+    Write-Host "[q] 返回"
+    $choice = (Read-Host $Prompt).Trim().ToLowerInvariant()
+    if ($choice -eq "q") { return -1 }
+    $number = 0
+    if (-not [int]::TryParse($choice, [ref]$number) -or $number -lt 1 -or $number -gt $Items.Count) {
+        Write-Host "无效选项。" -ForegroundColor Yellow
+        return -2
+    }
+    return $number - 1
+}
+
+function Get-ConfigOutboundItems {
+    param([Parameter(Mandatory)][string]$Name)
+    $configPath = Join-Path $OutputRoot "$Name\config.json"
+    # PS 5.1 ConvertFrom-Json chokes on the large generated config; read the
+    # outbound list through Python instead.
+    $code = @'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    data = json.load(handle)
+print('\n'.join(o.get('tag', '') + '\t' + o.get('type', '') for o in data.get('outbounds', [])))
+'@
+    $output = @(Invoke-Python -Arguments @("-c", $code, $configPath))
+    $result = @()
+    foreach ($line in $output) {
+        $parts = [string]$line -split "`t"
+        if (-not $parts[0]) { continue }
+        $result += [pscustomobject]@{ Tag = $parts[0]; Type = $parts[1] }
+    }
+    return $result
+}
+
+function Get-SelectableOutboundTags {
+    $configPath = Join-Path $OutputRoot "desktop\config.json"
+    Write-Host "[提示] 正在刷新桌面配置以读取当前可选出站。" -ForegroundColor DarkGray
+    [void](Invoke-Generate -Target "desktop")
+    $items = @(Get-ConfigOutboundItems -Name "desktop")
+    # Exclude only user-managed selectors. Policy-owned selectors (Available,
+    # AI, Emby, ...) remain valid members of a new strategy group.
+    $managedTags = @((Get-RoutingGroupsData).groups | Where-Object { @($_.outbounds).Count -gt 0 } | ForEach-Object { [string]$_.tag })
+    $strategyTags = @(Get-PolicyStrategyTags)
+    return @($items | Where-Object {
+        if (-not $_.Tag -or $_.Tag -in $managedTags) { return $false }
+        # Hide subscription-generated selector/urltest groups while retaining
+        # ordinary proxy nodes and policy strategy selectors as choices.
+        if ($_.Type -in @('selector', 'urltest') -and $_.Tag -notin $strategyTags) { return $false }
+        return $true
+    } | ForEach-Object { $_.Tag })
+}
+
+function Add-RoutingGroup {
+    $data = Get-RoutingGroupsData
+    $tag = (Read-Host "新分组名称").Trim()
+    if (-not $tag) { throw "分组名称不能为空。" }
+    if ($tag -match '[\r\n]') { throw "分组名称不能包含换行。" }
+    $allTags = @(Get-SelectableOutboundTags)
+    $existingTags = @($data.groups | ForEach-Object { [string]$_.tag })
+    if ($tag -in $allTags -or $tag -in $existingTags) { throw "名称 [$tag] 已被现有出站或分组使用。" }
+    if ($allTags.Count -eq 0) { throw "当前没有可加入分组的出站。" }
+
+    $selected = [Collections.Generic.List[string]]::new()
+    while ($true) {
+        Write-Host "`n--- 为 [$tag] 选择出站（可多选）---"
+        for ($i = 0; $i -lt $allTags.Count; $i++) {
+            $mark = if ($selected.Contains($allTags[$i])) { "x" } else { " " }
+            Write-Host ("[{0}] [{1}] {2}" -f ($i + 1), $mark, $allTags[$i])
+        }
+        Write-Host "[0] 完成选择  [q] 返回"
+        $choice = (Read-Host "输入序号切换选择").Trim().ToLowerInvariant()
+        if ($choice -eq "q") { return }
+        if ($choice -eq "0") {
+            if ($selected.Count -eq 0) { Write-Host "请至少选择一个出站。" -ForegroundColor Yellow; continue }
+            break
+        }
+        $number = 0
+        if ([int]::TryParse($choice, [ref]$number) -and $number -ge 1 -and $number -le $allTags.Count) {
+            $value = $allTags[$number - 1]
+            if ($selected.Contains($value)) { [void]$selected.Remove($value) } else { $selected.Add($value) }
+        } else {
+            Write-Host "无效选项。" -ForegroundColor Yellow
+        }
+    }
+    $groups = @($data.groups)
+    $data.groups = @($groups + [pscustomobject]@{ tag = $tag; outbounds = @($selected); domains = @() })
+    Invoke-RoutingGroupsUpdate -Data $data
+    Write-Host "[完成] 已创建分组“$tag”。" -ForegroundColor Green
+}
+
+function Remove-RoutingGroup {
+    $data = Get-RoutingGroupsData
+    # Policy-owned selectors are not removable groups; only selectors created
+    # through this menu (which carry explicit outbound members) can be deleted.
+    $groups = @($data.groups | Where-Object { @($_.outbounds).Count -gt 0 })
+    if ($groups.Count -eq 0) { Write-Host "暂无可删除的分组。" -ForegroundColor Yellow; return }
+    $index = Read-ListIndex -Items $groups -Prompt "请选择要删除的分组" -Label { param($group) "$($group.tag)（$(@($group.domains).Count) 条分流规则）" }
+    if ($index -lt 0) { return }
+    $target = $groups[$index]
+    $confirm = (Read-Host "删除 [$($target.tag)] 及其全部分流规则？输入 y 确认").Trim().ToLowerInvariant()
+    if ($confirm -ne "y") { Write-Host "已取消。"; return }
+    $data.groups = @($groups | Where-Object { $_ -ne $target })
+    Invoke-RoutingGroupsUpdate -Data $data
+    Write-Host "[完成] 已删除分组“$($target.tag)”。" -ForegroundColor Green
+}
+
+function Add-RoutingRule {
+    $data = Get-RoutingGroupsData
+    $groups = @($data.groups)
+    if ($groups.Count -eq 0) { Write-Host "请先创建分组。" -ForegroundColor Yellow; return }
+    $index = Read-ListIndex -Items $groups -Prompt "请选择规则所属分组" -Label { param($group) "$($group.tag)（$(@($group.domains).Count) 条规则）" }
+    if ($index -lt 0) { return }
+    $target = $groups[$index]
+    $all = @($groups | ForEach-Object { @($_.domains) })
+    $input = Read-Host "链接/域名/IP（如 https://platform.deepseek.com/usage、example.com、1.2.3.0/24、keyword:track；多个用空格或逗号分隔）"
+    $added = @()
+    $skipped = @()
+    foreach ($item in (Split-RuleInput -Value $input)) {
+        $matcher = ConvertTo-RouteMatcher -Value $item
+        if ($all -contains $matcher) { $skipped += (Format-RouteMatcher -Matcher $matcher); continue }
+        $target.domains += $matcher
+        $all += $matcher
+        $added += (Format-RouteMatcher -Matcher $matcher)
+    }
+    if ($added.Count -eq 0) { throw "没有新增规则：输入的内容都已存在。" }
+    $data.groups = $groups
+    Invoke-RoutingGroupsUpdate -Data $data
+    Write-Host "[完成] 已将 $($added -join '、') 加入分组“$($target.tag)”。" -ForegroundColor Green
+    if ($skipped.Count -gt 0) { Write-Host "[提示] 已存在，跳过：$($skipped -join '、')" -ForegroundColor DarkGray }
+}
+
+function Add-DirectRule {
+    $data = Get-RoutingGroupsData
+    $directTag = Get-PolicyDirectTag
+    $group = @($data.groups | Where-Object { [string]$_.tag -eq $directTag } | Select-Object -First 1)
+    if ($group.Count -eq 0) {
+        $data.groups += [pscustomobject]@{ tag = $directTag; outbounds = @(); domains = @() }
+        $group = @($data.groups | Where-Object { [string]$_.tag -eq $directTag } | Select-Object -First 1)
+    }
+    $target = $group[0]
+    $all = @($data.groups | ForEach-Object { @($_.domains) })
+    $input = Read-Host "要直连的链接/域名/IP（如 https://platform.deepseek.com/usage；多个用空格或逗号分隔）"
+    $added = @()
+    $skipped = @()
+    foreach ($item in (Split-RuleInput -Value $input)) {
+        $matcher = ConvertTo-RouteMatcher -Value $item
+        if ($all -contains $matcher) { $skipped += (Format-RouteMatcher -Matcher $matcher); continue }
+        $target.domains += $matcher
+        $all += $matcher
+        $added += (Format-RouteMatcher -Matcher $matcher)
+    }
+    if ($added.Count -eq 0) { throw "没有新增直连规则：输入的内容都已存在。" }
+    Invoke-RoutingGroupsUpdate -Data $data
+    Write-Host "[完成] 已添加直连规则：$($added -join '、')（DNS 走本地解析）。" -ForegroundColor Green
+    if ($skipped.Count -gt 0) { Write-Host "[提示] 已存在，跳过：$($skipped -join '、')" -ForegroundColor DarkGray }
+}
+
+function Remove-RoutingDomain {
+    $data = Get-RoutingGroupsData
+    $entries = @(
+        foreach ($group in @($data.groups)) {
+            foreach ($matcher in @($group.domains)) {
+                [pscustomobject]@{ Group = $group; Matcher = [string]$matcher }
+            }
+        }
+    )
+    if ($entries.Count -eq 0) { Write-Host "暂无可删除的分流规则。" -ForegroundColor Yellow; return }
+    $index = Read-ListIndex -Items $entries -Prompt "请选择要删除的分流规则" -Label { param($entry) "$(Format-RouteMatcher -Matcher $entry.Matcher) -> $($entry.Group.tag)" }
+    if ($index -lt 0) { return }
+    $target = $entries[$index]
+    $target.Group | Add-Member -NotePropertyName domains -NotePropertyValue @($target.Group.domains | Where-Object { $_ -ne $target.Matcher }) -Force
+    Invoke-RoutingGroupsUpdate -Data $data
+    Write-Host "[完成] 已删除 $(Format-RouteMatcher -Matcher $target.Matcher) -> $($target.Group.tag)。" -ForegroundColor Green
+}
+
+function Show-RoutingGroups {
+    $groups = @((Get-RoutingGroupsData).groups)
+    Write-Host "`n--- 当前分组与分流规则 ---"
+    if ($groups.Count -eq 0) { Write-Host "（暂无分组）"; return }
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        $group = $groups[$i]
+        Write-Host ("[{0}] {1}" -f ($i + 1), $group.tag)
+        if (@($group.outbounds).Count -gt 0) {
+            Write-Host ("    出站：{0}" -f (@($group.outbounds) -join "、"))
+        } else {
+            Write-Host "    出站：（策略选择器 / 直连）"
+        }
+        $rules = @($group.domains)
+        if ($rules.Count -eq 0) {
+            Write-Host "    规则：（暂无）"
+        } else {
+            foreach ($rule in $rules) { Write-Host ("    - {0}" -f (Format-RouteMatcher -Matcher $rule)) }
+        }
+    }
+}
+
+function Show-RoutingGroupsMenu {
+    while ($true) {
+        Write-Host "`n--- 分组与分流规则 ---"
+        Write-Host "[1] 增加分组"
+        Write-Host "[2] 删除分组"
+        Write-Host "[3] 增加分流规则（选择目标分组）"
+        Write-Host "[4] 快速添加直连规则"
+        Write-Host "[5] 删除分流规则"
+        Write-Host "[6] 查看分组与规则"
+        Write-Host "[q] 返回"
+        $choice = (Read-Host "请选择").Trim().ToLowerInvariant()
+        try {
+            switch ($choice) {
+                "1" { Add-RoutingGroup }
+                "2" { Remove-RoutingGroup }
+                "3" { Add-RoutingRule }
+                "4" { Add-DirectRule }
+                "5" { Remove-RoutingDomain }
+                "6" { Show-RoutingGroups }
+                "q" { return }
+                default { Write-Host "无效选项。" -ForegroundColor Yellow }
+            }
+        } catch {
+            Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+function Test-PublishedConfig {
+    param([string]$Name, [switch]$Quiet)
+    $config = Join-Path $OutputRoot "$Name\config.json"
+    $stamp = Join-Path $OutputRoot "$Name\config.validated.json"
+    $ok = $true
+    $message = ""
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
+        $ok = $false; $message = "缺少 config.json"
+    } elseif (-not (Test-Path -LiteralPath $stamp -PathType Leaf)) {
+        $ok = $false; $message = "缺少 config.validated.json"
+    } else {
+        try {
+            $metadata = Get-Content -LiteralPath $stamp -Raw -Encoding UTF8 | ConvertFrom-Json
+            $actual = Get-Sha256Hex -Path $config
+            if (-not $metadata.sha256 -or $actual -ine [string]$metadata.sha256) {
+                $ok = $false; $message = "验证摘要不匹配"
+            } else {
+                $validatedBy = if ($metadata.validator) { $metadata.validator } elseif ($metadata.core) { $metadata.core } else { "摘要校验" }
+                $message = "有效（$validatedBy）"
+            }
+        } catch {
+            $ok = $false; $message = "验证文件损坏"
+        }
+    }
+    if (-not $Quiet) {
+        $color = if ($ok) { "Green" } else { "Red" }
+        Write-Host ("{0,-8} {1}" -f $Name, $message) -ForegroundColor $color
+    }
+    return $ok
+}
+
+function Invoke-Check {
+    $ok = $true
+    $core = Get-CoreExecutable
+    foreach ($name in @("desktop", "android")) {
+        if (-not (Test-PublishedConfig -Name $name)) { $ok = $false; continue }
+        if ($core) {
+            & $core check -c (Join-Path $OutputRoot "$name\config.json")
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "核心校验失败：$name" -ForegroundColor Red
+                $ok = $false
+            } else {
+                Write-Host "核心校验通过：$name" -ForegroundColor Green
+            }
+        }
+    }
+    if ($core) {
+        Write-Host "核心校验：$core" -ForegroundColor DarkGray
+    } else {
+        Write-Host "未找到 sing-box 核心，仅完成摘要校验。" -ForegroundColor Yellow
+    }
+    return $ok
 }
 
 function Show-Menu {
     Write-Host ""
-    Write-Host "==================== sing-box 管理 ====================" -ForegroundColor White
-    Write-Host ("  服务状态：{0}    代理：{1}    仪表板：{2}" -f (Get-ServiceStateText), $ProxyEndpoint, $DashboardUrl) -ForegroundColor DarkGray
-    Write-Host "-------------------------------------------------------"
-    Write-Host "  [1] 刷新桌面配置并重启服务（日常一键）"
-    Write-Host "  [2] 仅生成桌面配置"
-    Write-Host "  [3] 生成安卓配置"
-    Write-Host "  [a] 安卓配置：生成并局域网发布（手机远程订阅一键更新）"
-    Write-Host "  [4] 生成全部配置（桌面 + 安卓）"
-    Write-Host "  [5] 离线刷新桌面配置（不联网，只用缓存）"
-    Write-Host "  ---------------------------------------------------"
-    Write-Host "  [6] 启动服务"
-    Write-Host "  [7] 停止服务"
-    Write-Host "  [8] 重启服务"
-    Write-Host "  [9] 检查核心、配置、服务和当前分组选择"
-    Write-Host "  ---------------------------------------------------"
-    Write-Host "  [d] 打开实时连接仪表板"
-    Write-Host "  [t] 打开流量去向统计（域名 / 应用 / 规则 / 出口）"
-    Write-Host "  [l] 查看实时日志"
-    Write-Host "  [x] 停止安卓局域网发布"
+    Write-Host "================ sing-box 配置与发布 ================"
+    Write-Host "  配置维护"
+    Write-Host "    [1] 更新桌面配置"
+    Write-Host "    [2] 更新安卓配置"
+    Write-Host "    [3] 更新两端配置"
+    Write-Host "    [4] 检查已发布配置"
+    Write-Host "    [5] 快速添加节点/订阅"
+    Write-Host "    [6] 删除/禁用节点或订阅"
+    Write-Host "    [7] 分组与分流规则"
+    Write-Host ""
+    Write-Host "  配置发布"
+    Write-Host "    [8] 启动发布（每次都会显示地址和凭据）"
+    Write-Host "    [9] 查看发布地址和凭据"
+    Write-Host "    [10] 轮换凭据并显示新发布信息"
     Write-Host "  [q] 退出"
-    Write-Host "======================================================="
+    Write-Host "====================================================="
 }
 
-if (-not (Test-Initialized)) {
-    Write-Host "[警告] 尚未初始化：找不到 config\local\subscriptions.yaml。" -ForegroundColor Yellow
-    Write-Host "生成类操作会失败，请先运行 scripts\bootstrap\setup.bat 粘贴订阅链接。" -ForegroundColor Yellow
-}
-
-if ($Action -ne "menu") {
-    $succeeded = switch ($Action) {
-        "reload" { Invoke-ReloadDesktop }
-        "offline-reload" { Invoke-ReloadDesktop -Offline }
-        "desktop" { Invoke-Generator -Target "desktop" }
-        "android" { Invoke-BuildAndroid }
-        "offline-android" { Invoke-BuildAndroid -Offline }
-        "publish" { Invoke-PublishAndroid }
-        "offline-publish" { Invoke-PublishAndroid -Offline }
-        "stop-publish" { Stop-AndroidPublisher }
-        "all" { Invoke-Generator -Target "all" }
-        "check" { Test-DesktopConfig }
-        "status" { Show-Status }
+function Invoke-Action {
+    param([string]$ActionName)
+    switch ($ActionName) {
+        "desktop"            { return Invoke-Generate -Target "desktop" }
+        "android"            { return Invoke-Generate -Target "android" }
+        "all"                { return Invoke-Generate -Target "all" }
+        "quick-add"          { return Invoke-QuickAdd -ProvidedName $Name -ProvidedLink $Link -ProvidedFormat $Format }
+        "remove"            { return Invoke-Maintenance -Mode remove -SelectedName $Name }
+        "delete"            { return Invoke-Maintenance -Mode remove -SelectedName $Name }
+        "disable"           { return Invoke-Maintenance -Mode disable -SelectedName $Name }
+        "enable"            { return Invoke-Maintenance -Mode enable -SelectedName $Name }
+        "publisher"          { Invoke-Publisher; return $true }
+        "check"              { return Invoke-Check }
+        "show-info"          { Invoke-Publisher -Extra @("--show-info"); return $true }
+        "rotate-credentials" { Invoke-Publisher -Extra @("--rotate-credentials"); return $true }
     }
-    if ($succeeded -eq $false) { exit 1 }
-    exit 0
 }
 
-while ($true) {
-    Show-Menu
-    $raw = Read-Host "请选择"
-    if ($null -eq $raw) { break }  # 输入流结束（EOF），退出循环。
-    $choice = $raw.Trim().ToLower()
-    Write-Host ""
-    try {
-        switch ($choice) {
-            "1" { [void](Invoke-ReloadDesktop) }
-            "2" { [void](Invoke-Generator -Target "desktop") }
-            "3" { [void](Invoke-BuildAndroid) }
-            "a" { [void](Invoke-PublishAndroid) }
-            "4" { [void](Invoke-Generator -Target "all") }
-            "5" { [void](Invoke-ReloadDesktop -Offline) }
-            "6" { [void](Invoke-ServiceAction -Action "start") }
-            "7" { [void](Invoke-ServiceAction -Action "stop") }
-            "8" { [void](Invoke-ServiceAction -Action "restart") }
-            "9" { [void](Show-Status) }
-            "d" { Open-Dashboard }
-            "t" { Open-TrafficDashboard }
-            "l" { Show-Log }
-            "x" { [void](Stop-AndroidPublisher) }
-            "q" { break }
-            ""  { }
-            default { Write-Host "无效选项：$choice" -ForegroundColor Yellow }
+try {
+    if ($Action -ne "menu") {
+        if (-not (Invoke-Action -ActionName $Action)) { exit 1 }
+        exit 0
+    }
+    while ($true) {
+        Show-Menu
+        $choice = (Read-Host "请选择").Trim().ToLowerInvariant()
+        if ($choice -eq "q") { break }
+        try {
+            switch ($choice) {
+                "1" { [void](Invoke-Generate -Target "desktop") }
+                "2" { [void](Invoke-Generate -Target "android") }
+                "3" { [void](Invoke-Generate -Target "all") }
+                "4" { [void](Invoke-Check) }
+                "5" { [void](Invoke-QuickAdd) }
+                "6" { Show-MaintenanceMenu }
+                "7" { Show-RoutingGroupsMenu }
+                "8" { Invoke-Publisher }
+                "9" { Invoke-Publisher -Extra @("--show-info") }
+                "10" { Invoke-Publisher -Extra @("--rotate-credentials") }
+                ""  { }
+                default { Write-Host "无效选项：$choice" -ForegroundColor Yellow }
+            }
+        } catch {
+            Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
         }
-    } catch {
-        Write-Host "[错误] 操作失败：$($_.Exception.Message)" -ForegroundColor Red
+        if ($choice -ne "8") { [void](Read-Host "按回车返回菜单") }
     }
-    if ($choice -eq "q") { break }
-    Write-Host ""
-    [void](Read-Host "按回车返回菜单")
+} catch {
+    Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
-
-Write-Host "已退出 sing-box 管理。" -ForegroundColor DarkGray

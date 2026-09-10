@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "lite.cn2gias.uk",
+        "emby.media",
+        "mb3admin.com",
+        "link00.okemby.org",
+        "link01.okemby.org",
+        "emby.taotu.ink",
+        "feimu.tv",
+        "emby.wawajiao.cc.cd",
+        "emby.7658888.xyz",
+        "yx.7658888.xyz",
+        "sinfan.7658888.xyz",
+        "ubi.7658888.xyz",
+        "shopify.7658888.xyz",
+        "yx1.7658888.xyz",
+        "yx2.7658888.xyz",
+        "yx3.7658888.xyz",
+        "yx4.7658888.xyz",
+        "yx5.7658888.xyz",
+        "yx6.7658888.xyz",
+        "yx7.7658888.xyz",
+        "yx8.7658888.xyz",
+        "yx9.7658888.xyz"
+      ]
+    }
+  ]
+}

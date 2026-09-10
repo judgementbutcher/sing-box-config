@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import base64
+
 from typing import Any, Callable, Dict, List, Tuple
 
 from . import anytls, hysteria2, ss, trojan, tuic, vless, vmess
@@ -20,6 +22,18 @@ LINE_PARSERS: Dict[str, LineParser] = {
 
 
 def parse(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    # Common v2ray subscription endpoints Base64-encode the whole URI list.
+    stripped = text.strip()
+    if "://" not in stripped and stripped:
+        compact = "".join(stripped.split())
+        try:
+            padding = "=" * (-len(compact) % 4)
+            decoded = base64.urlsafe_b64decode(compact + padding).decode("utf-8-sig")
+            if "://" in decoded:
+                text = decoded
+        except (ValueError, UnicodeDecodeError):
+            pass
+
     nodes: List[Dict[str, Any]] = []
     warnings: List[str] = []
 

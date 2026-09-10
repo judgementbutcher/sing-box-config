@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "windowsupdate.com",
+        "update.microsoft.com",
+        "windowsupdate.microsoft.com",
+        "swcdn.apple.com",
+        "iosapps.itunes.apple.com",
+        "osxapps.itunes.apple.com",
+        "cdn-apple.com",
+        "mzstatic.com",
+        "aaplimg.com",
+        "steamcontent.com"
+      ]
+    }
+  ]
+}

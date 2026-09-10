@@ -1,0 +1,48 @@
+schema_version: 1
+platform: android
+resolve_node_ipv4: false
+strip_rule_set_initial_path: true
+
+config:
+  dns:
+    cache_capacity: 4096
+    optimistic:
+      enabled: true
+      timeout: 45m
+  inbounds:
+    - type: tun
+      tag: tun-in
+      address: [172.18.0.1/30]
+      auto_route: true
+      udp_timeout: 1m
+      mtu: 1360
+      stack: system
+      dns_mode: hijack
+  experimental:
+    cache_file:
+      enabled: true
+      path: cache.android.db
+      # 1.14 can persist the DNS cache; this avoids repeated mobile lookups
+      # after SFA restarts without using the deprecated store_rdrc option.
+      store_dns: true
+
+route_rules:
+  - package_name:
+      - com.android.vending
+      - com.google.android.gms
+      - com.google.android.gsf
+    action: route
+    outbound: Available
+  - rule_set: google-play
+    action: route
+    outbound: Available
+
+dns_rules_front:
+  - rule_set: google-play
+    action: route
+    server: google
+
+rule_sets:
+  - tag: google-play
+    type: inline
+    inline_file: config/rule-sets/google-play.json

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "groups": [
+    {
+      "tag": "example",
+      "outbounds": ["Available", "direct"],
+      "domains": ["domain_suffix:example.com"]
+    },
+    {
+      "tag": "direct",
+      "outbounds": [],
+      "domains": [
+        "domain_suffix:platform.deepseek.com",
+        "ip_cidr:10.0.0.0/8"
+      ]
+    }
+  ]
+}

@@ -47,3 +47,45 @@ def test_audit_rejects_singleton_duplicate_and_missing_reference():
     assert report["duplicate_urltest_members"] == ["n1"]
     assert report["counts"]["duplicate_node_entries"] == 1
     assert report["missing_references"]
+
+
+def test_audit_accepts_multi_tag_rule_sets_and_object_resolvers():
+    conf = {
+        "dns": {"servers": [{"tag": "bootstrap", "type": "udp", "server": "1.1.1.1"}]},
+        "route": {
+            "default_domain_resolver": {"server": "bootstrap", "strategy": "ipv4_only"},
+            "rules": [{"rule_set": "geosite-one", "action": "route", "outbound": "direct"}],
+            "rule_set": [
+                {
+                    "tag": ["geosite-one", "geosite-two"],
+                    "type": "remote",
+                    "url": "https://example.invalid/{tag}.srs",
+                    "initial_path": "rules/{tag}.srs",
+                }
+            ],
+        },
+        "outbounds": [
+            node("n1", "one.example"),
+            {"type": "direct", "tag": "direct"},
+        ],
+    }
+    conf["outbounds"][0]["domain_resolver"] = {"server": "bootstrap"}
+
+    report = audit_config(conf)
+
+    assert report["ok"] is True
+    assert report["missing_dns_references"] == []
+    assert report["missing_rule_set_references"] == []
+
+
+def test_audit_rejects_selector_cycles():
+    conf = {
+        "outbounds": [
+            {"type": "selector", "tag": "A", "outbounds": ["B"]},
+            {"type": "selector", "tag": "B", "outbounds": ["A"]},
+        ],
+        "route": {"final": "A", "rules": [], "rule_set": []},
+    }
+    report = audit_config(conf)
+    assert not report["ok"]
+    assert report["selector_cycles"] == ["A -> B -> A"]

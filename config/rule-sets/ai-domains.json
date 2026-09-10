@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "openai.com",
+        "chatgpt.com",
+        "oaistatic.com",
+        "oaiusercontent.com",
+        "anthropic.com",
+        "claude.ai",
+        "claudeusercontent.com",
+        "perplexity.ai",
+        "pplx.ai",
+        "poe.com",
+        "grok.com",
+        "x.ai",
+        "mistral.ai",
+        "mistralcdn.com",
+        "huggingface.co",
+        "hf.co",
+        "huggingfacehub.com",
+        "replicate.com",
+        "openrouter.ai",
+        "groq.com",
+        "cohere.ai",
+        "together.ai",
+        "phind.com",
+        "cursor.com",
+        "cursor.sh",
+        "anysphere.co",
+        "codeium.com",
+        "windsurf.com",
+        "exafunction.com",
+        "githubcopilot.com",
+        "copilot-proxy.githubusercontent.com",
+        "copilot.microsoft.com",
+        "sydney.bing.com",
+        "edgeservices.bing.com",
+        "ai.google.dev",
+        "gemini.google.com",
+        "aistudio.google.com",
+        "makersuite.google.com",
+        "notebooklm.google.com",
+        "generativelanguage.googleapis.com",
+        "developerprofiles-pa.googleapis.com",
+        "content-developerprofiles-pa.googleapis.com"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,254 @@
+schema_version: 1
+core_version: 1.14.0
+
+subscription:
+  cache_max_age: 3d
+  timeout_seconds: 20
+  retry_proxy: http://127.0.0.1:7890
+
+urltest:
+  url: https://cp.cloudflare.com/generate_204
+  interval: 5m
+  tolerance: 80
+  idle_timeout: 15m
+
+config:
+  $schema: https://sing-box.sagernet.org/schema.json
+  log:
+    disabled: false
+    level: warn
+    timestamp: true
+  dns:
+    servers:
+      - type: local
+        tag: local
+      - type: https
+        tag: google
+        server: 8.8.8.8
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: dns.google
+        detour: Available
+    final: google
+    strategy: ipv4_only
+    reverse_mapping: true
+    timeout: 8s
+  http_clients:
+    - tag: rule-set-downloader
+      detour: Available
+  route:
+    auto_detect_interface: true
+    default_http_client: rule-set-downloader
+    default_domain_resolver: local
+    final: Available
+
+selectors:
+  available: Available
+  ai: AI
+  emby: Emby
+  direct: direct
+  interrupt_exist_connections: true
+
+rule_sets:
+  - tag: china-direct
+    type: local
+    format: source
+    path: config/rule-sets/china-direct.json
+  - tag: ai-domains
+    type: local
+    format: source
+    path: config/rule-sets/ai-domains.json
+  - tag: emby-domains
+    type: local
+    format: source
+    path: config/rule-sets/emby-domains.json
+  - tag: direct-cdn
+    type: local
+    format: source
+    path: config/rule-sets/direct-cdn.json
+  - tag: geosite-cn
+    type: remote
+    format: binary
+    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs
+    update_interval: 1d
+    http_client: rule-set-downloader
+    initial_path: runtime/rule-set-cache/geosite-cn.srs
+  - tag: geoip-cn
+    type: remote
+    format: binary
+    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs
+    update_interval: 1d
+    http_client: rule-set-downloader
+    initial_path: runtime/rule-set-cache/geoip-cn.srs
+  - tag:
+      - geosite-geolocation-!cn
+      - geosite-openai
+      - geosite-telegram
+      - geosite-category-ads-all
+    type: remote
+    format: binary
+    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{tag}.srs
+    update_interval: 1d
+    http_client: rule-set-downloader
+    initial_path: runtime/rule-set-cache/{tag}.srs
+
+domains:
+  ntp: &ntp_domains
+    - time.windows.com
+    - time.nist.gov
+    - ntp.org
+    - time.apple.com
+    - time.android.com
+    - time.google.com
+route:
+  pre_rules:
+    - action: sniff
+      timeout: 300ms
+    - protocol: dns
+      action: hijack-dns
+    - ip_is_private: true
+      action: route
+      outbound: direct
+    - ip_version: 6
+      action: reject
+    - domain_suffix: *ntp_domains
+      action: route
+      outbound: direct
+    - protocol: [bittorrent]
+      action: route
+      outbound: direct
+  business_rules:
+    # Self-hosted Emby servers reachable without a proxy.
+    - domain_suffix:
+        - emby.bbqwq.com
+        - emby.wawajiao.cc.cd
+        - emby.kingemby.com
+      action: route
+      outbound: direct
+    - rule_set: [emby-domains]
+      action: route
+      outbound: Emby
+    - rule_set: [geosite-openai, ai-domains]
+      action: route
+      outbound: AI
+    # Telegram clients use both domain names and bare data-centre IPs.
+    # Keep the domain path explicit so DNS and routing agree with the IP rules
+    # below, including when an app has not yet connected to a data centre.
+    - rule_set: [geosite-telegram]
+      action: route
+      outbound: Available
+    # Google services frequently split requests across these CDN/API domains.
+    # Keep them on the proxy path instead of letting the domestic fallback win.
+    - domain_suffix:
+        - gstatic.com
+        - googleapis.com
+        - googleusercontent.com
+        - googlevideo.com
+        - ggpht.com
+      action: route
+      outbound: Available
+    # Telegram data centres (apps connect by bare IP, so domain rules never see them).
+    - ip_cidr:
+        - 91.108.4.0/22
+        - 91.108.8.0/22
+        - 91.108.12.0/22
+        - 91.108.16.0/22
+        - 91.108.20.0/22
+        - 91.108.56.0/22
+        - 149.154.160.0/20
+        - 185.76.151.0/24
+      action: route
+      outbound: Available
+    - rule_set: [direct-cdn]
+      action: route
+      outbound: direct
+    # Apply ad blocking after explicit business routes.  The upstream ads
+    # list occasionally contains service/CDN hosts that must remain reachable
+    # for AI, Emby, Telegram, and store traffic.
+    - type: logical
+      mode: and
+      rules:
+        - rule_set: [geosite-category-ads-all]
+        - rule_set: [geosite-cn]
+          invert: true
+        - rule_set: [china-direct]
+          invert: true
+      action: reject
+  domestic_rules:
+    - rule_set: [china-direct]
+      action: route
+      outbound: direct
+    - rule_set: [geosite-geolocation-!cn]
+      action: route
+      outbound: Available
+    - rule_set: [geosite-cn]
+      action: route
+      outbound: direct
+    - rule_set: [geoip-cn]
+      action: route
+      outbound: direct
+
+dns_rules:
+  # Preserve HTTPS/SVCB records.  Returning an empty NOERROR response here
+  # breaks modern CDN selection, ECH, and HTTP/3; routing still follows the
+  # domain rules below and DNS hijacking prevents direct resolver leakage.
+  pre_rules: []
+  business_rules:
+    - domain_suffix:
+        - emby.bbqwq.com
+        - emby.wawajiao.cc.cd
+      action: route
+      # DNS must be resolved through the proxy path. These hosts are
+      # reachable by a direct socket, but their local/ISP DNS resolution
+      # is unavailable or times out.
+      server: google
+    - domain_suffix: [emby.kingemby.com]
+      action: route
+      server: local
+    - rule_set: [emby-domains]
+      action: route
+      server: google
+    - domain_suffix:
+        - gstatic.com
+        - googleapis.com
+        - googleusercontent.com
+        - googlevideo.com
+        - ggpht.com
+      action: route
+      server: google
+    - rule_set: [ai-domains, geosite-openai]
+      action: route
+      server: google
+    - rule_set: [geosite-telegram]
+      action: route
+      server: google
+    # Keep DNS business exceptions ahead of the ad-blocking response for the
+    # same reason as the route rules above.
+    - type: logical
+      mode: and
+      rules:
+        - rule_set: [geosite-category-ads-all]
+        - rule_set: [geosite-cn]
+          invert: true
+        - rule_set: [china-direct]
+          invert: true
+      action: predefined
+      rcode: NXDOMAIN
+  domestic_rules:
+    - rule_set: [china-direct]
+      action: route
+      server: local
+    - domain_suffix: *ntp_domains
+      action: route
+      server: local
+    - rule_set: [direct-cdn]
+      action: route
+      server: local
+    - rule_set: [geosite-geolocation-!cn]
+      action: route
+      server: google
+    - rule_set: [geosite-cn]
+      action: route
+      server: local

@@ -1,46 +1,29 @@
-# Sensitive inputs and local-only documentation
-README.local.md
-docs/README.local.md
-android_apps.yaml
-policy_aliases.yaml
-template.json
-templates/*.json
-!templates/*.example.json
-subscriptions.yaml
+# Local-only material: subscriptions, credentials, machine-specific rules
 config/local/
-config.json
-config.next.json
-config.*.json
-nodes-report.json
-nodes-report*.json
-subscriptions/
-.subscription-cache/
-.health/
 .secrets/
-cache.clean.db
-cache.*.db
 
-# Public sanitized examples
-!template.example.json
-!subscriptions.example.yaml
-
-# Runtime output and local backups
+# Runtime output, logs and backups
 runtime/
+dist/
 logs/
 backups/
-cores/
-dist/
 validation/
 *.bak
 
-# Downloaded/runtime binaries and extracted release artifacts
+# sing-box runtime caches
+cache.db
+cache.*.db
+
+# Downloaded binaries and release archives
 *.exe
 *.dll
 *.zip
-.downloads/
-dashboard/
 
-# Local Python/runtime files
+# Python environment
 .venv/
 __pycache__/
 *.pyc
+
+# Local-only documentation
+README.local.md
+docs/README.local.md

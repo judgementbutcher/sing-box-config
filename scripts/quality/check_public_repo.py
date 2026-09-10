@@ -21,7 +21,6 @@ FORBIDDEN_PARTS = {
     ".subscription-cache",
     ".venv",
     "cores",
-    "dashboard",
     "dist",
     "runtime",
     "subscriptions",
