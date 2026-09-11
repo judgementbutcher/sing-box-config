@@ -586,3 +586,46 @@ def test_managed_dns_rules_are_skipped_when_no_servers_declared():
     )
     assert dns == []
     assert route == [{"domain_suffix": ["deepseek.com"], "action": "route", "outbound": "direct"}]
+
+
+def test_dns_final_rules_are_appended_last():
+    source = simple.BuiltSource(
+        name="provider",
+        order=10,
+        entry_tag="Provider",
+        node_tags=["Provider"],
+        nodes=[{"type": "direct", "tag": "Provider"}],
+        groups=[],
+        ai_node_tags=["Provider"],
+    )
+    policy = {
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct", "emby": "Emby"},
+        "config": {
+            "dns": {
+                "final": "google",
+                "servers": [{"tag": "local"}, {"tag": "node-resolver"}, {"tag": "google"}],
+            }
+        },
+        "dns_rules": {
+            "business_rules": [{"domain_suffix": ["a.com"], "action": "route", "server": "google"}],
+            "domestic_rules": [{"domain_suffix": ["cn.com"], "action": "route", "server": "local"}],
+            "final_rules": [
+                {"action": "evaluate", "server": "node-resolver", "tag": "domestic"},
+                {"action": "evaluate", "server": "google", "tag": "foreign"},
+                {"match_response": "domestic", "action": "route", "server": "node-resolver", "race": True},
+                {"match_response": "foreign", "action": "route", "server": "google", "race": True},
+            ],
+        },
+    }
+    conf = simple.build_config(
+        "desktop",
+        policy,
+        {"platform": "desktop"},
+        {"schema_version": 1},
+        [source],
+    )
+    rules = conf["dns"]["rules"]
+    assert rules[-4:] == policy["dns_rules"]["final_rules"]
+    # final_rules sit after domestic rules, so they only see unmatched queries.
+    assert {"domain_suffix": ["cn.com"], "action": "route", "server": "local"} == rules[-5]
+    assert {"domain_suffix": ["a.com"], "action": "route", "server": "google"} == rules[-6]

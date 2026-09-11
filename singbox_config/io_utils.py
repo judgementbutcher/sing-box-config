@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -88,15 +87,3 @@ def atomic_write_text(path: Path | str, text: str, *, encoding: str = "utf-8") -
 
 def atomic_write_json(path: Path | str, data: Any) -> None:
     atomic_write_text(Path(path), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def sha256_file(path: Path | str) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()

@@ -10,6 +10,8 @@ from parsers.common import detect_region
         ("Tokyo JP-02", "JP"),
         ("Singapore SGP 3", "SG"),
         ("Los Angeles USA", "US"),
+        ("40010-VMISS-LAX-DC1-2-VLESS", "US"),
+        ("20110-Panstar-HKS-VLESS", "HK"),
         ("Paris France FR", "FR"),
         ("London UK", "GB"),
         ("Taiwan TW", "TW"),

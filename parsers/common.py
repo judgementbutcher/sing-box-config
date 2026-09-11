@@ -15,11 +15,13 @@ REGION_MAP: List[Tuple[str, List[str]]] = [
 ]
 
 REGION_CODES = {
-    "HK": {"HK", "HKG"},
+    # HKS: airport/proxy 命名常见的香港写法（如 Panstar-HKS），按词边界匹配避免误伤。
+    "HK": {"HK", "HKG", "HKS"},
     "TW": {"TW", "TWN"},
     "JP": {"JP", "JPN"},
     "SG": {"SG", "SGP"},
-    "US": {"US", "USA"},
+    # LAX: 洛杉矶机场代码，机场节点常用（如 VMISS-LAX-DC1），与 USA 一样按词边界匹配。
+    "US": {"US", "USA", "LAX"},
     "FR": {"FR", "FRA"},
     "GB": {"GB", "GBR", "UK"},
 }
@@ -33,10 +35,6 @@ INFO_NODE_KEYWORDS = [
     "到期",
     "订阅",
 ]
-
-HOT_REGIONS = ["HK", "TW", "JP", "SG", "US", "FR", "GB"]
-ALL_REGIONS = HOT_REGIONS + ["Others"]
-AI_PREFERRED_REGIONS = ["US", "SG", "JP", "HK", "TW", "FR", "GB"]
 
 
 def is_info_node(name: str) -> bool:

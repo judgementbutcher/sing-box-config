@@ -304,6 +304,14 @@ def is_placeholder_node(node: Mapping[str, Any]) -> bool:
     return ip.is_loopback or ip.is_unspecified
 
 
+def _is_ip_address(value: Any) -> bool:
+    try:
+        ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    return True
+
+
 def build_source(
     item: Mapping[str, Any],
     manifest_dir: Path,
@@ -378,6 +386,13 @@ def build_source(
         else:
             tag = original
         node["tag"] = tag
+        # 节点 server 为域名时，固定用直连解析器（policy.node_dns_resolver），
+        # 避免走 dns.final（google → detour Available）依赖当前选中节点，
+        # 导致节点域名解析超时、测速显示不出来或忽隐忽现。
+        node_resolver = str(policy.get("node_dns_resolver") or "").strip()
+        node_server = node.get("server")
+        if node_resolver and node_server and not _is_ip_address(node_server):
+            node["domain_resolver"] = node_resolver
         fingerprint = outbound_fingerprint(node, length=64)
         if deduplicate and fingerprint in used_fingerprints:
             print(f"[去重] {name}: {original} 与 {used_fingerprints[fingerprint]} 相同，已忽略。", file=sys.stderr)
@@ -877,6 +892,9 @@ def assemble_rules(
         *filtered_rules(profile.get("dns_rules"), platform),
         *filtered_rules(dns_policy.get("business_rules"), platform),
         *filtered_rules(dns_policy.get("domestic_rules"), platform),
+        # 兜底规则：只处理未命中上方任何规则的查询。当前用于 DNS 竞速
+        #（evaluate + race），两者都不命中时才由 dns.final 兜底。
+        *filtered_rules(dns_policy.get("final_rules"), platform),
     ]
 
 

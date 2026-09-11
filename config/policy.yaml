@@ -1,16 +1,14 @@
 schema_version: 1
-core_version: 1.14.0
 
 subscription:
   cache_max_age: 3d
   timeout_seconds: 20
   retry_proxy: http://127.0.0.1:7890
 
-urltest:
-  url: https://cp.cloudflare.com/generate_204
-  interval: 5m
-  tolerance: 80
-  idle_timeout: 15m
+# 节点 server 域名的解析器：必须是不经过 TUN/代理的直连 DNS。
+# 节点域名若走 dns.final（google → detour Available），会依赖当前选中节点，
+# 当前节点不稳时测速就超时（忽隐忽现）。domain_resolver 直连解析后与代理解耦。
+node_dns_resolver: node-resolver
 
 config:
   $schema: https://sing-box.sagernet.org/schema.json
@@ -22,6 +20,12 @@ config:
     servers:
       - type: local
         tag: local
+      # 节点域名专用直连解析器（AliDNS）。UDP 53 直连、不经 TUN/代理，
+      # 由生成器写入各节点的 domain_resolver。见 node_dns_resolver。
+      - type: udp
+        tag: node-resolver
+        server: 223.5.5.5
+        server_port: 53
       - type: https
         tag: google
         server: 8.8.8.8
@@ -252,3 +256,26 @@ dns_rules:
     - rule_set: [geosite-cn]
       action: route
       server: local
+  # 兜底 DNS 竞速（sing-box 1.14 evaluate + race 并行求值）。
+  # 只处理未命中上方所有规则的查询：并行向国内直连解析器（node-resolver，
+  # AliDNS UDP）与代理内 DoH（google）发起查询，哪个先返回就用哪个
+  #（首条 race 命中即终止，其余在途查询被取消）。
+  # 顺序要求：evaluate 规则必须位于引用它的 match_response 规则之前。
+  # 两端 evaluate 都超时（2s）时，本段不命中，退回 dns.final（google）。
+  final_rules:
+    - action: evaluate
+      server: node-resolver
+      tag: domestic
+      timeout: 2s
+    - action: evaluate
+      server: google
+      tag: foreign
+      timeout: 2s
+    - match_response: domestic
+      action: route
+      server: node-resolver
+      race: true
+    - match_response: foreign
+      action: route
+      server: google
+      race: true

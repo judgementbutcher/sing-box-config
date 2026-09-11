@@ -125,6 +125,7 @@ rule_sets: []
 
 - `route.business_rules` 控制连接走向；`outbound: direct` 表示直连，`Available`/`AI`/`Emby` 表示交给对应策略组。
 - `dns_rules.business_rules` 控制域名解析使用的 DNS；直连域名通常配 `server: local`，需要代理解析时配 `server: google`。
+- `dns_rules.final_rules` 追加在所有 DNS 规则之后，只处理未命中上方任何规则的查询；当前配置用它做兜底 DNS 竞速（sing-box 1.14 的 `evaluate` + `race`：并行查询国内直连解析器与代理内 DoH，谁先返回用谁，两者都超时才退回 `dns.final`）。
 - 两处规则都按文件中的顺序匹配，越靠前优先级越高。修改后重新生成配置，桌面和 Android 才会生效。
 
 只想为本机临时增加规则时，编辑 `config\local\custom-rules.yaml`（该目录不会提交 Git），将规则分别放入 `route_rules` 和 `dns_rules`；它们会在公共业务规则之前生成。例如：
