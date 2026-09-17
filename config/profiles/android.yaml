@@ -6,9 +6,6 @@ strip_rule_set_initial_path: true
 config:
   dns:
     cache_capacity: 4096
-    optimistic:
-      enabled: true
-      timeout: 45m
   inbounds:
     - type: tun
       tag: tun-in
@@ -16,8 +13,13 @@ config:
       auto_route: true
       udp_timeout: 1m
       mtu: 1360
-      stack: system
+      # 不写 stack：sing-box 1.15 起 TUN 默认使用 sing-tun 自带的 TCP/IP 栈，
+      # 移动端能耗与内存占用明显优于旧的 system 栈；stack 选项已弃用，1.17 删除。
       dns_mode: hijack
+      # 1.15 起 auto_redirect 在 Android 上完整可用，但需要 root（SFA 的
+      # root 服务或 root shell），非 root 设备启用会导致启动失败，故默认不开。
+      # 已 root 的设备可取消下一行注释，获得更好的路由性能与热点转发支持。
+      # auto_redirect: true
   experimental:
     cache_file:
       enabled: true
@@ -25,6 +27,9 @@ config:
       # 1.14 can persist the DNS cache; this avoids repeated mobile lookups
       # after SFA restarts without using the deprecated store_rdrc option.
       store_dns: true
+      # 1.15 起缓存写入先进内存缓冲，减少移动端磁盘写入与耗电；定时 flush
+      # 限制 SFA 被系统强杀时丢失的分组选择与 DNS 缓存不超过五分钟。
+      flush_interval: 5m
 
 route_rules:
   - package_name:

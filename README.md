@@ -38,7 +38,7 @@
 
 选择“分组与分流规则”后，可以创建或删除 selector 分组，也可以直接粘贴链接、域名、IP 或网段加入任意分组，或快速添加直连规则：
 
-- `[4] 快速添加直连规则`：粘贴要直连的链接/域名/IP，脚本自动识别并路由到 `direct`（DNS 走本地解析），适合“这个站点不走代理”的临时需求。
+- `[4] 快速添加直连规则`：粘贴要直连的链接/域名/IP，脚本自动识别并路由到 `direct`（DNS 走国内直连解析器），适合“这个站点不走代理”的临时需求。
 - `[3] 增加分流规则`：选择目标分组后粘贴同样格式的内容，可走代理或直连。
 
 输入的匹配内容支持以下格式，可一次粘贴多个（用空格或逗号分隔）：
@@ -62,12 +62,12 @@
 
 - 同一台 Windows 上的 SFW（首选）：`http://127.0.0.1:18080/desktop/config.json`
 - 其他电脑上的 SFW：`http://电脑局域网IP:18080/desktop/config.json`
-- Android/SFA：`http://电脑局域网IP:18080/android/config.json`
+- Android/SFA：`http://sfa:密码@电脑局域网IP:18080/android/config.json`（凭据已内嵌在链接里，SFA 中直接粘贴即可）
 - 健康检查：`http://电脑局域网IP:18080/healthz`
 
-每次启动发布器都会在终端明确打印两个发布地址、用户名和密码，避免遗忘。`show-info` 可随时再次显示，`rotate-credentials` 会轮换密码并显示新信息。
+每次启动发布器都会在终端明确打印三个发布地址、用户名和密码；Android 那条链接已经把用户名和密码拼好，不需要手工拼接，用户名与密码同时保留输出以便客户端分开填写。`show-info` 可随时再次显示，`rotate-credentials` 会轮换密码并显示新信息。
 
-发布端的 Android 配置使用 HTTP Basic Auth，凭据保存在 `.secrets\android-publisher.json`；桌面 `/desktop/config.json` 为兼容 SFW 自动更新而不要求认证。每次配置请求都会核对相应 `config.validated.json` 的 SHA-256；未校验或被手工改动的配置不会发布。响应禁用缓存，发布器以前台方式运行，按 `Ctrl+C` 停止。
+发布端的 Android 配置使用 HTTP Basic Auth，凭据保存在 `.secrets\android-publisher.json`；桌面 `/desktop/config.json` 为兼容 SFW 自动更新而不要求认证，所以桌面链接不带凭据，只有 Android 链接内嵌用户名和密码。每次配置请求都会核对相应 `config.validated.json` 的 SHA-256；未校验或被手工改动的配置不会发布。响应禁用缓存，发布器以前台方式运行，按 `Ctrl+C` 停止。
 
 桌面发布产物是自包含的单个 JSON：项目内的本地规则会被内嵌，远程规则不会引用发布电脑上的缓存路径。SFW 与发布器在同一台电脑时请使用 `127.0.0.1` 地址，避免局域网地址被 TUN 或虚拟网卡路由影响。
 
@@ -103,10 +103,13 @@ subscriptions:
     max_nodes: 30
     # 默认拒绝 skip-cert-verify/allowInsecure 节点；仅在确认必要时显式开启。
     allow_insecure: false
+    # 上游混入本核心加载不了的 outbound 类型时按类型跳过，见下方说明。
+    exclude_types: [hysteria, wireguard, shadowsocks]
 ```
 
 支持 `file` 和 `url_file`；支持 `clash`、`singbox-json` 与 `uri`。默认遇到不支持或字段不完整的节点就终止生成；确需跳过时，仅对相应订阅设置 `allow_unsupported: true`。
 默认也会拒绝关闭 TLS 证书校验的节点；只有确认订阅确实需要时，才对该订阅设置 `allow_insecure: true`。
+`exclude_types` 按 outbound `type` 跳过节点，被跳过的类型和数量会在生成时打印。免费节点池常混入本核心加载不了的写法（hysteria v1 的 `up`/`down`、wireguard 的旧 `server` 字段、shadowsocks 的 `plugin_opts` 对象），这些节点留在配置里会让 `sing-box check` 直接 FATAL、连带双端生成一起失败。用类型而不是 `exclude_node_tags` 排除：轮换池的节点名每轮都在变，按名字排除必然漏。
 默认会合并连接参数完全相同的节点；如果需要保留订阅中的每个节点名称，可对该订阅设置 `deduplicate: false`。设置 `urltest: false` 时，订阅分组只包含手动选择项，不生成 `/Auto`。
 
 自定义规则 `config\local\custom-rules.yaml` 只接受显式数组：
@@ -123,9 +126,11 @@ rule_sets: []
 
 规则的公共部分在 `config\policy.yaml`：
 
-- `route.business_rules` 控制连接走向；`outbound: direct` 表示直连，`Available`/`AI`/`Emby` 表示交给对应策略组。
-- `dns_rules.business_rules` 控制域名解析使用的 DNS；直连域名通常配 `server: local`，需要代理解析时配 `server: google`。
-- `dns_rules.final_rules` 追加在所有 DNS 规则之后，只处理未命中上方任何规则的查询；当前配置用它做兜底 DNS 竞速（sing-box 1.14 的 `evaluate` + `race`：并行查询国内直连解析器与代理内 DoH，谁先返回用谁，两者都超时才退回 `dns.final`）。
+- `route.business_rules` 控制连接走向；`outbound: direct` 表示直连，`Available`/`AI`/`Emby`/`YouTube` 表示交给对应策略组。`YouTube` 组的成员与 `Available` 相同，默认跟随 `Available`，可以在面板里单独给 YouTube 指定节点而不影响其他流量。
+- `dns_rules.business_rules` 控制域名解析使用的 DNS；直连域名配 `server: domestic`，需要代理解析时配 `server: google`。
+- `dns_failover` 将显式 DNS 分流展开为同路径双解析器竞速；相邻且解析器相同的规则会合并成一个竞速块（`evaluate` ×2 → `respond` ×2 → `SERVFAIL`），匹配条件只出现在 `evaluate` 与 `SERVFAIL` 上，`respond` 不带条件（sing-box 对未曾 `evaluate` 的响应 tag 直接跳过）。只合并相邻规则，不同解析器规则之间的先后优先级不变，所以 `policy.yaml` 里把同解析器的规则排在一起即可减少生成的规则数。
+- YouTube 域名使用 `google-youtube`/`cloudflare-youtube` 两个解析器，它们的 `detour` 是 `YouTube` 分组而不是 `Available`：Google 按解析出口所在地分配视频边缘，解析与播放必须走同一出口。`YouTube` 分组默认跟随 `Available`，此时两者等价。
+- `dns_rules.final_rules` 只处理其余查询（两张 geosite 名单都没收录的域名）：并行查询两条国内直连 DoH 与两条代理内 DoH，国内结果只有落在 `geoip-cn` 时才采信，否则一律采用代理侧结果。国内解析器对被墙域名会返回污染 IP，所以名单外域名绝不能"谁快用谁"。四路都失败时立即返回 `SERVFAIL`，不会再次等待 `dns.final`。
 - 两处规则都按文件中的顺序匹配，越靠前优先级越高。修改后重新生成配置，桌面和 Android 才会生效。
 
 只想为本机临时增加规则时，编辑 `config\local\custom-rules.yaml`（该目录不会提交 Git），将规则分别放入 `route_rules` 和 `dns_rules`；它们会在公共业务规则之前生成。例如：
@@ -139,7 +144,7 @@ route_rules:
 dns_rules:
   - domain_suffix: [example.com]
     action: route
-    server: local
+    server: domestic
 route_rules_front: []
 rule_sets: []
 ```
@@ -166,7 +171,7 @@ rule_sets: []
 }
 ```
 
-`direct` 分组的域名会同时生成 `server: local` 的 DNS 规则（本地解析，避免代理 DNS 泄漏）；其他分组的 DNS 走 `server: google`。IP/CIDR 规则只参与路由，不参与 DNS。
+`direct` 分组的域名会同时生成 `server: domestic` 的 DNS 规则（国内直连解析，避免代理 DNS 泄漏）；其他分组的 DNS 走 `server: google`。IP/CIDR 规则只参与路由，不参与 DNS。两个解析器 tag 在 `policy.yaml` 的 `dns_resolvers` 中指定，必须与 `config.dns.servers` 的 tag 一致。
 
 ## 安装与验证
 
@@ -185,8 +190,18 @@ python .\scripts\quality\check_public_repo.py
 
 `config\local\`、`.secrets\`、`runtime\`、`dist\`、核心二进制和订阅凭据均不得提交。
 
+## sing-box 1.15 要求
+
+生成的配置面向 sing-box 1.15（当前为 1.15.0-alpha.3 预发布），桌面端 SFW 与安卓端 SFA 都必须升级到 1.15 预发布版本才能加载：
+
+- TUN 不再写 `stack`，由 sing-tun 1.15 自带的 TCP/IP 栈接管；该选项已弃用并将在 1.17 删除，生成器审计会拒绝再次出现。
+- `cache_file` 使用 1.15 新增的写缓冲，桌面每 1 分钟、安卓每 5 分钟 `flush_interval` 落盘一次。1.14 及更早核心不认识该字段，会以 `unknown field "flush_interval"` 拒绝整份配置，因此不能把新配置交给旧客户端。
+- 安卓 `auto_redirect` 在 1.15 已完整支持，但需要 root；`config\profiles\android.yaml` 中留有注释掉的开关，已 root 的设备可自行打开。
+- 校验核心放在 `runtime\cores\<版本>\sing-box.exe`，管理脚本自动选用修改时间最新的核心；升级核心时新建版本目录即可。低于 1.15 的核心无法解析当前配置（`unknown field "flush_interval"`），没有对照价值，可直接删除。
+
 ## 官方参考
 
 - [sing-box 配置文档](https://sing-box.sagernet.org/configuration/)
 - [sing-box 变更日志](https://sing-box.sagernet.org/changelog/)
-- [1.14.0 GitHub Release](https://github.com/SagerNet/sing-box/releases/tag/v1.14.0)
+- [1.15 迁移说明：TUN stack](https://sing-box.sagernet.org/migration/#migrate-tun-stack)
+- [1.15.0-alpha.3 GitHub Release](https://github.com/SagerNet/sing-box/releases/tag/v1.15.0-alpha.3)

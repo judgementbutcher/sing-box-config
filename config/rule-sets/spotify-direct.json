@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "spotify.com",
+        "scdn.co",
+        "spotifycdn.com",
+        "pscdn.co",
+        "audio-ak-spotify-com.akamaized.net",
+        "audio-akp-spotify-com.akamaized.net",
+        "audio-akp-bbr-spotify-com.akamaized.net"
+      ]
+    }
+  ]
+}

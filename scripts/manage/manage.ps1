@@ -183,7 +183,7 @@ function Get-LinkFormat {
     if ($trimmed -notmatch '^https?://') {
         throw "链接必须是 HTTP(S) 订阅地址或支持的单节点 URI。"
     }
-    $settings = Get-Content -Raw -LiteralPath (Join-Path $ProjectRoot "config\policy.yaml")
+    $settings = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $ProjectRoot "config\policy.yaml")
     $timeout = 20
     if ($settings -match 'timeout_seconds:\s*(\d+)') { $timeout = [int]$Matches[1] }
     try {
@@ -525,7 +525,7 @@ function Get-PolicyStrategyTags {
         if ($line -match '^selectors:\s*$') { $inSelectors = $true; continue }
         if ($inSelectors -and $line -match '^\S') { break }
         if (-not $inSelectors) { continue }
-        if ($line -match '^\s{2}(available|ai|emby):\s*(.+?)\s*$') {
+        if ($line -match '^\s{2}(available|ai|emby|youtube):\s*(.+?)\s*$') {
             $value = $Matches[2].Trim().Trim('"''')
             if ($value -and $value -notin $result) { $result += $value }
         }
@@ -724,7 +724,7 @@ function Add-DirectRule {
     }
     if ($added.Count -eq 0) { throw "没有新增直连规则：输入的内容都已存在。" }
     Invoke-RoutingGroupsUpdate -Data $data
-    Write-Host "[完成] 已添加直连规则：$($added -join '、')（DNS 走本地解析）。" -ForegroundColor Green
+    Write-Host "[完成] 已添加直连规则：$($added -join '、')（DNS 走国内直连解析器）。" -ForegroundColor Green
     if ($skipped.Count -gt 0) { Write-Host "[提示] 已存在，跳过：$($skipped -join '、')" -ForegroundColor DarkGray }
 }
 

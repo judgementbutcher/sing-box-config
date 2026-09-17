@@ -8,7 +8,29 @@ subscription:
 # 节点 server 域名的解析器：必须是不经过 TUN/代理的直连 DNS。
 # 节点域名若走 dns.final（google → detour Available），会依赖当前选中节点，
 # 当前节点不稳时测速就超时（忽隐忽现）。domain_resolver 直连解析后与代理解耦。
-node_dns_resolver: node-resolver
+node_dns_resolver:
+  server: domestic
+  timeout: 2s
+
+# 生成器写入 managed 分组规则的解析器 tag，必须与 config.dns.servers 中的 tag 一致。
+# domestic：直连分组的域名，解析不能走代理，避免 DNS 泄漏。
+# proxy：代理分组的域名，跟随代理出口解析，拿到与出口匹配的 CDN 边缘。
+dns_resolvers:
+  domestic: domestic
+  proxy: google
+
+# 所有显式 DNS 分流都使用同路径双解析器竞速。国内解析器保持直连，海外
+# 解析器保持走 Available，避免故障切换改变出口或造成 DNS 泄漏。
+# 生成器会把相邻、同解析器的规则合并成一个块（evaluate ×2 → respond ×2 →
+# SERVFAIL），匹配条件只写在 evaluate 和 SERVFAIL 上；respond 不带匹配条件，
+# 因为 sing-box 对未曾 evaluate 的响应 tag 直接跳过、不等待。
+# 只合并相邻规则，不同解析器规则之间的先后优先级保持不变。
+dns_failover:
+  timeout: 2s
+  servers:
+    domestic: [domestic, domestic-backup]
+    google: [google, cloudflare]
+    google-youtube: [google-youtube, cloudflare-youtube]
 
 config:
   $schema: https://sing-box.sagernet.org/schema.json
@@ -18,14 +40,42 @@ config:
     timestamp: true
   dns:
     servers:
-      - type: local
-        tag: local
-      # 节点域名专用直连解析器（AliDNS）。UDP 53 直连、不经 TUN/代理，
-      # 由生成器写入各节点的 domain_resolver。见 node_dns_resolver。
-      - type: udp
-        tag: node-resolver
+      # 国内直连解析器（AliDNS DoH）。
+      #
+      # 这里曾经是 type: local，它在 TUN 下必然失效：桌面 profile 的 TUN 用
+      # dns_mode=hijack，而 hijack 会把系统 DNS 指向 TUN 自己的地址
+      # （172.18.0.2 / fdfe:dcba:9876::2）。local 解析器读到的"系统上游"就是
+      # sing-box 自己，查询一路挂到 dns.timeout（8s）才失败，且不报错：
+      # 走 local 的域名（全部国内域名、直连分组、默认 domain_resolver）静默超时。
+      # 另有两个连带影响：route.default_domain_resolver 也是 local，导致
+      # 规则集下载（fastly.jsdelivr.net）长期失败；strict_route 装上的 WFP
+      # 过滤器会拦截非 TUN 接口上的 53 端口（直连 UDP/TCP 53 报 WSAEACCES），
+      # 所以直连 DNS 一律走 443 上的 DoH，不再使用 53。
+      #
+      # server 用 IP，避免"解析器自己需要被解析"的自举问题。
+      # 不写 detour：DNS 服务器不带 detour 时本身就等价于一个空直连 outbound，
+      # 由 sing-box 直接发起连接、不经代理，与节点解析、直连域名一致。
+      # 显式写 detour: direct 会被核心拒绝
+      # （"detour to an empty direct outbound makes no sense"，且 check 不报错，
+      # 只在启动时才 FATAL），所以这里必须留空。
+      - type: https
+        tag: domestic
         server: 223.5.5.5
-        server_port: 53
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: dns.alidns.com
+      # 备用国内解析器（DNSPod）：只在兜底竞速里参与，AliDNS 不可用时接管
+      # 未命中规则的查询。换一家运营商，避免两家同源同时失效。
+      - type: https
+        tag: domestic-backup
+        server: 1.12.12.12
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: doh.pub
       - type: https
         tag: google
         server: 8.8.8.8
@@ -35,23 +85,63 @@ config:
           enabled: true
           server_name: dns.google
         detour: Available
+      - type: https
+        tag: cloudflare
+        server: 1.1.1.1
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: cloudflare-dns.com
+        detour: Available
+      # YouTube 专用解析器：与 YouTube 分组同一出口。googlevideo.com 等域名
+      # 由 Google 按解析器出口所在地区分配视频边缘节点，若解析走 Available
+      # 而播放走 YouTube 分组里另挑的节点，拿到的边缘与实际出口不在一地，
+      # 视频取流会绕远。YouTube 分组默认跟随 Available，此时两者等价。
+      - type: https
+        tag: google-youtube
+        server: 8.8.8.8
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: dns.google
+        detour: YouTube
+      - type: https
+        tag: cloudflare-youtube
+        server: 1.1.1.1
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: cloudflare-dns.com
+        detour: YouTube
     final: google
     strategy: ipv4_only
     reverse_mapping: true
-    timeout: 8s
+    # 单次查询最多等待 3 秒；显式分流和兜底竞速均在 2 秒内结束。
+    timeout: 3s
   http_clients:
+    # 规则集通过代理下载，域名也用代理侧解析：国内解析器给出的是面向国内的
+    # CDN 边缘，经由海外出口回连会绕远甚至失败。
     - tag: rule-set-downloader
       detour: Available
+      domain_resolver: google
   route:
     auto_detect_interface: true
     default_http_client: rule-set-downloader
-    default_domain_resolver: local
+    default_domain_resolver:
+      server: domestic
+      timeout: 2s
     final: Available
 
 selectors:
   available: Available
   ai: AI
   emby: Emby
+  # YouTube 专用分组：成员与 Available 相同，默认也跟随 Available，
+  # 需要时可在面板里单独给 YouTube 挑节点，不影响其他流量。
+  youtube: YouTube
   direct: direct
   interrupt_exist_connections: true
 
@@ -72,6 +162,13 @@ rule_sets:
     type: local
     format: source
     path: config/rule-sets/direct-cdn.json
+  # Spotify 账号地区（埃及）与出口 IP 不一致时会触发"资料与所在地区不符"，
+  # 机房 IP 尤其容易被判定为 VPN。整条链路（账号/API、图片、音频 CDN）直连，
+  # 与手机上不挂代理时的可用路径保持一致。
+  - tag: spotify-direct
+    type: local
+    format: source
+    path: config/rule-sets/spotify-direct.json
   - tag: geosite-cn
     type: remote
     format: binary
@@ -99,6 +196,22 @@ rule_sets:
     initial_path: runtime/rule-set-cache/{tag}.srs
 
 domains:
+  # YouTube 视频链路：播放地址与取流请求的出口 IP 绑定，这些域名必须落在
+  # 同一个出口，否则分到两个节点就会 403。googlevideo.com 承载实际视频流，
+  # youtubei.googleapis.com 是取流接口，yt3/yt4.ggpht.com 是头像与封面
+  # （ggpht.com 其余子域仍走通用 Google 规则）。
+  youtube: &youtube_domains
+    - youtube.com
+    - youtu.be
+    - yt.be
+    - youtube-nocookie.com
+    - youtubekids.com
+    - ytimg.com
+    - googlevideo.com
+    - youtubei.googleapis.com
+    - youtube.googleapis.com
+    - yt3.ggpht.com
+    - yt4.ggpht.com
   ntp: &ntp_domains
     - time.windows.com
     - time.nist.gov
@@ -143,13 +256,17 @@ route:
     - rule_set: [geosite-telegram]
       action: route
       outbound: Available
+    # YouTube 单独交给 YouTube 分组。必须排在下面的通用 Google 规则之前，
+    # 否则 googlevideo.com 会先被那条规则摘走，YouTube 分组就形同虚设。
+    - domain_suffix: *youtube_domains
+      action: route
+      outbound: YouTube
     # Google services frequently split requests across these CDN/API domains.
     # Keep them on the proxy path instead of letting the domestic fallback win.
     - domain_suffix:
         - gstatic.com
         - googleapis.com
         - googleusercontent.com
-        - googlevideo.com
         - ggpht.com
       action: route
       outbound: Available
@@ -166,6 +283,11 @@ route:
       action: route
       outbound: Available
     - rule_set: [direct-cdn]
+      action: route
+      outbound: direct
+    # Spotify 整条链路直连：账号地区校验看的是出口 IP，走代理出口（尤其是机房
+    # 段）会被判成"资料与所在地区不符"而拒绝播放。见 rule_sets 中的说明。
+    - rule_set: [spotify-direct]
       action: route
       outbound: direct
     # Apply ad blocking after explicit business routes.  The upstream ads
@@ -199,7 +321,14 @@ dns_rules:
   # breaks modern CDN selection, ECH, and HTTP/3; routing still follows the
   # domain rules below and DNS hijacking prevents direct resolver leakage.
   pre_rules: []
+  # 规则按"解析器"分段书写：相邻的同解析器规则会被生成器合并成一个竞速块，
+  # 所以这里把走 google 的业务规则排在一起。先后顺序仍然是优先级：YouTube
+  # 域名必须排在通用 Google 域名之前（youtubei.googleapis.com 同时命中两者）。
   business_rules:
+    # YouTube 走与 YouTube 分组同出口的解析器，保证视频边缘与出口一致。
+    - domain_suffix: *youtube_domains
+      action: route
+      server: google-youtube
     - domain_suffix:
         - emby.bbqwq.com
         - emby.wawajiao.cc.cd
@@ -208,9 +337,6 @@ dns_rules:
       # reachable by a direct socket, but their local/ISP DNS resolution
       # is unavailable or times out.
       server: google
-    - domain_suffix: [emby.kingemby.com]
-      action: route
-      server: local
     - rule_set: [emby-domains]
       action: route
       server: google
@@ -218,7 +344,6 @@ dns_rules:
         - gstatic.com
         - googleapis.com
         - googleusercontent.com
-        - googlevideo.com
         - ggpht.com
       action: route
       server: google
@@ -243,39 +368,78 @@ dns_rules:
   domestic_rules:
     - rule_set: [china-direct]
       action: route
-      server: local
+      server: domestic
+    # kingemby 走 Cloudflare（104.21.8.8 / 172.67.156.153），国内直连可达，
+    # 用国内解析器拿到国内优化的边缘即可。同为直连的 bbqwq/wawajiao 之所以
+    # 走 google，是因为那两个域名的国内解析拿不到可用地址。
+    # kingemby 不在 emby-domains 名单里，放在这里不会被上方的 google 规则抢走。
+    - domain_suffix: [emby.kingemby.com]
+      action: route
+      server: domestic
     - domain_suffix: *ntp_domains
       action: route
-      server: local
+      server: domestic
     - rule_set: [direct-cdn]
       action: route
-      server: local
+      server: domestic
+    # 直连的域名必须用国内解析器，否则会经代理解析、拿到面向海外的边缘，
+    # 与直连接口回连绕远。与上面的路由规则成对出现。
+    - rule_set: [spotify-direct]
+      action: route
+      server: domestic
     - rule_set: [geosite-geolocation-!cn]
       action: route
       server: google
     - rule_set: [geosite-cn]
       action: route
-      server: local
-  # 兜底 DNS 竞速（sing-box 1.14 evaluate + race 并行求值）。
-  # 只处理未命中上方所有规则的查询：并行向国内直连解析器（node-resolver，
-  # AliDNS UDP）与代理内 DoH（google）发起查询，哪个先返回就用哪个
-  #（首条 race 命中即终止，其余在途查询被取消）。
-  # 顺序要求：evaluate 规则必须位于引用它的 match_response 规则之前。
-  # 两端 evaluate 都超时（2s）时，本段不命中，退回 dns.final（google）。
+      server: domestic
+  # 兜底 DNS（sing-box 1.14 evaluate + match_response 响应匹配）。
+  # 只处理未命中上方所有规则的查询，即两张 geosite 名单都没收录的域名。
+  #
+  # 历史教训（2026-09-13 实测）：这里曾让国内、海外四路解析器"谁先返回用谁"。
+  # AliDNS 直连通常比代理内 DoH 快 100ms 以上，于是名单外的海外域名多数由
+  # AliDNS 作答，而 AliDNS 对被墙域名返回的是污染 IP（annas-archive.org →
+  # 199.59.148.222、genius.com → 173.244.217.42 等），连接走代理也打不开；
+  # 缓存过期后重赛，偶尔换 Google 赢就又能打开，表现为"间歇性无法访问、
+  # 换节点或放一会儿又好了"。竞速的胜负取决于网络抖动，本质是不确定的。
+  #
+  # 现在的判定是确定性的（类 ChinaDNS）：
+  #   1. 四条 evaluate 并行发起（国内两条直连、海外两条走 Available）。
+  #   2. 国内解析结果只有落在 geoip-cn（中国大陆 IP 段）时才采信——说明这是
+  #      国内站点，路由层也会按 IP 直连；两条国内腿之间用 race 互为备份。
+  #   3. 否则（海外站点，或国内结果被污染）一律采用海外解析结果；这两条不带
+  #      race，会等国内两条 race 规则都判定"不命中"后才生效，保证顺序确定。
+  #   4. 四路都失败时立即返回 SERVFAIL，不再重复等待 dns.final。
+  # 顺序要求：evaluate 规则必须位于引用它的 match_response 规则之前；
+  # 响应 tag 与解析器 tag 有意区分开：tag 命名的是"某个 evaluate 的结果"。
   final_rules:
     - action: evaluate
-      server: node-resolver
-      tag: domestic
+      server: domestic
+      tag: cn-primary
+      timeout: 2s
+    - action: evaluate
+      server: domestic-backup
+      tag: cn-backup
       timeout: 2s
     - action: evaluate
       server: google
-      tag: foreign
+      tag: overseas
       timeout: 2s
-    - match_response: domestic
-      action: route
-      server: node-resolver
+    - action: evaluate
+      server: cloudflare
+      tag: overseas-backup
+      timeout: 2s
+    - match_response: cn-primary
+      rule_set: [geoip-cn]
+      action: respond
       race: true
-    - match_response: foreign
-      action: route
-      server: google
+    - match_response: cn-backup
+      rule_set: [geoip-cn]
+      action: respond
       race: true
+    - match_response: overseas
+      action: respond
+    - match_response: overseas-backup
+      action: respond
+    - action: predefined
+      rcode: SERVFAIL

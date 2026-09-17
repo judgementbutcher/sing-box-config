@@ -66,6 +66,7 @@ SUBSCRIPTION_KEYS = {
     "include",
     "exclude",
     "exclude_node_tags",
+    "exclude_types",
     "max_nodes",
     "deduplicate",
     "allow_unsupported",
@@ -334,9 +335,21 @@ def build_source(
     include = compile_patterns(item.get("include"), f"{name}.include")
     exclude = compile_patterns(item.get("exclude"), f"{name}.exclude")
     exclude_node_tags = compile_patterns(item.get("exclude_node_tags"), f"{name}.exclude_node_tags")
+    # 上游订阅常混有本核心加载不了的 outbound 类型（例如 nodebuf 的
+    # hysteria v1 用 up/down、wireguard 用旧 server 字段）。这些节点留在配置里
+    # 会让 sing-box check 直接 FATAL、连带双端生成全部失败，所以按类型跳过。
+    # 用类型而不是节点名：免费池的节点编号每轮都在换，按名字排除必然漏。
+    exclude_types = {
+        str(value).strip().lower() for value in as_list(item.get("exclude_types")) if str(value).strip()
+    }
+    dropped_types: dict[str, int] = {}
     selected: list[dict[str, Any]] = []
     for node in nodes:
         original = node_name(node)
+        node_type = str(node.get("type") or "").strip().lower()
+        if node_type in exclude_types:
+            dropped_types[node_type] = dropped_types.get(node_type, 0) + 1
+            continue
         if is_placeholder_node(node):
             print(f"[占位节点] {name}: {original} 指向 {node.get('server')}:{node.get('server_port')}，已忽略。", file=sys.stderr)
             continue
@@ -350,6 +363,9 @@ def build_source(
     max_nodes = int(item.get("max_nodes") or 0)
     if max_nodes > 0:
         selected = selected[:max_nodes]
+    if dropped_types:
+        summary = "、".join(f"{kind} ×{count}" for kind, count in sorted(dropped_types.items()))
+        print(f"[订阅] {name}: 已按 exclude_types 跳过 {summary}。", file=sys.stderr)
     if not selected:
         raise ValueError(f"{name}: 筛选后没有可用节点")
 
@@ -389,7 +405,15 @@ def build_source(
         # 节点 server 为域名时，固定用直连解析器（policy.node_dns_resolver），
         # 避免走 dns.final（google → detour Available）依赖当前选中节点，
         # 导致节点域名解析超时、测速显示不出来或忽隐忽现。
-        node_resolver = str(policy.get("node_dns_resolver") or "").strip()
+        raw_node_resolver = policy.get("node_dns_resolver")
+        if isinstance(raw_node_resolver, Mapping):
+            resolver_server = str(raw_node_resolver.get("server") or "").strip()
+            node_resolver: str | dict[str, Any] | None = (
+                copy.deepcopy(dict(raw_node_resolver)) if resolver_server else None
+            )
+        else:
+            resolver_text = str(raw_node_resolver or "").strip()
+            node_resolver = resolver_text or None
         node_server = node.get("server")
         if node_resolver and node_server and not _is_ip_address(node_server):
             node["domain_resolver"] = node_resolver
@@ -540,6 +564,7 @@ def build_outbounds(
     available_tag = str(selectors.get("available") or "Available")
     ai_tag = str(selectors.get("ai") or "AI")
     emby_tag = str(selectors.get("emby") or "Emby")
+    youtube_tag = str(selectors.get("youtube") or "YouTube")
     direct_outbound: dict[str, Any] = {"type": "direct", "tag": direct_tag}
     direct_interface = str(profile.get("direct_interface") or "").strip()
     if direct_interface:
@@ -564,6 +589,16 @@ def build_outbounds(
             "type": "selector",
             "tag": emby_tag,
             "outbounds": list(dict.fromkeys([available_tag, *available_entries, direct_tag])),
+            "default": available_tag,
+            "interrupt_exist_connections": interrupt,
+        },
+        # YouTube exposes the same entries as Available plus Available itself as
+        # the default, so it tracks the global choice until a user pins a
+        # specific node for video traffic.
+        {
+            "type": "selector",
+            "tag": youtube_tag,
+            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
             "default": available_tag,
             "interrupt_exist_connections": interrupt,
         },
@@ -645,6 +680,158 @@ def filtered_rules(values: Any, platform: str) -> list[dict[str, Any]]:
     return result
 
 
+DNS_ACTION_FIELDS = {
+    "action",
+    "server",
+    "race",
+    "speculative",
+    "strategy",
+    "disable_cache",
+    "disable_optimistic_cache",
+    "rewrite_ttl",
+    "timeout",
+    "client_subnet",
+    "remove_client_subnet",
+    "rcode",
+    "answer",
+    "ns",
+    "extra",
+}
+# Query options that carry over from a ``route`` rule to its ``evaluate`` legs.
+DNS_QUERY_OPTION_FIELDS = {
+    "strategy",
+    "disable_cache",
+    "disable_optimistic_cache",
+    "rewrite_ttl",
+    "timeout",
+    "client_subnet",
+    "remove_client_subnet",
+}
+# Single-field matchers whose values are OR'd inside one rule, so rules that
+# consist of exactly one such field can be merged by concatenating the lists.
+DNS_MERGEABLE_MATCHER_FIELDS = {
+    "domain",
+    "domain_suffix",
+    "domain_keyword",
+    "domain_regex",
+    "rule_set",
+    "process_name",
+    "process_path",
+    "process_path_regex",
+    "package_name",
+    "package_name_regex",
+}
+
+
+def _dns_matcher(rule: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: copy.deepcopy(value) for key, value in rule.items() if key not in DNS_ACTION_FIELDS}
+
+
+def _merge_dns_matchers(matchers: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Union several rule matchers into a single matcher.
+
+    Rules made of one list-valued field are folded together per field; any
+    other matcher (multi-field AND rules, inverted rules, logical rules) stays
+    a separate branch.  More than one branch becomes a ``logical`` OR rule.
+    """
+    merged_lists: dict[str, list[Any]] = {}
+    branches: list[dict[str, Any]] = []
+    for matcher in matchers:
+        keys = set(matcher)
+        if len(keys) == 1:
+            (key,) = keys
+            if key in DNS_MERGEABLE_MATCHER_FIELDS:
+                merged_lists.setdefault(key, []).extend(as_list(matcher[key]))
+                continue
+        branches.append(copy.deepcopy(dict(matcher)))
+    folded = [
+        {key: list(dict.fromkeys(values))}
+        for key, values in merged_lists.items()
+    ]
+    branches = [*folded, *branches]
+    if len(branches) == 1:
+        return branches[0]
+    return {"type": "logical", "mode": "or", "rules": branches}
+
+
+def expand_dns_failover_rules(
+    rules: Sequence[Mapping[str, Any]], settings: Mapping[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Expand ordinary DNS routes into same-path resolver races.
+
+    Cached responses remain fast.  On a cache miss, ``evaluate`` starts every
+    upstream query in parallel and the first successful tagged response is
+    returned by a ``respond`` race.  A final SERVFAIL bounds failure latency
+    instead of falling through and querying the same servers again.
+
+    Consecutive routes to the same server are merged into one block, so the
+    matcher is written once per leg instead of once per rule.  Merging only
+    happens for adjacent rules, which preserves the priority order between
+    differently-resolved rules exactly.  ``respond`` rules carry no matcher:
+    sing-box skips a ``match_response`` rule whose tag was never evaluated,
+    so they can only fire for queries that matched this block's evaluates.
+    """
+
+    settings = settings if isinstance(settings, Mapping) else {}
+    raw_groups = settings.get("servers")
+    groups = raw_groups if isinstance(raw_groups, Mapping) else {}
+    default_timeout = str(settings.get("timeout") or "2s").strip() or "2s"
+
+    def alternatives_for(rule: Mapping[str, Any]) -> list[str]:
+        if (
+            (rule.get("action") or "route") != "route"
+            or rule.get("match_response") is not None
+            or rule.get("race")
+        ):
+            return []
+        server = str(rule.get("server") or "").strip()
+        alternatives = [str(value).strip() for value in as_list(groups.get(server)) if str(value).strip()]
+        return alternatives if len(alternatives) >= 2 else []
+
+    def block_key(rule: Mapping[str, Any]) -> tuple[Any, ...]:
+        options = {key: rule[key] for key in DNS_QUERY_OPTION_FIELDS if key in rule}
+        return (str(rule.get("server")), json.dumps(options, sort_keys=True, ensure_ascii=False))
+
+    expanded: list[dict[str, Any]] = []
+    block_index = 0
+    index = 0
+    while index < len(rules):
+        rule = copy.deepcopy(dict(rules[index]))
+        alternatives = alternatives_for(rule)
+        if not alternatives:
+            expanded.append(rule)
+            index += 1
+            continue
+        key = block_key(rule)
+        members = [rule]
+        index += 1
+        while index < len(rules):
+            candidate = dict(rules[index])
+            if not alternatives_for(candidate) or block_key(candidate) != key:
+                break
+            members.append(copy.deepcopy(candidate))
+            index += 1
+        block_index += 1
+        matcher = _merge_dns_matchers([_dns_matcher(member) for member in members])
+        query_options = {key: copy.deepcopy(rule[key]) for key in DNS_QUERY_OPTION_FIELDS if key in rule}
+        query_options.setdefault("timeout", default_timeout)
+        response_tags = [f"failover-{block_index}-{alternative}" for alternative in alternatives]
+        for alternative, response_tag in zip(alternatives, response_tags):
+            expanded.append(
+                {
+                    **copy.deepcopy(matcher),
+                    "action": "evaluate",
+                    "server": alternative,
+                    "tag": response_tag,
+                    **query_options,
+                }
+            )
+        for response_tag in response_tags:
+            expanded.append({"match_response": response_tag, "action": "respond", "race": True})
+        expanded.append({**copy.deepcopy(matcher), "action": "predefined", "rcode": "SERVFAIL"})
+    return expanded
+
+
 def load_inline_rules(path_text: str) -> list[dict[str, Any]]:
     path = (ROOT / path_text).resolve()
     try:
@@ -720,19 +907,22 @@ def parse_route_matcher(value: str) -> tuple[str, str]:
 def build_managed_rules(
     routing_groups: Mapping[str, Any] | None,
     direct_tag: str,
-    dns_server_tags: Iterable[str] = (),
+    domestic_server: str | None,
+    proxy_server: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Turn routing-groups domains into typed route + DNS rules.
 
     Each group yields one route rule per matcher kind; domains routed to the
-    ``direct`` outbound also get a local-DNS rule so resolution cannot leak
+    ``direct`` outbound also get a domestic-DNS rule so resolution cannot leak
     through the proxy DNS.  DNS rules are only emitted for servers that the
     policy actually declares, and never for IP matchers.  Empty groups produce
     nothing.
+
+    The two resolver tags come from ``policy.dns_resolvers`` rather than being
+    guessed from the declared server set: guessing used to fall back to
+    ``next(iter(server_pool))``, whose set ordering would silently point rules
+    at an arbitrary resolver.
     """
-    server_pool = {str(tag).strip() for tag in dns_server_tags if str(tag).strip()}
-    local_server = "local" if "local" in server_pool else next(iter(server_pool), None)
-    proxy_server = "google" if "google" in server_pool else ("local" if "local" in server_pool else next(iter(server_pool), None))
     route_rules: list[dict[str, Any]] = []
     dns_rules: list[dict[str, Any]] = []
     for raw_group in as_list((routing_groups or {}).get("groups")):
@@ -752,7 +942,7 @@ def build_managed_rules(
             route_rules.append({kind: members, "action": "route", "outbound": tag})
             if kind == "ip_cidr":
                 continue
-            server = local_server if tag == direct_tag else proxy_server
+            server = domestic_server if tag == direct_tag else proxy_server
             if server:
                 dns_rules.append({kind: members, "action": "route", "server": server})
     return route_rules, dns_rules
@@ -868,12 +1058,14 @@ def assemble_rules(
     route_policy = policy.get("route", {})
     dns_policy = policy.get("dns_rules", {})
     direct_tag = str(policy.get("selectors", {}).get("direct") or "direct")
-    dns_server_tags = [
-        str(server.get("tag")).strip()
-        for server in as_list(policy.get("config", {}).get("dns", {}).get("servers"))
-        if isinstance(server, dict) and str(server.get("tag") or "").strip()
-    ]
-    managed_rules, managed_dns_rules = build_managed_rules(routing_groups, direct_tag, dns_server_tags)
+    resolvers = policy.get("dns_resolvers") or {}
+    if not isinstance(resolvers, Mapping):
+        resolvers = {}
+    domestic_server = str(resolvers.get("domestic") or "").strip() or None
+    proxy_server = str(resolvers.get("proxy") or "").strip() or None
+    managed_rules, managed_dns_rules = build_managed_rules(
+        routing_groups, direct_tag, domestic_server, proxy_server
+    )
     conf.setdefault("route", {})["rules"] = [
         *filtered_rules(custom.get("route_rules_front"), platform),
         *filtered_rules(profile.get("route_rules_front"), platform),
@@ -884,7 +1076,7 @@ def assemble_rules(
         *filtered_rules(route_policy.get("business_rules"), platform),
         *filtered_rules(route_policy.get("domestic_rules"), platform),
     ]
-    conf.setdefault("dns", {})["rules"] = [
+    dns_rules = [
         *filtered_rules(profile.get("dns_rules_front"), platform),
         *filtered_rules(dns_policy.get("pre_rules"), platform),
         *managed_dns_rules,
@@ -896,6 +1088,9 @@ def assemble_rules(
         #（evaluate + race），两者都不命中时才由 dns.final 兜底。
         *filtered_rules(dns_policy.get("final_rules"), platform),
     ]
+    conf.setdefault("dns", {})["rules"] = expand_dns_failover_rules(
+        dns_rules, policy.get("dns_failover")
+    )
 
 
 def build_config(
@@ -915,7 +1110,10 @@ def build_config(
         apply_route_exclusions(conf, nodes)
     require_valid_config(
         conf,
-        {"allow_duplicate_nodes": any(source.allows_duplicate_nodes for source in sources)},
+        {
+            "allow_duplicate_nodes": any(source.allows_duplicate_nodes for source in sources),
+            "platform": target,
+        },
     )
     return conf
 

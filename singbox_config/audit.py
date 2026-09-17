@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Set
@@ -155,6 +156,16 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         if isinstance(server, dict) and server.get("tag")
     }
     missing_dns_references: List[Dict[str, str]] = []
+    evaluate_tags = [
+        str(rule.get("tag"))
+        for rule in conf.get("dns", {}).get("rules", [])
+        if isinstance(rule, dict) and rule.get("action") == "evaluate" and rule.get("tag")
+    ]
+    duplicate_evaluate_tags = sorted(
+        tag for tag, count in Counter(evaluate_tags).items() if count > 1
+    )
+    evaluate_tag_set = set(evaluate_tags)
+    missing_response_references: List[Dict[str, str]] = []
     dns_final = conf.get("dns", {}).get("final")
     if dns_final and str(dns_final) not in dns_servers:
         missing_dns_references.append({"location": "dns.final", "tag": str(dns_final)})
@@ -162,6 +173,11 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         if isinstance(rule, dict) and rule.get("server") and str(rule["server"]) not in dns_servers:
             missing_dns_references.append(
                 {"location": f"dns.rules[{index}].server", "tag": str(rule["server"])}
+            )
+        response_tag = rule.get("match_response") if isinstance(rule, dict) else None
+        if isinstance(response_tag, str) and response_tag not in evaluate_tag_set:
+            missing_response_references.append(
+                {"location": f"dns.rules[{index}].match_response", "tag": response_tag}
             )
     default_resolver = _dns_resolver_tag(conf.get("route", {}).get("default_domain_resolver"))
     if default_resolver and default_resolver not in dns_servers:
@@ -188,6 +204,86 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
                 missing_dns_references.append(
                     {"location": f"{section_name}[{index}].domain_resolver", "tag": resolver}
                 )
+
+    # A detoured DNS server cannot resolve the domain of the proxy node that
+    # carries that same DNS server.  This dependency loop is valid JSON and can
+    # pass the core's static check, but every lookup waits for its timeout.
+    outbound_by_tag = {
+        str(item.get("tag")): item for item in outbounds if item.get("tag")
+    }
+
+    def strategy_leaves(tag: str, trail: set[str] | None = None) -> list[Dict[str, Any]]:
+        trail = set(trail or ())
+        if tag in trail:
+            return []
+        trail.add(tag)
+        outbound = outbound_by_tag.get(tag)
+        if not outbound:
+            return []
+        if outbound.get("type") not in {"selector", "urltest"}:
+            return [outbound]
+        return [
+            leaf
+            for member in outbound.get("outbounds", [])
+            for leaf in strategy_leaves(str(member), trail)
+        ]
+
+    default_resolver = _dns_resolver_tag(conf.get("route", {}).get("default_domain_resolver"))
+    dns_dependency_cycles: list[str] = []
+    for dns_server in conf.get("dns", {}).get("servers", []):
+        if not isinstance(dns_server, dict) or not dns_server.get("tag"):
+            continue
+        dns_tag = str(dns_server["tag"])
+        server_address = str(dns_server.get("server") or "").strip()
+        if server_address:
+            try:
+                ipaddress.ip_address(server_address)
+                server_is_domain = False
+            except ValueError:
+                server_is_domain = True
+            if server_is_domain and _dns_resolver_tag(dns_server.get("domain_resolver")) == dns_tag:
+                dns_dependency_cycles.append(f"{dns_tag} -> {server_address} -> {dns_tag}")
+        detour = str(dns_server.get("detour") or "").strip()
+        if not detour:
+            continue
+        for node_outbound in strategy_leaves(detour):
+            node_server = str(node_outbound.get("server") or "").strip()
+            if not node_server:
+                continue
+            try:
+                ipaddress.ip_address(node_server)
+                continue
+            except ValueError:
+                pass
+            resolver = _dns_resolver_tag(node_outbound.get("domain_resolver")) or default_resolver
+            if resolver == dns_tag:
+                dns_dependency_cycles.append(
+                    f"{dns_tag} -> {detour} -> {node_outbound.get('tag')} -> {dns_tag}"
+                )
+
+    platform = str(limits.get("platform") or "").lower()
+    hijacking_tun = any(
+        isinstance(inbound, dict)
+        and inbound.get("type") == "tun"
+        and inbound.get("dns_mode", "hijack") == "hijack"
+        for inbound in conf.get("inbounds", [])
+    )
+    local_dns_loop_risk = (
+        platform in {"desktop", "windows"}
+        and hijacking_tun
+        and any(
+            isinstance(server, dict) and server.get("type") == "local"
+            for server in conf.get("dns", {}).get("servers", [])
+        )
+    )
+
+    # sing-box 1.15 deprecates the TUN ``stack`` option (removed in 1.17): the
+    # built-in sing-tun stack is only used when the field is absent, so any
+    # value silently opts back into the slower legacy implementations.
+    deprecated_tun_stack = any(
+        isinstance(inbound, dict) and inbound.get("type") == "tun" and "stack" in inbound
+        for inbound in conf.get("inbounds", [])
+    )
 
     http_clients = {
         str(client.get("tag"))
@@ -251,6 +347,16 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         errors.append(f"存在 {len(missing_references)} 个不存在的 outbound 引用")
     if missing_dns_references:
         errors.append(f"存在 {len(missing_dns_references)} 个不存在的 DNS server 引用")
+    if duplicate_evaluate_tags:
+        errors.append(f"存在重复 DNS evaluate tag: {', '.join(duplicate_evaluate_tags)}")
+    if missing_response_references:
+        errors.append(f"存在 {len(missing_response_references)} 个不存在的 DNS evaluate 响应引用")
+    if dns_dependency_cycles:
+        errors.append(f"DNS 解析依赖存在循环: {'; '.join(dns_dependency_cycles)}")
+    if local_dns_loop_risk:
+        errors.append("Windows TUN hijack 不得使用 local DNS，可能递归查询自身")
+    if deprecated_tun_stack:
+        errors.append("TUN 的 stack 选项已在 sing-box 1.15 弃用，请删除以使用内置协议栈")
     if missing_http_client_references:
         errors.append(f"存在 {len(missing_http_client_references)} 个不存在的 HTTP client 引用")
     if missing_rule_set_references:
@@ -272,6 +378,9 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     insecure_nodes = sum(1 for item in nodes if is_insecure_outbound(item))
     if insecure_nodes:
         warnings.append(f"有 {insecure_nodes} 个节点关闭了 TLS 证书校验")
+    optimistic = conf.get("dns", {}).get("optimistic")
+    if optimistic is True or (isinstance(optimistic, dict) and optimistic.get("enabled") is True):
+        warnings.append("已启用 optimistic DNS，过期地址可能继续被返回")
 
     report = {
         "ok": not errors,
@@ -293,6 +402,11 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         "selector_cycles": selector_cycles,
         "missing_references": missing_references,
         "missing_dns_references": missing_dns_references,
+        "duplicate_evaluate_tags": duplicate_evaluate_tags,
+        "missing_response_references": missing_response_references,
+        "dns_dependency_cycles": dns_dependency_cycles,
+        "local_dns_loop_risk": local_dns_loop_risk,
+        "deprecated_tun_stack": deprecated_tun_stack,
         "missing_http_client_references": missing_http_client_references,
         "missing_rule_set_references": missing_rule_set_references,
     }

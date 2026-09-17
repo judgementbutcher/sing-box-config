@@ -89,3 +89,57 @@ def test_audit_rejects_selector_cycles():
     report = audit_config(conf)
     assert not report["ok"]
     assert report["selector_cycles"] == ["A -> B -> A"]
+
+
+def test_audit_rejects_dns_dependency_and_missing_response_tag():
+    conf = {
+        "dns": {
+            "servers": [{"tag": "remote", "type": "https", "server": "8.8.8.8", "detour": "Proxy"}],
+            "rules": [{"match_response": "missing", "action": "respond"}],
+        },
+        "route": {"default_domain_resolver": "remote", "rules": [], "rule_set": []},
+        "outbounds": [
+            {"type": "selector", "tag": "Proxy", "outbounds": ["n1"]},
+            node("n1", "node.example"),
+        ],
+    }
+
+    report = audit_config(conf)
+
+    assert not report["ok"]
+    assert report["missing_response_references"] == [
+        {"location": "dns.rules[1].match_response", "tag": "missing"}
+    ]
+    assert report["dns_dependency_cycles"] == ["remote -> Proxy -> n1 -> remote"]
+
+
+def test_audit_rejects_local_dns_with_windows_tun_hijack():
+    conf = {
+        "dns": {"servers": [{"tag": "local", "type": "local"}]},
+        "inbounds": [{"type": "tun", "dns_mode": "hijack"}],
+        "route": {"rules": [], "rule_set": []},
+        "outbounds": [],
+    }
+
+    report = audit_config(conf, {"platform": "desktop"})
+
+    assert not report["ok"]
+    assert report["local_dns_loop_risk"] is True
+
+
+def test_audit_rejects_deprecated_tun_stack():
+    conf = {
+        "dns": {"servers": []},
+        "inbounds": [{"type": "tun", "stack": "system"}],
+        "route": {"rules": [], "rule_set": []},
+        "outbounds": [],
+    }
+
+    report = audit_config(conf, {"platform": "android"})
+
+    assert not report["ok"]
+    assert report["deprecated_tun_stack"] is True
+    assert any("stack" in message for message in report["errors"])
+
+    conf["inbounds"][0].pop("stack")
+    assert audit_config(conf, {"platform": "android"})["deprecated_tun_stack"] is False

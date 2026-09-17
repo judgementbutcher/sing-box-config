@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -176,20 +176,33 @@ class ValidatedConfigStore:
         return _ValidatedSnapshot(config_sig, stamp_sig, True, "", body, actual)
 
 
-def publication_urls(host: str, port: int) -> dict[str, str]:
+def authenticated_url(url: str, credentials: Mapping[str, str]) -> str:
+    """Embed HTTP Basic credentials so the link can be pasted as-is."""
+    user = quote(str(credentials["username"]), safe="")
+    secret = quote(str(credentials["password"]), safe="")
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, f"{user}:{secret}@{parts.netloc}", parts.path, "", ""))
+
+
+def publication_urls(host: str, port: int, credentials: Mapping[str, str] | None = None) -> dict[str, str]:
+    android = f"http://{host}:{port}/android/config.json"
+    if credentials:
+        android = authenticated_url(android, credentials)
     return {
         "桌面/SFW（本机首选）": f"http://127.0.0.1:{port}/desktop/config.json",
         "桌面/SFW（局域网）": f"http://{host}:{port}/desktop/config.json",
-        "安卓/SFA": f"http://{host}:{port}/android/config.json",
+        "安卓/SFA": android,
     }
 
 
 def print_publication_info(host: str, port: int, credentials: Mapping[str, str]) -> None:
     print("\n配置发布已启动，请保存以下信息：", flush=True)
-    for name, url in publication_urls(host, port).items():
+    for name, url in publication_urls(host, port, credentials).items():
         print(f"  {name}: {url}", flush=True)
     print(f"  用户名: {credentials['username']}", flush=True)
     print(f"  密码:   {credentials['password']}", flush=True)
+    print("  安卓链接已内嵌凭据，可直接粘贴；客户端若分开填写，请用上面的用户名和密码。", flush=True)
+    print("  桌面链接不需要认证。", flush=True)
     print("按 Ctrl+C 停止发布。\n", flush=True)
 
 

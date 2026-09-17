@@ -7,9 +7,6 @@ strip_rule_set_initial_path: true
 config:
   dns:
     cache_capacity: 8192
-    optimistic:
-      enabled: true
-      timeout: 2h
   inbounds:
     - type: tun
       tag: tun-in
@@ -20,7 +17,9 @@ config:
       strict_route: true
       udp_timeout: 5m
       mtu: 1400
-      stack: system
+      # 不写 stack：sing-box 1.15 起 TUN 默认使用 sing-tun 自带的 TCP/IP 栈，
+      # 峰值吞吐、能耗与内存都优于 system/gvisor/mixed；stack 选项已弃用，
+      # 1.17 删除。生成器审计会拒绝再次写入 stack。
       dns_mode: hijack
       # Keep domestic direct sockets out of the TUN so sing-box cannot capture
       # its own Windows connections recursively.
@@ -36,6 +35,10 @@ config:
       enabled: true
       path: cache.db
       store_dns: true
+      # 1.15 起缓存写入先进内存缓冲（默认 1MB），缓冲满、内存压力或退出时
+      # 才落盘。定时 flush 限制异常退出（崩溃、强杀）时丢失的分组选择与
+      # DNS 缓存不超过一分钟。
+      flush_interval: 1m
 
 route_rules:
   - process_name:
