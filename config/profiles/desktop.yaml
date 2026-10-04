@@ -1,7 +1,5 @@
 schema_version: 1
 platform: windows
-# auto_detect_interface 在内核拨号时防止回环，不再由生成器解析节点并写死 /32 路由。
-resolve_node_ipv4: false
 embed_local_rule_sets: true
 strip_rule_set_initial_path: true
 
@@ -34,11 +32,6 @@ route_rules:
   - rule_set: microsoft-store
     action: route
     outbound: Available
-
-dns_rules:
-  - rule_set: microsoft-store
-    action: route
-    server: google
 
 rule_sets:
   - tag: microsoft-store

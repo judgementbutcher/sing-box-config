@@ -389,7 +389,7 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         raw_client = provider.get("http_client") or default_http_client
         client = clients_by_tag.get(raw_client, {}) if isinstance(raw_client, str) else (raw_client or {})
         dependencies = referenced_providers(str(client.get("detour") or ""))
-        resolver_tag = _default_resolver_for_client = _dns_resolver_tag(client.get("domain_resolver")) or default_resolver
+        resolver_tag = _dns_resolver_tag(client.get("domain_resolver")) or default_resolver
         resolver = servers_by_tag.get(resolver_tag, {})
         dependencies.update(referenced_providers(str(resolver.get("detour") or "")))
         if str(provider.get("tag")) in dependencies:
@@ -467,16 +467,6 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         errors.append(f"存在单节点或空 URLTest: {', '.join(singleton_urltests)}")
     if selector_cycles:
         errors.append(f"策略组存在循环引用: {'; '.join(selector_cycles)}")
-    # Shared members across Available/AI/Control auto pools are intentional and
-    # are reported via duplicate_urltest_members without failing the build.
-
-    max_nodes = int(limits.get("max_nodes") or 0)
-    max_urltest_members = int(limits.get("max_urltest_members") or 0)
-    if "max_nodes" in limits and max_nodes >= 0 and len(nodes) > max_nodes:
-        errors.append(f"代理节点 {len(nodes)} 超过档位上限 {max_nodes}")
-    if "max_urltest_members" in limits and max_urltest_members >= 0 and len(urltest_members) > max_urltest_members:
-        errors.append(f"URLTest 成员 {len(urltest_members)} 超过档位上限 {max_urltest_members}")
-
     insecure_nodes = sum(1 for item in nodes if is_insecure_outbound(item))
     if insecure_nodes:
         warnings.append(f"有 {insecure_nodes} 个节点关闭了 TLS 证书校验")

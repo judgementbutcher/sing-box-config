@@ -24,7 +24,7 @@ def test_audit_accepts_unique_disjoint_urltests():
             {"type": "block", "tag": "block"},
         ],
     }
-    report = audit_config(conf, {"max_nodes": 2, "max_urltest_members": 2})
+    report = audit_config(conf)
     assert report["ok"] is True
     assert report["counts"]["urltest_unique_members"] == 2
 

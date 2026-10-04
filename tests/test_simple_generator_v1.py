@@ -20,6 +20,14 @@ requires_local = pytest.mark.skipif(
 )
 
 
+# One resolver per role keeps derived DNS rules unexpanded (no race).
+SINGLE_UPSTREAMS = {
+    "domestic": [{"tag": "domestic", "server": "223.5.5.5", "server_name": "dns.alidns.com"}],
+    "proxy": [{"tag": "google", "server": "8.8.8.8", "server_name": "dns.google"}],
+    "proxy_detours": {"Available": ""},
+}
+
+
 def dns_matcher_covers(rule: dict, field: str, value: str) -> bool:
     """True when ``rule`` (plain or logical OR) matches ``value`` via ``field``."""
     if rule.get("type") == "logical":
@@ -208,18 +216,13 @@ def test_routing_rule_can_target_policy_owned_selector_without_recreating_it():
 
 
 @requires_local
-def test_current_sources_generate_small_valid_profiles(monkeypatch, tmp_path):
+def test_current_sources_generate_small_valid_profiles():
     policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
     sources = simple.load_sources(
         ROOT / "config" / "local" / "subscriptions.yaml",
         policy,
         offline=False,
         fetch_proxy=None,
-    )
-    monkeypatch.setattr(
-        simple,
-        "node_route_exclusions",
-        lambda _nodes: ["23.146.4.24/32", "156.239.11.161/32"],
     )
     custom = simple.load_yaml(ROOT / "config" / "local" / "custom-rules.yaml")
 
@@ -975,7 +978,7 @@ subscriptions:
 
 
 @requires_local
-def test_custom_rules_are_inserted_between_pre_rules_and_business(monkeypatch):
+def test_custom_rules_are_inserted_between_pre_rules_and_business():
     policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
     sources = simple.load_sources(
         ROOT / "config" / "local" / "subscriptions.yaml",
@@ -983,7 +986,6 @@ def test_custom_rules_are_inserted_between_pre_rules_and_business(monkeypatch):
         offline=False,
         fetch_proxy=None,
     )
-    monkeypatch.setattr(simple, "node_route_exclusions", lambda _nodes: ["192.0.2.1/32"])
     custom = {
         "schema_version": 1,
         "route_rules_front": [{"domain": ["front.example"], "action": "reject"}],
@@ -1007,8 +1009,7 @@ def test_custom_rules_are_inserted_between_pre_rules_and_business(monkeypatch):
 
 
 @requires_local
-def test_generated_json_contains_no_legacy_download_detour(monkeypatch, tmp_path):
-    monkeypatch.setattr(simple, "node_route_exclusions", lambda _nodes: ["192.0.2.1/32"])
+def test_generated_json_contains_no_legacy_download_detour(tmp_path):
     simple.generate("all", output_dir=tmp_path)
     for target in ("desktop", "android"):
         config_path = tmp_path / target / "config.json"
@@ -1050,9 +1051,8 @@ def test_managed_typed_matchers_build_typed_route_and_dns_rules():
         ai_node_tags=["Provider"],
     )
     policy = {
-        "selectors": {"available": "Available", "ai": "AI", "direct": "direct", "emby": "Emby"},
-        "dns_resolvers": {"domestic": "domestic", "proxy": "google"},
-        "config": {"dns": {"servers": [{"tag": "domestic"}, {"tag": "google"}]}},
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct"},
+        "dns_upstreams": SINGLE_UPSTREAMS,
     }
     managed = {
         "schema_version": 1,
@@ -1098,9 +1098,8 @@ def test_managed_rule_on_policy_selector_uses_proxy_dns():
         ai_node_tags=["Provider"],
     )
     policy = {
-        "selectors": {"available": "Available", "ai": "AI", "direct": "direct", "emby": "Emby"},
-        "dns_resolvers": {"domestic": "domestic", "proxy": "google"},
-        "config": {"dns": {"servers": [{"tag": "domestic"}, {"tag": "google"}]}},
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct"},
+        "dns_upstreams": SINGLE_UPSTREAMS,
     }
     managed = {
         "schema_version": 1,
@@ -1110,32 +1109,49 @@ def test_managed_rule_on_policy_selector_uses_proxy_dns():
     assert {"domain_suffix": ["openai.com"], "action": "route", "server": "google"} in conf["dns"]["rules"]
 
 
-def test_managed_dns_rules_are_skipped_when_no_servers_declared():
-    route, dns = simple.build_managed_rules(
-        {"groups": [{"tag": "direct", "domains": ["domain_suffix:deepseek.com"]}]},
-        "direct",
-        None,
-        None,
-    )
-    assert dns == []
-    assert route == [{"domain_suffix": ["deepseek.com"], "action": "route", "outbound": "direct"}]
+def test_derived_dns_rules_are_skipped_when_no_upstreams_declared():
+    rules = simple.build_managed_rules({"groups": [{"tag": "direct", "domains": ["domain_suffix:deepseek.com"]}]})
+    assert rules == [{"domain_suffix": ["deepseek.com"], "action": "route", "outbound": "direct"}]
+    assert simple.derive_dns_rules(rules, simple.build_dns_layout({})) == []
 
 
-def test_managed_dns_rules_follow_declared_resolver_tags():
-    """Resolvers come from policy.dns_resolvers, not from the server set order."""
-    _, dns = simple.build_managed_rules(
-        {
-            "groups": [
-                {"tag": "direct", "domains": ["domain_suffix:deepseek.com"]},
-                {"tag": "AI", "domains": ["domain_suffix:openai.com"]},
-            ]
-        },
-        "direct",
-        "domestic",
-        "google",
+def test_derived_dns_rules_follow_outbound_resolvers():
+    layout = simple.build_dns_layout(
+        {"dns_upstreams": {**SINGLE_UPSTREAMS, "proxy_detours": {"Available": "", "AI": "ai"}}}
     )
-    assert {"domain_suffix": ["deepseek.com"], "action": "route", "server": "domestic"} in dns
-    assert {"domain_suffix": ["openai.com"], "action": "route", "server": "google"} in dns
+    assert [server["tag"] for server in layout.servers] == ["domestic", "google", "google-ai"]
+    assert next(server for server in layout.servers if server["tag"] == "google-ai")["detour"] == "AI"
+    assert "detour" not in layout.servers[0]
+    dns = simple.derive_dns_rules(
+        [
+            {"domain_suffix": ["deepseek.com"], "action": "route", "outbound": "direct"},
+            {"domain_suffix": ["openai.com"], "action": "route", "outbound": "AI"},
+            # Outbounds without a dedicated resolver use the Available one.
+            {"domain_suffix": ["emby.example"], "action": "route", "outbound": "Emby"},
+            {"rule_set": ["spotify"], "action": "route", "outbound": "Spotify", "dns": "domestic"},
+            {"rule_set": ["ads"], "action": "reject"},
+            {"rule_set": ["geoip-cn"], "action": "route", "outbound": "direct", "dns": False},
+            {"ip_cidr": ["1.2.3.0/24"], "action": "route", "outbound": "direct"},
+            {"process_name": ["app.exe"], "action": "route", "outbound": "Available"},
+            {"action": "sniff"},
+        ],
+        layout,
+    )
+    assert dns == [
+        {"domain_suffix": ["deepseek.com"], "action": "route", "server": "domestic"},
+        {"domain_suffix": ["openai.com"], "action": "route", "server": "google-ai"},
+        {"domain_suffix": ["emby.example"], "action": "route", "server": "google"},
+        {"rule_set": ["spotify"], "action": "route", "server": "domestic"},
+        {"rule_set": ["ads"], "action": "predefined", "rcode": "NXDOMAIN"},
+    ]
+
+
+def test_derived_dns_rejects_mixed_route_only_matchers():
+    layout = simple.build_dns_layout({"dns_upstreams": SINGLE_UPSTREAMS})
+    with pytest.raises(ValueError, match="dns: false"):
+        simple.derive_dns_rules(
+            [{"domain_suffix": ["a.com"], "port": [443], "action": "route", "outbound": "direct"}], layout
+        )
 
 
 def test_dns_failover_expands_route_into_bounded_response_race():
@@ -1245,7 +1261,7 @@ def test_dns_failover_keeps_inverted_and_multi_field_matchers_as_branches():
     ]
 
 
-def test_dns_final_rules_are_appended_last():
+def test_dns_final_race_is_appended_last():
     source = simple.BuiltSource(
         name="provider",
         order=10,
@@ -1256,23 +1272,22 @@ def test_dns_final_rules_are_appended_last():
         ai_node_tags=["Provider"],
     )
     policy = {
-        "selectors": {"available": "Available", "ai": "AI", "direct": "direct", "emby": "Emby"},
-        "config": {
-            "dns": {
-                "final": "google",
-                "servers": [{"tag": "local"}, {"tag": "node-resolver"}, {"tag": "google"}],
-            }
-        },
-        "dns_rules": {
-            "business_rules": [{"domain_suffix": ["a.com"], "action": "route", "server": "google"}],
-            "domestic_rules": [{"domain_suffix": ["cn.com"], "action": "route", "server": "local"}],
-            "final_rules": [
-                {"action": "evaluate", "server": "node-resolver", "tag": "domestic"},
-                {"action": "evaluate", "server": "google", "tag": "foreign"},
-                {"match_response": "domestic", "action": "route", "server": "node-resolver", "race": True},
-                {"match_response": "foreign", "action": "route", "server": "google", "race": True},
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct"},
+        "dns_upstreams": {
+            "domestic": [{"tag": "cn", "server": "223.5.5.5", "server_name": "dns.alidns.com"}],
+            "proxy": [
+                {"tag": "google", "server": "8.8.8.8", "server_name": "dns.google"},
+                {"tag": "cloudflare", "server": "1.1.1.1", "server_name": "cloudflare-dns.com"},
             ],
+            "proxy_detours": {"Available": ""},
         },
+        "config": {"dns": {"final": "google"}},
+        "route": {
+            "business_rules": [{"domain_suffix": ["a.cn"], "action": "route", "outbound": "direct"}],
+            # Same resolver as dns.final: folded into the trailing catch-all race.
+            "domestic_rules": [{"rule_set": ["foreign"], "action": "route", "outbound": "Available"}],
+        },
+        "rule_sets": [{"tag": "foreign", "type": "inline", "rules": [{"domain_suffix": ["a.com"]}]}],
     }
     conf = simple.build_config(
         "desktop",
@@ -1282,55 +1297,36 @@ def test_dns_final_rules_are_appended_last():
         [source],
     )
     rules = conf["dns"]["rules"]
-    assert rules[-4:] == policy["dns_rules"]["final_rules"]
-    # final_rules sit after domestic rules, so they only see unmatched queries.
-    assert {"domain_suffix": ["cn.com"], "action": "route", "server": "local"} == rules[-5]
-    assert {"domain_suffix": ["a.com"], "action": "route", "server": "google"} == rules[-6]
-
-
-def test_policy_dns_fallback_stays_on_proxy_path():
-    """Unknown proxy-routed domains must never be sent to a domestic resolver."""
-    policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
-    final_rules = policy["dns_rules"]["final_rules"]
-
-    evaluates = [rule for rule in final_rules if rule.get("action") == "evaluate"]
-    responders = [rule for rule in final_rules if rule.get("action") == "respond"]
-    assert {rule["server"] for rule in evaluates} == {"google", "cloudflare"}
-    assert {
-        server["detour"]
-        for server in policy["config"]["dns"]["servers"]
-        if server["tag"] in {"google", "cloudflare"}
-    } == {"Available"}
-    assert {rule["match_response"] for rule in responders} == {
-        rule["tag"] for rule in evaluates
+    assert rules[0] == {"domain_suffix": ["a.cn"], "action": "route", "server": "cn"}
+    # Unknown domains race both proxy resolvers and never reach the domestic one.
+    assert rules[1:] == [
+        {"action": "evaluate", "server": "google", "tag": "failover-1-google", "timeout": "2s"},
+        {"action": "evaluate", "server": "cloudflare", "tag": "failover-1-cloudflare", "timeout": "2s"},
+        {"match_response": "failover-1-google", "response_rcode": "NOERROR", "action": "respond", "race": True},
+        {"match_response": "failover-1-cloudflare", "response_rcode": "NOERROR", "action": "respond", "race": True},
+        {"match_response": "failover-1-google", "response_rcode": "NXDOMAIN", "action": "respond"},
+        {"match_response": "failover-1-cloudflare", "response_rcode": "NXDOMAIN", "action": "respond"},
+        {"action": "predefined", "rcode": "SERVFAIL"},
+    ]
+    assert {server["detour"] for server in conf["dns"]["servers"] if server["tag"] in {"google", "cloudflare"}} == {
+        "Available"
     }
-    assert all(
-        rule.get("race") is True
-        for rule in responders
-        if rule.get("response_rcode") == "NOERROR"
-    )
-    first_reference = next(i for i, rule in enumerate(final_rules) if rule.get("match_response"))
-    assert all(final_rules.index(rule) < first_reference for rule in evaluates)
-    assert final_rules[-1] == {"action": "predefined", "rcode": "SERVFAIL"}
-    assert simple.expand_dns_failover_rules(final_rules, policy.get("dns_failover")) == final_rules
+
+
+def test_profiles_reject_hand_written_dns_rules():
+    with pytest.raises(ValueError, match="dns_rules_front"):
+        simple.assemble_rules({}, {}, {"dns_rules_front": []}, {})
 
 
 def test_china_domain_rules_precede_foreign_fallbacks():
     """New Chinese TLDs stay direct even before remote geosite updates."""
     policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
     route_rules = policy["route"]["domestic_rules"]
-    dns_rules = policy["dns_rules"]["domestic_rules"]
-    cn_suffixes = {"cn", "xn--fiqs8s"}
 
     route_suffix_rule = next(rule for rule in route_rules if rule.get("domain_suffix") == ["cn", "xn--fiqs8s"])
-    dns_suffix_rule = next(rule for rule in dns_rules if rule.get("domain_suffix") == ["cn", "xn--fiqs8s"])
     route_cn_index = next(i for i, rule in enumerate(route_rules) if rule.get("rule_set") == ["geosite-cn"])
     route_foreign_index = next(i for i, rule in enumerate(route_rules) if rule.get("rule_set") == ["geosite-geolocation-!cn"])
-    dns_cn_index = next(i for i, rule in enumerate(dns_rules) if rule.get("rule_set") == ["geosite-cn"])
-    dns_foreign_index = next(i for i, rule in enumerate(dns_rules) if rule.get("rule_set") == ["geosite-geolocation-!cn"])
 
-    assert set(route_suffix_rule["domain_suffix"]) == cn_suffixes
     assert route_suffix_rule["outbound"] == "direct"
-    assert dns_suffix_rule["server"] == "domestic"
+    assert "dns" not in route_suffix_rule
     assert route_cn_index < route_foreign_index
-    assert dns_cn_index < dns_foreign_index

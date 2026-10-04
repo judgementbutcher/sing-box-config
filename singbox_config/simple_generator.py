@@ -9,7 +9,6 @@ import hashlib
 import ipaddress
 import json
 import re
-import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +41,6 @@ DEFAULT_CUSTOM_RULES = ROOT / "config" / "local" / "custom-rules.yaml"
 DEFAULT_ROUTING_GROUPS = ROOT / "config" / "local" / "routing-groups.json"
 DEFAULT_OUTPUT = ROOT / "dist"
 DEFAULT_CACHE_DIR = ROOT / "runtime" / "subscription-cache"
-NODE_ADDRESS_CACHE = ROOT / "runtime" / "node-address-cache.json"
 PROFILE_PATHS = {
     "desktop": ROOT / "config" / "profiles" / "desktop.yaml",
     "android": ROOT / "config" / "profiles" / "android.yaml",
@@ -597,7 +595,6 @@ def build_outbounds(
     native = bool_value((policy.get("providers") or {}).get("enabled"), False)
     native_sources = [source for source in sources if native and source.provider]
     static_sources = [source for source in sources if not (native and source.provider)]
-    nodes = [node for source in static_sources for node in source.nodes]
     bootstrap = provider_bootstrap(sources, policy) if native_sources else None
 
     def dynamic_tag(source: BuiltSource, tag: str) -> str:
@@ -614,61 +611,14 @@ def build_outbounds(
                 f"{source.name}: 允许 insecure 的动态订阅不能保证 AI 节点刷新后的 TLS 边界；"
                 "请设置 ai: false、allow_insecure: false 或 provider: false"
             )
-    region_groups: list[dict[str, Any]] = []
-    region_group_tags: list[str] = []
-    for raw_group in as_list(selectors.get("region_groups")):
-        if not isinstance(raw_group, dict):
-            raise ValueError("selectors.region_groups 的每一项必须是对象")
-        tag = str(raw_group.get("tag") or "").strip()
-        raw_regions = raw_group.get("regions", raw_group.get("region"))
-        regions = [str(value).strip().upper() for value in as_list(raw_regions) if str(value).strip()]
-        if not tag or not regions:
-            raise ValueError("selectors.region_groups 必须同时设置 tag 和 regions")
-        members = [
-            str(node.get("tag"))
-            for node in nodes
-            if node.get("tag") and detect_region(str(node.get("tag"))) in regions
-        ]
-        provider_members = [
-            (source, dynamic_tag(source, str(node["tag"])))
-            for source in native_sources
-            for node in source.nodes
-            if node.get("tag") and detect_region(str(node["tag"])) in regions
-        ]
-        if not members and not provider_members:
-            raise ValueError(f"地区分组 {tag} 没有匹配到 {','.join(regions)} 节点")
-        if provider_members and not members:
-            raise ValueError(f"地区分组 {tag} 需要一个同地区的独立节点作为空 Provider 后备")
-        region_group_tags.append(tag)
-        region_groups.append(
-            {
-                "type": "selector",
-                "tag": tag,
-                "outbounds": members,
-                **({"default": members[0]} if members and not provider_members else {}),
-                **({
-                    "providers": list(dict.fromkeys(str(source.provider["tag"]) for source, _ in provider_members)),
-                    "include": "^(?:" + "|".join(re.escape(tag) for _, tag in provider_members) + ")$",
-                } if provider_members else {}),
-                "interrupt_exist_connections": interrupt,
-            }
-        )
     # Ungrouped multi-node sources expose every node to the top-level selector;
     # grouped sources continue to expose their selector entry only.
-    source_entries = [
+    available_entries = [
         tag
         for source in sources
         if not (native and source.provider and not source.groups)
         for tag in (source.node_tags if len(source.node_tags) > 1 and not source.groups else [source.entry_tag])
     ]
-    # Keep the existing default entry stable; region groups are additional
-    # manual choices exposed by the top-level selector.
-    profile_available_entries = [
-        str(tag).strip()
-        for tag in as_list(profile.get("available_outbounds"))
-        if str(tag).strip()
-    ]
-    available_entries = [*source_entries, *region_group_tags, *profile_available_entries]
     ai_entries = list(dict.fromkeys(tag for source in static_sources for tag in source.ai_node_tags))
     if native_ai and not ai_entries:
         raise ValueError("动态 AI 分组需要一个通过 AI 筛选的独立节点作为空 Provider 后备")
@@ -693,16 +643,6 @@ def build_outbounds(
     direct_tag = str(selectors.get("direct") or "direct")
     available_tag = str(selectors.get("available") or "Available")
     ai_tag = str(selectors.get("ai") or "AI")
-    emby_tag = str(selectors.get("emby") or "Emby")
-    youtube_tag = str(selectors.get("youtube") or "YouTube")
-    spotify_tag = str(selectors.get("spotify") or "Spotify")
-    telegram_tag = str(selectors.get("telegram") or "Telegram")
-    twitch_tag = str(selectors.get("twitch") or "Twitch")
-    google_play_tag = str(selectors.get("google_play") or "Google Play")
-    direct_outbound: dict[str, Any] = {"type": "direct", "tag": direct_tag}
-    direct_interface = str(profile.get("direct_interface") or "").strip()
-    if direct_interface:
-        direct_outbound["bind_interface"] = direct_interface
     # Provider refresh must not turn the user's global choice into URLTest.
     # Keep grouped subscriptions nested and allow explicit standalone choices.
     available: dict[str, Any] = {
@@ -733,67 +673,33 @@ def build_outbounds(
             } if native_ai else {}),
             "interrupt_exist_connections": interrupt,
         },
-        direct_outbound,
-        {
-            "type": "selector",
-            "tag": emby_tag,
-            "outbounds": list(dict.fromkeys([available_tag, *available_entries, direct_tag])),
-            "default": available_tag,
-            "interrupt_exist_connections": interrupt,
-        },
-        # YouTube exposes the same entries as Available plus Available itself as
-        # the default, so it tracks the global choice until a user pins a
-        # specific node for video traffic.
-        {
-            "type": "selector",
-            "tag": youtube_tag,
-            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
-            "default": available_tag,
-            "interrupt_exist_connections": interrupt,
-        },
-        # Spotify keeps direct as the default member: the account-region check
-        # judges the egress IP, and datacentre proxy exits get rejected (see
-        # policy.yaml). Proxy nodes stay selectable in the panel.
-        {
-            "type": "selector",
-            "tag": spotify_tag,
-            "outbounds": list(dict.fromkeys([direct_tag, available_tag, *available_entries])),
-            "default": direct_tag,
-            "interrupt_exist_connections": interrupt,
-        },
-        # Telegram and the profile-scoped groups below are proxy-only: their
-        # traffic must never silently fall back to direct.
-        {
-            "type": "selector",
-            "tag": telegram_tag,
-            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
-            "default": available_tag,
-            "interrupt_exist_connections": interrupt,
-        },
-        # Twitch mirrors Telegram: proxy-only, tracks Available until a node
-        # is pinned for stream quality in the panel.
-        {
-            "type": "selector",
-            "tag": twitch_tag,
-            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
-            "default": available_tag,
-            "interrupt_exist_connections": interrupt,
-        },
+        {"type": "direct", "tag": direct_tag},
     ]
-    # Profile-scoped selectors (Google Play on Android) are generated only when
-    # a profile rule hands traffic to them, so the desktop panel never shows an
-    # empty group.
-    if profile_references_outbound(profile, google_play_tag):
+    # Service groups expose Available plus its entries and follow Available by
+    # default, so they only diverge once a node is pinned in the panel.
+    for raw_group in as_list(selectors.get("groups")):
+        if not isinstance(raw_group, Mapping) or not str(raw_group.get("tag") or "").strip():
+            raise ValueError("selectors.groups 的每一项必须是带 tag 的对象")
+        tag = str(raw_group["tag"]).strip()
+        if bool_value(raw_group.get("when_referenced")) and not profile_references_outbound(profile, tag):
+            continue
+        direct_mode = str(raw_group.get("direct") or "").strip()
+        if direct_mode not in {"", "last", "default"}:
+            raise ValueError(f"selectors.groups[{tag}].direct 只能是 last 或 default")
+        members = [available_tag, *available_entries]
+        if direct_mode == "last":
+            members.append(direct_tag)
+        elif direct_mode == "default":
+            members.insert(0, direct_tag)
         outbounds.append(
             {
                 "type": "selector",
-                "tag": google_play_tag,
-                "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
-                "default": available_tag,
+                "tag": tag,
+                "outbounds": list(dict.fromkeys(members)),
+                "default": members[0],
                 "interrupt_exist_connections": interrupt,
             }
         )
-    outbounds.extend(region_groups)
     for source in sources:
         for group in copy.deepcopy(source.groups):
             if bool_value((policy.get("providers") or {}).get("enabled"), False) and source.provider:
@@ -807,18 +713,11 @@ def build_outbounds(
             outbounds.append(group)
     for source in static_sources:
         outbounds.extend(copy.deepcopy(source.nodes))
-    outbounds.extend(copy.deepcopy(as_list(profile.get("static_outbounds"))))
     known_tags = {
         str(outbound.get("tag"))
         for outbound in outbounds
         if isinstance(outbound, dict) and outbound.get("tag")
     }
-    unknown_profile_entries = [tag for tag in profile_available_entries if tag not in known_tags]
-    if unknown_profile_entries:
-        raise ValueError(
-            "profile.available_outbounds 引用了不存在的出站: "
-            + ", ".join(unknown_profile_entries)
-        )
     managed_outbounds: list[dict[str, Any]] = []
     managed_tags: set[str] = set()
     for raw_group in as_list((routing_groups or {}).get("groups")):
@@ -885,7 +784,7 @@ def provider_bootstrap(sources: Sequence[BuiltSource], policy: Mapping[str, Any]
 def profile_references_outbound(profile: Mapping[str, Any], tag: str) -> bool:
     """True when a profile route rule hands traffic to ``tag``.
 
-    Profile-scoped selectors (Google Play on Android) must only exist on the
+    ``when_referenced`` groups (Google Play on Android) must only exist on the
     platforms whose rules reference them; emitting them everywhere would show
     an unused group in the other platform's panel.
     """
@@ -968,7 +867,10 @@ def _merge_dns_matchers(matchers: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     Rules made of one list-valued field are folded together per field; any
     other matcher (multi-field AND rules, inverted rules, logical rules) stays
     a separate branch.  More than one branch becomes a ``logical`` OR rule.
+    An empty (catch-all) matcher absorbs every other branch.
     """
+    if any(not matcher for matcher in matchers):
+        return {}
     merged_lists: dict[str, list[Any]] = {}
     branches: list[dict[str, Any]] = []
     for matcher in matchers:
@@ -1146,28 +1048,13 @@ def parse_route_matcher(value: str) -> tuple[str, str]:
     return kind, payload
 
 
-def build_managed_rules(
-    routing_groups: Mapping[str, Any] | None,
-    direct_tag: str,
-    domestic_server: str | None,
-    proxy_server: str | None,
-    group_servers: Mapping[str, str] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Turn routing-groups domains into typed route + DNS rules.
+def build_managed_rules(routing_groups: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Turn routing-groups domains into one typed route rule per matcher kind.
 
-    Each group yields one route rule per matcher kind; domains routed to the
-    ``direct`` outbound also get a domestic-DNS rule so resolution cannot leak
-    through the proxy DNS.  DNS rules are only emitted for servers that the
-    policy actually declares, and never for IP matchers.  Empty groups produce
-    nothing.
-
-    The two resolver tags come from ``policy.dns_resolvers`` rather than being
-    guessed from the declared server set: guessing used to fall back to
-    ``next(iter(server_pool))``, whose set ordering would silently point rules
-    at an arbitrary resolver.
+    DNS rules are derived from these route rules like every other policy rule,
+    so domains routed to ``direct`` resolve through the domestic resolver.
     """
     route_rules: list[dict[str, Any]] = []
-    dns_rules: list[dict[str, Any]] = []
     for raw_group in as_list((routing_groups or {}).get("groups")):
         if not isinstance(raw_group, dict):
             continue
@@ -1183,12 +1070,7 @@ def build_managed_rules(
             if not members:
                 continue
             route_rules.append({kind: members, "action": "route", "outbound": tag})
-            if kind == "ip_cidr":
-                continue
-            server = domestic_server if tag == direct_tag else (group_servers or {}).get(tag, proxy_server)
-            if server:
-                dns_rules.append({kind: members, "action": "route", "server": server})
-    return route_rules, dns_rules
+    return route_rules
 
 
 def build_rule_sets(
@@ -1233,61 +1115,118 @@ def build_rule_sets(
     return result
 
 
-def read_node_address_cache() -> dict[str, list[str]]:
-    try:
-        data = json.loads(NODE_ADDRESS_CACHE.read_text(encoding="utf-8"))
-        hosts = data.get("hosts") if isinstance(data, dict) else None
-        return hosts if isinstance(hosts, dict) else {}
-    except Exception:
-        return {}
+@dataclass
+class DnsLayout:
+    """DoH servers rendered from ``policy.dns_upstreams`` and their roles."""
+
+    servers: list[dict[str, Any]]
+    # Primary tag -> every server raced for it (see expand_dns_failover_rules).
+    failover: dict[str, list[str]]
+    # Outbound tag -> resolver whose detour matches that outbound.
+    by_outbound: dict[str, str]
+    proxy: str | None
+    timeout: str
 
 
-def node_route_exclusions(nodes: Sequence[Mapping[str, Any]]) -> list[str]:
-    cached = read_node_address_cache()
-    updated = copy.deepcopy(cached)
-    addresses: list[str] = []
-    for node in nodes:
-        server = str(node.get("server") or "").strip()
-        if not server:
-            continue
-        try:
-            ip = ipaddress.ip_address(server)
-            if ip.version == 4:
-                addresses.append(f"{ip}/32")
-            continue
-        except ValueError:
-            pass
-        resolved: list[str] = []
-        try:
-            for item in socket.getaddrinfo(server, None, type=socket.SOCK_STREAM):
-                ip = ipaddress.ip_address(item[4][0])
-                if ip.version == 4:
-                    resolved.append(f"{ip}/32")
-        except OSError:
-            resolved = [str(value) for value in cached.get(server, [])]
-        resolved = list(dict.fromkeys(resolved))
-        if not resolved:
-            raise RuntimeError(f"节点域名无法解析且没有缓存: {server}")
-        updated[server] = resolved
-        addresses.extend(resolved)
-    NODE_ADDRESS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(NODE_ADDRESS_CACHE, {"version": 1, "hosts": updated})
-    unique = list(dict.fromkeys(addresses))
-    return sorted(unique, key=lambda value: int(ipaddress.ip_network(value, strict=False).network_address))
+def build_dns_layout(policy: Mapping[str, Any]) -> DnsLayout:
+    upstreams = policy.get("dns_upstreams")
+    if not isinstance(upstreams, Mapping):
+        return DnsLayout([], {}, {}, None, "2s")
+    selectors = policy.get("selectors") or {}
+    direct_tag = str(selectors.get("direct") or "direct")
+    available_tag = str(selectors.get("available") or "Available")
 
+    def render(entry: Any, suffix: str = "", detour: str | None = None) -> dict[str, Any]:
+        if not isinstance(entry, Mapping) or not all(entry.get(key) for key in ("tag", "server", "server_name")):
+            raise ValueError("dns_upstreams 的每一项必须包含 tag、server 和 server_name")
+        server: dict[str, Any] = {
+            "type": "https",
+            "tag": f"{entry['tag']}-{suffix}" if suffix else str(entry["tag"]),
+            "server": str(entry["server"]),
+            "server_port": int(entry.get("server_port") or 443),
+            "path": str(entry.get("path") or "/dns-query"),
+            "tls": {"enabled": True, "server_name": str(entry["server_name"])},
+        }
+        if detour:
+            server["detour"] = detour
+        return server
 
-def apply_route_exclusions(conf: dict[str, Any], nodes: Sequence[Mapping[str, Any]]) -> None:
-    exclusions = node_route_exclusions(nodes)
-    for inbound in conf.get("inbounds", []):
-        if isinstance(inbound, dict) and inbound.get("type") == "tun":
-            configured = [
-                str(value).strip()
-                for value in as_list(inbound.get("route_exclude_address"))
-                if str(value).strip()
-            ]
-            inbound["route_exclude_address"] = list(dict.fromkeys([*configured, *exclusions]))
+    servers: list[dict[str, Any]] = []
+    failover: dict[str, list[str]] = {}
+    by_outbound: dict[str, str] = {}
+
+    def add_race(outbound: str, legs: list[dict[str, Any]]) -> None:
+        if not legs:
             return
-    raise ValueError("桌面 profile 缺少 TUN inbound")
+        servers.extend(legs)
+        failover[legs[0]["tag"]] = [leg["tag"] for leg in legs]
+        by_outbound[outbound] = legs[0]["tag"]
+
+    add_race(direct_tag, [render(entry) for entry in as_list(upstreams.get("domestic"))])
+    detours = upstreams.get("proxy_detours") or {}
+    if not isinstance(detours, Mapping):
+        raise ValueError("dns_upstreams.proxy_detours 必须是 出站: 后缀 的映射")
+    for outbound, suffix in detours.items():
+        add_race(
+            str(outbound),
+            [render(entry, str(suffix or "").strip(), str(outbound)) for entry in as_list(upstreams.get("proxy"))],
+        )
+    return DnsLayout(
+        servers=servers,
+        failover=failover,
+        by_outbound=by_outbound,
+        proxy=by_outbound.get(available_tag),
+        timeout=str(upstreams.get("timeout") or "2s"),
+    )
+
+
+ROUTE_ACTION_FIELDS = {"action", "outbound", "method", "no_drop", "dns"}
+DNS_DOMAIN_FIELDS = {"domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set"}
+DNS_MATCHER_FIELDS = DNS_DOMAIN_FIELDS | PROCESS_RULE_KEYS | PACKAGE_RULE_KEYS | {"invert", "type", "mode", "rules"}
+
+
+def _matcher_fields(rule: Mapping[str, Any]) -> set[str]:
+    fields = set(rule)
+    for child in as_list(rule.get("rules")):
+        if isinstance(child, Mapping):
+            fields |= _matcher_fields(child)
+    return fields
+
+
+def derive_dns_rules(rules: Sequence[Mapping[str, Any]], layout: DnsLayout) -> list[dict[str, Any]]:
+    """Pair every domain route rule with the DNS rule for the same egress.
+
+    ``route`` resolves through the resolver detoured via the same outbound
+    (direct -> domestic, AI -> google-ai, ...), falling back to the Available
+    resolver; ``reject`` answers NXDOMAIN.  A rule's ``dns`` key overrides the
+    resolver, and ``dns: false`` opts out (IP rule sets such as geoip-cn).
+    """
+    if not layout.servers:
+        return []
+    derived: list[dict[str, Any]] = []
+    for rule in rules:
+        override = rule.get("dns")
+        if override is False:
+            continue
+        matcher = {key: copy.deepcopy(value) for key, value in rule.items() if key not in ROUTE_ACTION_FIELDS}
+        fields = _matcher_fields(matcher)
+        if override is None and not fields & DNS_DOMAIN_FIELDS:
+            continue
+        unsupported = sorted(fields - DNS_MATCHER_FIELDS)
+        if unsupported:
+            raise ValueError(f"路由规则含 DNS 不支持的匹配字段 {', '.join(unsupported)}，请设置 dns: false: {dict(rule)}")
+        action = str(rule.get("action") or "route")
+        if override is None and action == "reject":
+            derived.append({**matcher, "action": "predefined", "rcode": "NXDOMAIN"})
+            continue
+        if override is None and action != "route":
+            continue
+        server = str(override).strip() if override is not None else (
+            layout.by_outbound.get(str(rule.get("outbound") or "")) or layout.proxy
+        )
+        if server:
+            derived.append({**matcher, "action": "route", "server": server})
+    return derived
 
 
 def assemble_rules(
@@ -1296,43 +1235,50 @@ def assemble_rules(
     profile: Mapping[str, Any],
     custom: Mapping[str, Any],
     routing_groups: Mapping[str, Any] | None = None,
+    layout: DnsLayout | None = None,
 ) -> None:
     platform = str(profile.get("platform") or "")
+    for legacy in ("dns_rules", "dns_rules_front"):
+        if legacy in profile:
+            raise ValueError(f"profile 不再支持 {legacy}：DNS 规则由 route 规则自动推导，需要覆盖时在规则上写 dns")
+    layout = layout or build_dns_layout(policy)
     route_policy = policy.get("route", {})
-    dns_policy = policy.get("dns_rules", {})
-    direct_tag = str(policy.get("selectors", {}).get("direct") or "direct")
-    resolvers = policy.get("dns_resolvers") or {}
-    if not isinstance(resolvers, Mapping):
-        resolvers = {}
-    domestic_server = str(resolvers.get("domestic") or "").strip() or None
-    proxy_server = str(resolvers.get("proxy") or "").strip() or None
-    managed_rules, managed_dns_rules = build_managed_rules(
-        routing_groups, direct_tag, domestic_server, proxy_server, resolvers.get("groups")
-    )
-    conf.setdefault("route", {})["rules"] = [
+    profile_front = filtered_rules(profile.get("route_rules_front"), platform)
+    pre_rules = filtered_rules(route_policy.get("pre_rules"), platform)
+    managed_rules = build_managed_rules(routing_groups)
+    profile_rules = filtered_rules(profile.get("route_rules"), platform)
+    business_rules = filtered_rules(route_policy.get("business_rules"), platform)
+    domestic_rules = filtered_rules(route_policy.get("domestic_rules"), platform)
+    route_rules = [
         *filtered_rules(custom.get("route_rules_front"), platform),
-        *filtered_rules(profile.get("route_rules_front"), platform),
-        *filtered_rules(route_policy.get("pre_rules"), platform),
+        *profile_front,
+        *pre_rules,
         *managed_rules,
         *filtered_rules(custom.get("route_rules"), platform),
-        *filtered_rules(profile.get("route_rules"), platform),
-        *filtered_rules(route_policy.get("business_rules"), platform),
-        *filtered_rules(route_policy.get("domestic_rules"), platform),
+        *profile_rules,
+        *business_rules,
+        *domestic_rules,
+    ]
+    conf.setdefault("route", {})["rules"] = [
+        {key: value for key, value in rule.items() if key != "dns"} for rule in route_rules
     ]
     dns_rules = [
-        *filtered_rules(profile.get("dns_rules_front"), platform),
-        *filtered_rules(dns_policy.get("pre_rules"), platform),
-        *managed_dns_rules,
+        *derive_dns_rules(profile_front, layout),
+        *derive_dns_rules(pre_rules, layout),
+        *derive_dns_rules(managed_rules, layout),
+        # custom-rules.yaml keeps its explicit DNS rules.
         *filtered_rules(custom.get("dns_rules"), platform),
-        *filtered_rules(profile.get("dns_rules"), platform),
-        *filtered_rules(dns_policy.get("business_rules"), platform),
-        *filtered_rules(dns_policy.get("domestic_rules"), platform),
-        # 兜底规则：只处理未命中上方任何规则的查询。当前用于 DNS 竞速
-        #（evaluate + race），两者都不命中时才由 dns.final 兜底。
-        *filtered_rules(dns_policy.get("final_rules"), platform),
+        *derive_dns_rules(profile_rules, layout),
+        *derive_dns_rules(business_rules, layout),
+        *derive_dns_rules(domestic_rules, layout),
     ]
+    # Unmatched queries race through dns.final's resolvers instead of falling
+    # through to a single server.
+    final = str(conf.get("dns", {}).get("final") or "")
+    if final in layout.failover:
+        dns_rules.append({"action": "route", "server": final})
     conf.setdefault("dns", {})["rules"] = expand_dns_failover_rules(
-        dns_rules, policy.get("dns_failover")
+        dns_rules, {"timeout": layout.timeout, "servers": layout.failover}
     )
 
 
@@ -1367,10 +1313,10 @@ def build_config(
     if providers:
         conf["providers"] = copy.deepcopy(providers)
     conf.setdefault("route", {})["rule_set"] = build_rule_sets(policy, profile, custom)
-    assemble_rules(conf, policy, profile, custom, routing_groups)
-    nodes = [node for source in sources for node in source.nodes]
-    if bool_value(profile.get("resolve_node_ipv4")):
-        apply_route_exclusions(conf, nodes)
+    layout = build_dns_layout(policy)
+    dns = conf.setdefault("dns", {})
+    dns["servers"] = [*copy.deepcopy(layout.servers), *as_list(dns.get("servers"))]
+    assemble_rules(conf, policy, profile, custom, routing_groups, layout)
     require_valid_config(
         conf,
         {

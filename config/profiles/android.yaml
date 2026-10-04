@@ -1,6 +1,5 @@
 schema_version: 1
 platform: android
-resolve_node_ipv4: false
 strip_rule_set_initial_path: true
 
 config:
@@ -49,11 +48,6 @@ route_rules:
   - rule_set: google-play
     action: route
     outbound: Google Play
-
-dns_rules_front:
-  - rule_set: google-play
-    action: route
-    server: google
 
 rule_sets:
   - tag: google-play

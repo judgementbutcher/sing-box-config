@@ -574,8 +574,15 @@ function Get-PolicyStrategyTags {
         if ($line -match '^selectors:\s*$') { $inSelectors = $true; continue }
         if ($inSelectors -and $line -match '^\S') { break }
         if (-not $inSelectors) { continue }
-        if ($line -match '^\s{2}(available|ai|emby|youtube):\s*(.+?)\s*$') {
-            $value = $Matches[2].Trim().Trim('"''')
+        $value = $null
+        if ($line -match '^\s{2}(available|ai):\s*(.+?)\s*$') {
+            $value = $Matches[2]
+        } elseif ($line -match '^\s{4}-\s*\{?\s*tag:\s*([^,}]+)' -and $line -notmatch 'when_referenced:\s*true') {
+            # Groups generated only on some platforms cannot be rule targets everywhere.
+            $value = $Matches[1]
+        }
+        if ($value) {
+            $value = $value.Trim().Trim('"''')
             if ($value -and $value -notin $result) { $result += $value }
         }
     }

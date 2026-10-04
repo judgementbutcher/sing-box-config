@@ -146,16 +146,17 @@ rule_sets: []
 
 规则的公共部分在 `config\policy.yaml`：
 
-- `route.business_rules` 控制连接走向；`outbound: direct` 表示直连，`Available`/`AI`/`Emby`/`YouTube`/`Spotify`/`Telegram` 表示交给对应策略组。`YouTube`/`Telegram` 组的成员与 `Available` 相同，默认跟随 `Available`，可以在面板里单独指定节点而不影响其他流量；`Spotify` 组默认 `direct`（账号地区校验拒绝机房出口），需要时再切到代理。`AI` 组的成员由 `selectors.ai_regions` 白名单决定（当前 US/JP/SG/TW，香港等被上游封锁的地区不会进入）。安卓专用的 `Google Play` 分组只在有规则引用它时生成（桌面端不出现）。
-- `dns_rules.business_rules` 控制域名解析使用的 DNS；直连域名配 `server: domestic`，需要代理解析时配 `server: google`。
-- 国内分流先匹配 `china-direct`、`.cn`/`.中国` 后缀和 `geosite-cn`，再匹配 `geosite-geolocation-!cn`；新注册的中国域名即使暂未进入规则集也会直连并使用国内 DNS。未命中这些条件的域名仍按代理兜底处理。
-- `dns_failover` 将显式 DNS 分流展开为同路径双解析器竞速；相邻且解析器相同的规则会合并成一个竞速块（`evaluate` ×2 → `respond NOERROR` ×2 → `respond NXDOMAIN` ×2 → `SERVFAIL`）。响应规则只保留 `match_response` 与响应码，不重复原始域名匹配；成功响应竞速返回，NXDOMAIN 要等两路成功响应都未返回后再接受。只合并相邻规则，不同解析器规则之间的先后优先级不变，所以 `policy.yaml` 里把同解析器的规则排在一起即可减少生成的规则数。
-- YouTube 域名使用 `google-youtube`/`cloudflare-youtube` 两个解析器，它们的 `detour` 是 `YouTube` 分组而不是 `Available`：Google 按解析出口所在地分配视频边缘，解析与播放必须走同一出口。`YouTube` 分组默认跟随 `Available`，此时两者等价。
-- `dns_rules.final_rules` 只处理未命中的域名：Google 与 Cloudflare 两条代理内 DoH 竞速，不再同时向国内解析器发送未知域名。国内直连域名仍由显式规则交给 AliDNS/DNSPod；双路失败时返回 `SERVFAIL`，不再重复查询。
+- `route.business_rules`/`route.domestic_rules` 控制连接走向，按文件顺序匹配，越靠前优先级越高；`outbound: direct` 表示直连，其余值表示交给对应策略组。
+- 业务策略组在 `selectors.groups` 中声明（当前 `Emby`/`YouTube`/`Spotify`/`Telegram`/`Twitch`/`Google Play`）：成员是 `Available` 及其全部条目，默认跟随 `Available`，可以在面板里单独指定节点而不影响其他流量。`direct: last` 在成员末尾追加直连（Emby），`direct: default` 默认直连（Spotify，账号地区校验拒绝机房出口）；`when_referenced: true` 的分组只在 profile 规则引用时生成（`Google Play` 只出现在安卓端）。`AI` 组的成员由 `selectors.ai_regions` 白名单决定（当前 US/JP/SG/TW，香港等被上游封锁的地区不会进入）。
+- DNS 规则不再单独书写，而是由路由规则自动推导：含域名匹配（`domain*`/`rule_set`）的 `route` 规则使用与出口相同的解析器（`direct` → 国内 DoH，`AI`/`YouTube`/`Twitch` → 经该分组出站的专用 DoH，其余 → 经 `Available` 的 DoH），`reject` 规则返回 NXDOMAIN。规则上写 `dns: <解析器>` 可覆盖（Spotify 固定国内解析），写 `dns: false` 不生成 DNS 规则（`geoip-cn` 这类 IP 规则集）。
+- `dns_upstreams` 声明 DoH 解析器模板：`domestic` 为直连的 AliDNS/DNSPod，`proxy` 为 Google/Cloudflare，按 `proxy_detours` 为每个出口展开一组（例如 `google-youtube`/`cloudflare-youtube` 经 `YouTube` 出站，Google 按解析出口分配视频边缘，解析与播放必须同一出口）。
+- 同组解析器并行竞速；相邻且解析器相同的规则合并成一个竞速块（`evaluate` ×2 → `respond NOERROR` ×2 → `respond NXDOMAIN` ×2 → `SERVFAIL`）。成功响应竞速返回，NXDOMAIN 要等两路成功响应都未返回后再接受。只合并相邻规则，所以 `policy.yaml` 里把同出口的规则排在一起即可减少生成的规则数。
+- 未命中任何规则的域名由 `dns.final`（Google/Cloudflare 经 `Available`）竞速解析，不向国内解析器发送未知域名；双路失败时返回 `SERVFAIL`。
+- 国内分流先匹配 `china-direct`、`.cn`/`.中国` 后缀和 `geosite-cn`，再做广告拦截，最后匹配 `geosite-geolocation-!cn`；新注册的中国域名即使暂未进入规则集也会直连并使用国内 DNS。广告拦截排在业务与国内直连规则之后，上游广告名单误收的服务域名会先被放行。
 - Windows TUN 使用 `strict_route` + `dns_mode: hijack`，拦截系统 DNS；不再把整张 `geoip-cn` 地址表排除在 TUN 外，以免某些中国 IP 上的代理分组流量绕过规则，同时减少大量静态路由。TUN 自身网关地址在 DNS 劫持之后拒绝非 DNS 流量，避免直连回环。
-- 两处规则都按文件中的顺序匹配，越靠前优先级越高。修改后重新生成配置，桌面和 Android 才会生效。
+- 修改后重新生成配置，桌面和 Android 才会生效。
 
-只想为本机临时增加规则时，编辑 `config\local\custom-rules.yaml`（该目录不会提交 Git），将规则分别放入 `route_rules` 和 `dns_rules`；它们会在公共业务规则之前生成。例如：
+只想为本机临时增加规则时，编辑 `config\local\custom-rules.yaml`（该目录不会提交 Git），将规则分别放入 `route_rules` 和 `dns_rules`；它们会在公共业务规则之前生成。本机自定义规则不做 DNS 自动推导，需要成对书写。例如：
 
 ```yaml
 schema_version: 1
@@ -193,7 +194,7 @@ rule_sets: []
 }
 ```
 
-`direct` 分组的域名会同时生成 `server: domestic` 的 DNS 规则（国内直连解析，避免代理 DNS 泄漏）；其他分组的 DNS 走 `server: google`。IP/CIDR 规则只参与路由，不参与 DNS。两个解析器 tag 在 `policy.yaml` 的 `dns_resolvers` 中指定，必须与 `config.dns.servers` 的 tag 一致。
+分组规则同样按上文的出口规则推导 DNS：`direct` 分组的域名走国内直连解析（避免代理 DNS 泄漏），`AI` 等有专用解析器的分组走该分组出口，其他分组走 `Available` 出口的解析器。IP/CIDR 规则只参与路由，不参与 DNS。
 
 ## 安装与验证
 
@@ -227,6 +228,7 @@ python .\scripts\quality\check_public_repo.py
 - `runtime\cores\1.15.0-alpha.9-reF1nd\` 下的 `sing-box.exe` 是 CLI 校验核心，不是 SFW 桌面客户端。当前 CLI zip 为 `sing-box-1.15.0-alpha.9-reF1nd-windows-amd64.zip`，SHA-256：`d1523ddc054c2e27eb88dc5f1b6f8ef50d44de16a4d25ce0e8027dae7377a75e`。管理脚本优先使用版本目录中的 CLI 核心校验。
 - `experimental.urltest_unified_delay: true` 启用下游的二次请求测速，减少首次建连和 TLS 握手对延迟结果的影响。
 - `experimental.cache_file.store_dns: true` 持久化 DNS 缓存；`flush_interval: 1m` 控制 1.15 写缓冲的落盘间隔。
+- `dns.min_cache_ttl: 60` 是 reF1nd 的缓存 TTL 下限：CDN 常见的 10–30 秒 TTL 会让同一域名反复发起两路代理 DoH 竞速，抬到 60 秒后显著减少重复查询。
 
 ## 官方参考
 
