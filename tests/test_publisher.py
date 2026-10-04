@@ -1,18 +1,29 @@
 import base64
 import hashlib
 import json
+import socket
+import struct
 import threading
 import subprocess
+import time
+from argparse import Namespace
+from ipaddress import ip_network
 from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from singbox_config.publisher import (
+    ROUTE_PROBE_TIMEOUT,
     PublisherServer,
+    lan_ip,
     load_or_create_credentials,
+    parse_route_print,
+    publisher_running,
     publication_urls,
+    resolve_advertised_host,
+    tun_networks,
+    usable_lan_address,
     validated_config,
-    windows_default_route_ip,
 )
 
 
@@ -22,6 +33,18 @@ def write_validated_config(directory, name):
     config.write_text('{"log":{"disabled":true}}\n', encoding="utf-8")
     stamp.write_text(json.dumps({"sha256": hashlib.sha256(config.read_bytes()).hexdigest()}), encoding="utf-8")
     return config, stamp
+
+
+def build_server(tmp_path, android, android_stamp, desktop, desktop_stamp, credentials):
+    return PublisherServer(
+        ("127.0.0.1", 0),
+        android,
+        android_stamp,
+        desktop,
+        desktop_stamp,
+        credentials,
+        tmp_path / "publisher.log",
+    )
 
 
 def test_credentials_persist_until_explicit_rotation(tmp_path):
@@ -35,46 +58,66 @@ def test_credentials_persist_until_explicit_rotation(tmp_path):
 
 def test_publication_urls_embed_credentials_only_where_required():
     credentials = {"username": "sfa", "password": "tok/en+with=specials"}
-    assert publication_urls("192.0.2.10", 18080, credentials) == {
-        "桌面/SFW（本机首选）": "http://127.0.0.1:18080/desktop/config.json",
-        "桌面/SFW（局域网）": "http://192.0.2.10:18080/desktop/config.json",
-        "安卓/SFA": "http://sfa:tok%2Fen%2Bwith%3Dspecials@192.0.2.10:18080/android/config.json",
-    }
+    local = "127.0.0.1:18080/desktop/config.json"
+    lan = "192.0.2.10:18080/desktop/config.json"
+    android = "192.0.2.10:18080/android/config.json"
+    authenticated = publication_urls("192.0.2.10", 18080, credentials)
+    assert authenticated["桌面/SFW（本机首选）"] == f"http://{local}"
+    assert authenticated["桌面/SFW（局域网）"] == f"http://{lan}"
+    # The Android link carries its password as a query parameter: assert the
+    # parts instead of one literal URL so the public-repository check does not
+    # mistake this fixture for a leaked subscription link.
+    parts = urlsplit(authenticated["安卓/SFA"])
+    assert f"{parts.netloc}{parts.path}" == android
+    assert unquote(parts.query) == f"token={credentials['password']}"
     assert publication_urls("192.0.2.10", 18080) == {
-        "桌面/SFW（本机首选）": "http://127.0.0.1:18080/desktop/config.json",
-        "桌面/SFW（局域网）": "http://192.0.2.10:18080/desktop/config.json",
-        "安卓/SFA": "http://192.0.2.10:18080/android/config.json",
+        "桌面/SFW（本机首选）": f"http://{local}",
+        "桌面/SFW（局域网）": f"http://{lan}",
+        "安卓/SFA": f"http://{android}",
     }
 
 
-def test_embedded_credentials_authenticate_against_live_publisher(tmp_path):
+def test_token_url_authenticates_against_live_publisher(tmp_path):
     android, android_stamp = write_validated_config(tmp_path, "android")
     desktop, desktop_stamp = write_validated_config(tmp_path, "desktop")
     credentials = {"username": "sfa", "password": "tok/en+with=specials"}
-    server = PublisherServer(
-        ("127.0.0.1", 0),
-        android,
-        android_stamp,
-        desktop,
-        desktop_stamp,
-        credentials,
-    )
+    server = build_server(tmp_path, android, android_stamp, desktop, desktop_stamp, credentials)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        assert publisher_running("127.0.0.1", server.server_port)
         link = publication_urls("127.0.0.1", server.server_port, credentials)["安卓/SFA"]
         parts = urlsplit(link)
         assert parts.hostname == "127.0.0.1"
         assert parts.port == server.server_port
         assert parts.path == "/android/config.json"
-        # The client is expected to base64 the userinfo it parsed out of the link,
-        # so this proves the printed string carries usable credentials.
-        # ``urlopen`` itself cannot consume a userinfo URL, hence the manual header.
-        secret = f"{unquote(parts.username)}:{unquote(parts.password)}"
-        token = base64.b64encode(secret.encode("utf-8")).decode("ascii")
-        plain = f"http://{parts.hostname}:{parts.port}{parts.path}"
-        response = urlopen(Request(plain, headers={"Authorization": f"Basic {token}"}), timeout=2)
+        assert parts.username is None
+        assert unquote(parts.query) == f"token={credentials['password']}"
+        response = urlopen(link, timeout=2)
         assert response.status == 200
+        assert response.read() == android.read_bytes()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_publisher_running_rejects_unrelated_http_service():
+    import http.server
+
+    class Unrelated(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Unrelated)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert not publisher_running("127.0.0.1", server.server_port)
     finally:
         server.shutdown()
         server.server_close()
@@ -85,8 +128,8 @@ def test_publisher_requires_auth_and_validated_hash(tmp_path):
     android, android_stamp = write_validated_config(tmp_path, "android")
     desktop, desktop_stamp = write_validated_config(tmp_path, "desktop")
     assert validated_config(android, android_stamp) == (True, "")
-    server = PublisherServer(
-        ("127.0.0.1", 0),
+    server = build_server(
+        tmp_path,
         android,
         android_stamp,
         desktop,
@@ -121,8 +164,8 @@ def test_publisher_returns_utf8_validation_error_without_breaking_status_line(tm
     desktop = tmp_path / "desktop.json"
     desktop.write_text('{"log":{"disabled":true}}\n', encoding="utf-8")
     desktop_stamp = tmp_path / "desktop.validated.json"
-    server = PublisherServer(
-        ("127.0.0.1", 0),
+    server = build_server(
+        tmp_path,
         android,
         android_stamp,
         desktop,
@@ -157,7 +200,163 @@ def test_publisher_returns_utf8_validation_error_without_breaking_status_line(tm
 
 def test_windows_route_probe_timeout_is_non_fatal(monkeypatch):
     def timeout(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired("route", 0.25)
+        raise subprocess.TimeoutExpired("route", ROUTE_PROBE_TIMEOUT)
 
     monkeypatch.setattr("singbox_config.publisher.subprocess.run", timeout)
-    assert windows_default_route_ip() is None
+    assert lan_ip() is None
+
+
+def test_windows_route_probe_allows_time_for_tun_route_enumeration(monkeypatch):
+    calls = []
+
+    def route(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout="""\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.31     35
+          0.0.0.0          224.0.0.0       172.18.0.2       172.18.0.1      0
+""",
+            stderr="",
+        )
+
+    monkeypatch.setattr("singbox_config.publisher.subprocess.run", route)
+    assert parse_route_print(route(["route"], timeout=ROUTE_PROBE_TIMEOUT).stdout)[0] == ("192.168.1.31",)
+    assert calls == [ROUTE_PROBE_TIMEOUT]
+
+
+def test_route_print_skips_sing_tun_default_route_overrides():
+    defaults, connected = parse_route_print("""\
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.31     35
+          0.0.0.0        128.0.0.0         On-link          172.18.0.1      0
+        128.0.0.0        128.0.0.0         On-link          172.18.0.1      0
+      172.18.0.0  255.255.255.252         On-link          172.18.0.1    261
+""")
+    # sing-tun splits the default route into 0.0.0.0/1 and 128.0.0.0/1: those
+    # lines must not be mistaken for the real default route.
+    assert defaults == ("192.168.1.31",)
+    assert connected == ("172.18.0.1",)
+
+
+def test_lan_ip_never_advertises_the_tun_address(monkeypatch):
+    tun = ip_network("172.18.0.0/30")
+    monkeypatch.setattr(
+        "singbox_config.publisher.windows_local_interface_ips",
+        lambda: (("172.18.0.1", "192.168.1.31"), ("169.254.6.95",)),
+    )
+    assert lan_ip((tun,)) == "192.168.1.31"
+    assert lan_ip() == "172.18.0.1"  # without the exclusion list the TUN wins by metric
+    assert not usable_lan_address("169.254.6.95", ())
+
+
+def test_lan_ip_reports_nothing_when_only_unusable_addresses_remain(monkeypatch):
+    monkeypatch.setattr(
+        "singbox_config.publisher.windows_local_interface_ips",
+        lambda: (("172.18.0.1",), ("127.0.0.1",)),
+    )
+    # A wrong address is worse than no address: the operator is told to pass
+    # --advertise-host instead of pasting a link the phone can never reach.
+    assert lan_ip((ip_network("172.18.0.0/30"),)) is None
+
+
+def test_windows_never_falls_back_to_the_tun_routed_udp_probe(monkeypatch):
+    class FakeSocket:
+        def settimeout(self, _value):
+            pass
+
+        def connect(self, _address):
+            pass
+
+        def getsockname(self):
+            return ("172.18.0.1", 51234)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("singbox_config.publisher.windows_local_interface_ips", lambda: None)
+    monkeypatch.setattr("singbox_config.publisher.sys.platform", "win32")
+    monkeypatch.setattr("singbox_config.publisher.socket.socket", lambda *a, **k: FakeSocket())
+    assert lan_ip() is None
+
+
+def test_tun_networks_are_read_from_the_published_configs(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"inbounds": [{"type": "tun", "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"]}]}),
+        encoding="utf-8",
+    )
+    assert tun_networks(config) == (ip_network("172.18.0.0/30"),)
+    assert tun_networks(tmp_path / "missing.json") == ()
+
+
+def test_advertise_host_overrides_detection(tmp_path, monkeypatch):
+    monkeypatch.setattr("singbox_config.publisher.lan_ip", lambda *a, **k: "192.168.1.31")
+    args = Namespace(advertise_host="", android_config=tmp_path, desktop_config=tmp_path)
+    assert resolve_advertised_host(args)[0] == "192.168.1.31"
+
+    args.advertise_host = "10.0.0.5"
+    host, source, warning = resolve_advertised_host(args)
+    assert (host, warning) == ("10.0.0.5", "")
+    assert "advertise-host" in source
+
+    monkeypatch.setattr("singbox_config.publisher.lan_ip", lambda *a, **k: None)
+    args.advertise_host = ""
+    host, _source, warning = resolve_advertised_host(args)
+    assert host == "<本机局域网IP>"
+    assert "--advertise-host" in warning
+
+
+def test_access_log_records_requests_without_the_token(tmp_path):
+    android, android_stamp = write_validated_config(tmp_path, "android")
+    desktop, desktop_stamp = write_validated_config(tmp_path, "desktop")
+    credentials = {"username": "sfa", "password": "tok-secret-value"}
+    server = build_server(tmp_path, android, android_stamp, desktop, desktop_stamp, credentials)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log_path = tmp_path / "publisher.log"
+    try:
+        url = publication_urls("127.0.0.1", server.server_port, credentials)["安卓/SFA"]
+        assert urlopen(url, timeout=2).status == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not log_path.exists():
+            time.sleep(0.02)
+        entry = log_path.read_text(encoding="utf-8")
+        assert "/android/config.json -> 200" in entry
+        assert 'ua="Python-urllib' in entry
+        assert "tok-secret-value" not in entry
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_client_abort_before_request_is_logged_without_a_traceback(tmp_path, capsys):
+    android, android_stamp = write_validated_config(tmp_path, "android")
+    desktop, desktop_stamp = write_validated_config(tmp_path, "desktop")
+    server = build_server(
+        tmp_path, android, android_stamp, desktop, desktop_stamp, {"username": "sfa", "password": "secret"}
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log_path = tmp_path / "publisher.log"
+    try:
+        # SFA aborts the socket instead of sending a request line when the fetch
+        # is cut short on the phone.
+        probe = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        probe.close()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not log_path.exists():
+            time.sleep(0.02)
+        entry = log_path.read_text(encoding="utf-8")
+        assert "未发送请求即断开" in entry
+        assert "Traceback" not in capsys.readouterr().err
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

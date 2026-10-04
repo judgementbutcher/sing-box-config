@@ -5,7 +5,7 @@ import hashlib
 import ipaddress
 import json
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Mapping, Set
 
 
 NON_PROXY_OUTBOUND_TYPES = {"selector", "urltest", "direct", "bridge", "block", "dns"}
@@ -82,6 +82,13 @@ def _referenced_outbounds(conf: Dict[str, Any]) -> List[tuple[str, str]]:
     for index, rule_set in enumerate(conf.get("route", {}).get("rule_set", []), 1):
         if isinstance(rule_set, dict) and rule_set.get("download_detour"):
             references.append((f"route.rule_set[{index}].download_detour", str(rule_set["download_detour"])))
+    for index, provider in enumerate(conf.get("providers", []), 1):
+        if not isinstance(provider, dict):
+            continue
+        for field in ("http_client", "override_dialer"):
+            value = provider.get(field)
+            if isinstance(value, dict) and value.get("detour"):
+                references.append((f"providers[{index}].{field}.detour", str(value["detour"])))
     return references
 
 
@@ -94,13 +101,55 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     nodes = [item for item in outbounds if is_proxy_outbound(item)]
     selectors = [item for item in outbounds if item.get("type") == "selector"]
     urltests = [item for item in outbounds if item.get("type") == "urltest"]
+    providers = [item for item in conf.get("providers", []) if isinstance(item, dict)]
+    provider_tags = [str(item.get("tag")) for item in providers if item.get("tag")]
+    provider_tag_set = set(provider_tags)
+    duplicate_provider_tags = sorted(
+        tag for tag, count in Counter(provider_tags).items() if count > 1
+    )
+    provider_paths = [str(item.get("path")) for item in providers if item.get("path")]
+    duplicate_provider_paths = sorted(
+        path for path, count in Counter(provider_paths).items() if count > 1
+    )
+    missing_provider_references = [
+        {"location": f"outbound[{test.get('tag')}].providers", "tag": str(reference)}
+        for test in selectors + urltests
+        for reference in test.get("providers", [])
+        if str(reference) not in provider_tag_set
+    ]
+    invalid_providers = [
+        str(item.get("tag") or index)
+        for index, item in enumerate(providers, 1)
+        if item.get("type") == "remote"
+        and (
+            not str(item.get("url") or "").lower().startswith(("http://", "https://"))
+            or bool(item.get("path") and item.get("initial_path"))
+            or bool(item.get("initial_path") and not conf.get("experimental", {}).get("cache_file", {}).get("enabled"))
+            or bool(item.get("user_agent") and item.get("http_client"))
+        )
+    ]
 
     fingerprint_counts = Counter(outbound_fingerprint(item) for item in nodes)
     duplicate_node_entries = sum(count - 1 for count in fingerprint_counts.values() if count > 1)
     urltest_members = [str(tag) for test in urltests for tag in test.get("outbounds", [])]
     urltest_member_counts = Counter(urltest_members)
     duplicate_urltest_members = sorted(tag for tag, count in urltest_member_counts.items() if count > 1)
-    singleton_urltests = [str(test.get("tag")) for test in urltests if len(test.get("outbounds", [])) < 2]
+    outbound_by_tag = {str(item.get("tag")): item for item in outbounds if item.get("tag")}
+    def urltest_candidate_count(test: Mapping[str, Any]) -> int:
+        count = len(test.get("providers", []))
+        for member in test.get("outbounds", []):
+            nested = outbound_by_tag.get(str(member))
+            if nested and nested.get("providers"):
+                count += max(2, len(nested.get("providers", [])))
+            else:
+                count += 1
+        return count
+
+    singleton_urltests = [
+        str(test.get("tag"))
+        for test in urltests
+        if urltest_candidate_count(test) < 2
+    ]
 
     # Selector-to-selector references are useful for composing policy groups,
     # but a cycle makes every affected connection fail at runtime.  Detect it
@@ -229,6 +278,14 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         ]
 
     default_resolver = _dns_resolver_tag(conf.get("route", {}).get("default_domain_resolver"))
+    for index, provider in enumerate(providers, 1):
+        for field in ("override_dialer", "http_client"):
+            value = provider.get(field)
+            resolver = _dns_resolver_tag(value.get("domain_resolver")) if isinstance(value, dict) else None
+            if resolver and resolver not in dns_servers:
+                missing_dns_references.append({
+                    "location": f"providers[{index}].{field}.domain_resolver", "tag": resolver,
+                })
     dns_dependency_cycles: list[str] = []
     for dns_server in conf.get("dns", {}).get("servers", []):
         if not isinstance(dns_server, dict) or not dns_server.get("tag"):
@@ -303,6 +360,41 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
                 {"location": f"route.rule_set[{index}].http_client", "tag": str(client)}
             )
 
+    for index, provider in enumerate(providers, 1):
+        client = provider.get("http_client")
+        if isinstance(client, str) and client not in http_clients:
+            missing_http_client_references.append({"location": f"providers[{index}].http_client", "tag": client})
+
+    # Provider downloads must not depend on their own still-empty selectors.
+    clients_by_tag = {str(client.get("tag")): client for client in conf.get("http_clients", []) if isinstance(client, dict)}
+    servers_by_tag = {str(server.get("tag")): server for server in conf.get("dns", {}).get("servers", []) if isinstance(server, dict)}
+
+    def referenced_providers(tag: str, trail: set[str] | None = None) -> set[str]:
+        trail = set(trail or ())
+        if tag in trail:
+            return set()
+        trail.add(tag)
+        outbound = outbound_by_tag.get(tag, {})
+        found = {str(value) for value in outbound.get("providers", [])}
+        if outbound.get("use_all_providers"):
+            found.update(provider_tag_set)
+        for member in outbound.get("outbounds", []):
+            found.update(referenced_providers(str(member), trail))
+        return found
+
+    provider_dependency_cycles: list[str] = []
+    for provider in providers:
+        if provider.get("type") != "remote":
+            continue
+        raw_client = provider.get("http_client") or default_http_client
+        client = clients_by_tag.get(raw_client, {}) if isinstance(raw_client, str) else (raw_client or {})
+        dependencies = referenced_providers(str(client.get("detour") or ""))
+        resolver_tag = _default_resolver_for_client = _dns_resolver_tag(client.get("domain_resolver")) or default_resolver
+        resolver = servers_by_tag.get(resolver_tag, {})
+        dependencies.update(referenced_providers(str(resolver.get("detour") or "")))
+        if str(provider.get("tag")) in dependencies:
+            provider_dependency_cycles.append(str(provider["tag"]))
+
     rule_set_tags = {
         tag
         for rule_set in conf.get("route", {}).get("rule_set", [])
@@ -339,6 +431,16 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     warnings: List[str] = []
     if duplicate_tags:
         errors.append(f"存在重复 outbound tag: {', '.join(duplicate_tags)}")
+    if duplicate_provider_tags:
+        errors.append(f"存在重复 Provider tag: {', '.join(duplicate_provider_tags)}")
+    if duplicate_provider_paths:
+        errors.append(f"Provider 缓存路径冲突: {', '.join(duplicate_provider_paths)}")
+    if missing_provider_references:
+        errors.append(f"存在 {len(missing_provider_references)} 个不存在的 Provider 引用")
+    if invalid_providers:
+        errors.append(f"远程 Provider 配置无效（URL/缓存路径/HTTP 客户端冲突）: {', '.join(invalid_providers)}")
+    if provider_dependency_cycles:
+        errors.append(f"Provider 下载依赖自身订阅分组: {', '.join(provider_dependency_cycles)}")
     if duplicate_node_entries and not limits.get("allow_duplicate_nodes"):
         errors.append(f"仍有 {duplicate_node_entries} 个完全重复节点")
     elif duplicate_node_entries:
@@ -397,6 +499,11 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
             "duplicate_node_entries": duplicate_node_entries,
         },
         "duplicate_tags": duplicate_tags,
+        "duplicate_provider_tags": duplicate_provider_tags,
+        "duplicate_provider_paths": duplicate_provider_paths,
+        "missing_provider_references": missing_provider_references,
+        "invalid_providers": invalid_providers,
+        "provider_dependency_cycles": provider_dependency_cycles,
         "duplicate_urltest_members": duplicate_urltest_members,
         "singleton_urltests": singleton_urltests,
         "selector_cycles": selector_cycles,

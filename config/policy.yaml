@@ -5,6 +5,18 @@ subscription:
   timeout_seconds: 20
   retry_proxy: http://127.0.0.1:7890
 
+# Provider 能力保留给需要运行时更新的订阅；当前本地订阅显式使用 provider:false，
+# 静态展开节点并保留原始名称，避免 Provider 的 provider-tag/ 前缀污染客户端面板。
+# 将来单独订阅设置 provider:true 后，生成器才会为它启用运行时 Provider。
+providers:
+  enabled: true
+  update_interval: 24h
+  health_check:
+    enabled: false
+    url: https://www.gstatic.com/generate_204
+    interval: 10m
+    timeout: 3s
+
 # 节点 server 域名的解析器：必须是不经过 TUN/代理的直连 DNS。
 # 节点域名若走 dns.final（google → detour Available），会依赖当前选中节点，
 # 当前节点不稳时测速就超时（忽隐忽现）。domain_resolver 直连解析后与代理解耦。
@@ -18,22 +30,38 @@ node_dns_resolver:
 dns_resolvers:
   domestic: domestic
   proxy: google
+  groups:
+    AI: google-ai
+    YouTube: google-youtube
+    Twitch: google-twitch
 
 # 所有显式 DNS 分流都使用同路径双解析器竞速。国内解析器保持直连，海外
 # 解析器保持走 Available，避免故障切换改变出口或造成 DNS 泄漏。
-# 生成器会把相邻、同解析器的规则合并成一个块（evaluate ×2 → respond ×2 →
-# SERVFAIL），匹配条件只写在 evaluate 和 SERVFAIL 上；respond 不带匹配条件，
-# 因为 sing-box 对未曾 evaluate 的响应 tag 直接跳过、不等待。
+# 生成器会把相邻、同解析器的规则合并成一个块（evaluate ×2 →
+# respond(NOERROR) ×2 → respond(NXDOMAIN) ×2 → SERVFAIL）。响应规则只保留
+# match_response 与响应码，不重复原始域名匹配；未曾 evaluate 的响应 tag 会被跳过。
 # 只合并相邻规则，不同解析器规则之间的先后优先级保持不变。
 dns_failover:
   timeout: 2s
   servers:
     domestic: [domestic, domestic-backup]
     google: [google, cloudflare]
+    google-ai: [google-ai, cloudflare-ai]
     google-youtube: [google-youtube, cloudflare-youtube]
+    google-twitch: [google-twitch, cloudflare-twitch]
 
 config:
-  $schema: https://sing-box.sagernet.org/schema.json
+  experimental:
+    cache_file:
+      enabled: true
+      # 1.14 起 DNS 缓存需要显式启用持久化；否则 cache_file 只保存规则集
+      # 等核心状态，重启后节点域名解析仍会从头开始。
+      store_dns: true
+      # 1.15 的缓存写缓冲定期落盘，降低移动端频繁写盘开销。
+      flush_interval: 1m
+    # reF1nd performs a second URLTest request so connection setup cost does
+    # not dominate the reported delay.
+    urltest_unified_delay: true
   log:
     disabled: false
     level: warn
@@ -45,7 +73,7 @@ config:
       # 这里曾经是 type: local，它在 TUN 下必然失效：桌面 profile 的 TUN 用
       # dns_mode=hijack，而 hijack 会把系统 DNS 指向 TUN 自己的地址
       # （172.18.0.2 / fdfe:dcba:9876::2）。local 解析器读到的"系统上游"就是
-      # sing-box 自己，查询一路挂到 dns.timeout（8s）才失败，且不报错：
+      # sing-box 自己，查询一路挂到 dns.timeout（3s）才失败，且不报错：
       # 走 local 的域名（全部国内域名、直连分组、默认 domain_resolver）静默超时。
       # 另有两个连带影响：route.default_domain_resolver 也是 local，导致
       # 规则集下载（fastly.jsdelivr.net）长期失败；strict_route 装上的 WFP
@@ -66,8 +94,7 @@ config:
         tls:
           enabled: true
           server_name: dns.alidns.com
-      # 备用国内解析器（DNSPod）：只在兜底竞速里参与，AliDNS 不可用时接管
-      # 未命中规则的查询。换一家运营商，避免两家同源同时失效。
+      # DNSPod 与 AliDNS 仅在国内域名的竞速中配对。
       - type: https
         tag: domestic-backup
         server: 1.12.12.12
@@ -94,6 +121,25 @@ config:
           enabled: true
           server_name: cloudflare-dns.com
         detour: Available
+      # AI 可独立选节点，解析也跟随 AI 的出口。
+      - type: https
+        tag: google-ai
+        server: 8.8.8.8
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: dns.google
+        detour: AI
+      - type: https
+        tag: cloudflare-ai
+        server: 1.1.1.1
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: cloudflare-dns.com
+        detour: AI
       # YouTube 专用解析器：与 YouTube 分组同一出口。googlevideo.com 等域名
       # 由 Google 按解析器出口所在地区分配视频边缘节点，若解析走 Available
       # 而播放走 YouTube 分组里另挑的节点，拿到的边缘与实际出口不在一地，
@@ -116,6 +162,31 @@ config:
           enabled: true
           server_name: cloudflare-dns.com
         detour: YouTube
+      # Twitch 专用解析器：与 Twitch 分组同一出口，理由同 YouTube——
+      # ttvnw.net 等取流域名按解析出口分配边缘节点，解析与播放必须在
+      # 同一出口，否则直播流绕远。Twitch 分组默认跟随 Available。
+      - type: https
+        tag: google-twitch
+        server: 8.8.8.8
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: dns.google
+        detour: Twitch
+      - type: https
+        tag: cloudflare-twitch
+        server: 1.1.1.1
+        server_port: 443
+        path: /dns-query
+        tls:
+          enabled: true
+          server_name: cloudflare-dns.com
+        detour: Twitch
+    # 正常情况下 final 不可达：dns_rules.final_rules 末尾的无条件
+    # predefined SERVFAIL 已兜住所有未命中查询。保留 final 只是作为
+    # 规则结构调整期的安全网，避免规则改坏时出现无主查询直接落到
+    # 第一个解析器上。
     final: google
     strategy: ipv4_only
     reverse_mapping: true
@@ -138,10 +209,27 @@ config:
 selectors:
   available: Available
   ai: AI
+  # AI 分组地区白名单：ai: auto 只把命中这些地区的节点放进 AI 组
+  # （ai: true 也只放宽 insecure 限制，地区门槛不变）。只收录 Claude/
+  # ChatGPT 等官方支持的地区；香港/大陆被上游封锁，未识别地区（Others）
+  # 不会进入，写错地区名等于收不进节点。
+  # 列表顺序即优先级：分组默认选中第一个地区（美国）里最靠前的节点，
+  # 其余地区仅作备用；组内同一地区的节点保持订阅原序。
+  ai_regions: [US, JP, SG, TW]
   emby: Emby
   # YouTube 专用分组：成员与 Available 相同，默认也跟随 Available，
   # 需要时可在面板里单独给 YouTube 挑节点，不影响其他流量。
   youtube: YouTube
+  # Spotify 分组：默认 direct（账号地区校验看出口 IP，机房段会被判成
+  # “资料与所在地区不符”而拒绝播放），成员含 direct，可在面板里切到代理。
+  spotify: Spotify
+  # Telegram 分组：成员与 Available 相同，不含 direct。
+  telegram: Telegram
+  # Twitch 分组：成员与 Available 相同，不含 direct。直播取流对节点质量
+  # 敏感，需要时可在面板里单独挑节点，不影响其他流量。
+  twitch: Twitch
+  # Google Play 分组：仅被安卓 profile 的规则引用时生成，桌面端不出现。
+  google_play: Google Play
   direct: direct
   interrupt_exist_connections: true
 
@@ -185,8 +273,10 @@ rule_sets:
     initial_path: runtime/rule-set-cache/geoip-cn.srs
   - tag:
       - geosite-geolocation-!cn
+      - geosite-anthropic
       - geosite-openai
       - geosite-telegram
+      - geosite-twitch
       - geosite-category-ads-all
     type: remote
     format: binary
@@ -221,10 +311,17 @@ domains:
     - time.google.com
 route:
   pre_rules:
+    - port: 53
+      action: hijack-dns
     - action: sniff
       timeout: 300ms
     - protocol: dns
       action: hijack-dns
+    # Never route packets addressed to the TUN itself back into direct.
+    # The DNS peer is handled by hijack-dns above; other ports must be dropped.
+    - ip_cidr: [172.18.0.0/30, 'fdfe:dcba:9876::/126']
+      action: reject
+      method: drop
     - ip_is_private: true
       action: route
       outbound: direct
@@ -238,16 +335,18 @@ route:
       outbound: direct
   business_rules:
     # Self-hosted Emby servers reachable without a proxy.
-    - domain_suffix:
-        - emby.bbqwq.com
-        - emby.wawajiao.cc.cd
-        - emby.kingemby.com
+    - domain_suffix: [emby.kingemby.com, media.wybcs.work]
       action: route
       outbound: direct
     - rule_set: [emby-domains]
       action: route
       outbound: Emby
-    - rule_set: [geosite-openai, ai-domains]
+    # AI 走 AI 分组（ai: auto 只收 selectors.ai_regions 白名单地区的节点）。
+    # geosite-anthropic 覆盖
+    # claude.com/claude.dev/clau.de/claudemcp* 等上游新域名：这些域名若
+    # 漏到 domestic_rules 的 geosite-geolocation-!cn，会从 Available（默认
+    # 香港节点）出站，触发 Anthropic 的地区封锁。必须排在它之前。
+    - rule_set: [geosite-anthropic, geosite-openai, ai-domains]
       action: route
       outbound: AI
     # Telegram clients use both domain names and bare data-centre IPs.
@@ -255,7 +354,14 @@ route:
     # below, including when an app has not yet connected to a data centre.
     - rule_set: [geosite-telegram]
       action: route
-      outbound: Available
+      outbound: Telegram
+    # Twitch 单独交给 Twitch 分组：直播取流对节点质量敏感，可在面板里
+    # 单独挑节点。域名清单由上游 geosite-twitch 维护（twitch.tv、
+    # ttvnw.net、jtvnw.net、twitchcdn.net 等），必须排在 domestic_rules
+    # 的 geosite-geolocation-!cn 之前，否则会被通用海外规则先摘走。
+    - rule_set: [geosite-twitch]
+      action: route
+      outbound: Twitch
     # YouTube 单独交给 YouTube 分组。必须排在下面的通用 Google 规则之前，
     # 否则 googlevideo.com 会先被那条规则摘走，YouTube 分组就形同虚设。
     - domain_suffix: *youtube_domains
@@ -281,15 +387,17 @@ route:
         - 149.154.160.0/20
         - 185.76.151.0/24
       action: route
-      outbound: Available
+      outbound: Telegram
     - rule_set: [direct-cdn]
       action: route
       outbound: direct
-    # Spotify 整条链路直连：账号地区校验看的是出口 IP，走代理出口（尤其是机房
-    # 段）会被判成"资料与所在地区不符"而拒绝播放。见 rule_sets 中的说明。
+    # Spotify 默认直连：账号地区校验看的是出口 IP，走代理出口（尤其是机房
+    # 段）会被判成“资料与所在地区不符”而拒绝播放。见 rule_sets 中的说明。
+    # 交给 Spotify 分组（默认 direct），需要时可切到代理节点；DNS 始终走
+    # 国内解析器，切换到代理后仅 CDN 边缘略偏，不影响可用性。
     - rule_set: [spotify-direct]
       action: route
-      outbound: direct
+      outbound: Spotify
     # Apply ad blocking after explicit business routes.  The upstream ads
     # list occasionally contains service/CDN hosts that must remain reachable
     # for AI, Emby, Telegram, and store traffic.
@@ -306,12 +414,17 @@ route:
     - rule_set: [china-direct]
       action: route
       outbound: direct
-    - rule_set: [geosite-geolocation-!cn]
+    # 中国国家/地区顶级域名不应因 geosite 更新滞后而落入代理。
+    # 包括 .cn、.com.cn 以及“中国”的 punycode 表示。
+    - domain_suffix: [cn, xn--fiqs8s]
       action: route
-      outbound: Available
+      outbound: direct
     - rule_set: [geosite-cn]
       action: route
       outbound: direct
+    - rule_set: [geosite-geolocation-!cn]
+      action: route
+      outbound: Available
     - rule_set: [geoip-cn]
       action: route
       outbound: direct
@@ -323,31 +436,36 @@ dns_rules:
   pre_rules: []
   # 规则按"解析器"分段书写：相邻的同解析器规则会被生成器合并成一个竞速块，
   # 所以这里把走 google 的业务规则排在一起。先后顺序仍然是优先级：YouTube
-  # 域名必须排在通用 Google 域名之前（youtubei.googleapis.com 同时命中两者）。
+  # 与 AI 域名必须排在通用 Google 域名之前（youtubei.googleapis.com、
+  # generativelanguage.googleapis.com 同时命中专属名单和 googleapis.com
+  # 通用后缀），保证解析出口与对应分组一致，与路由侧顺序对应。
   business_rules:
     # YouTube 走与 YouTube 分组同出口的解析器，保证视频边缘与出口一致。
     - domain_suffix: *youtube_domains
       action: route
       server: google-youtube
-    - domain_suffix:
-        - emby.bbqwq.com
-        - emby.wawajiao.cc.cd
+    # Twitch 同理：解析出口跟随 Twitch 分组，取流边缘与播放出口一致。
+    # 必须排在通用 Google 域名规则之前（twitch 域名虽不与 googleapis
+    # 重叠，但保持与路由侧 business_rules 相同的优先级书写习惯）。
+    - rule_set: [geosite-twitch]
       action: route
-      # DNS must be resolved through the proxy path. These hosts are
-      # reachable by a direct socket, but their local/ISP DNS resolution
-      # is unavailable or times out.
-      server: google
+      server: google-twitch
     - rule_set: [emby-domains]
       action: route
       server: google
+    # AI 必须排在下面的通用 Google 域名之前：ai-domains 里的
+    # generativelanguage.googleapis.com 等主机同时命中 googleapis.com 后缀，
+    # 若被通用规则先摘走，解析会走 Available 出口而连接走 AI 分组，
+    # 两者不一致。与上方 YouTube 规则的处理同理。geosite-anthropic 与
+    # 路由侧对应，保证 Claude 新域名的解析出口也落在 AI 分组。
+    - rule_set: [ai-domains, geosite-anthropic, geosite-openai]
+      action: route
+      server: google-ai
     - domain_suffix:
         - gstatic.com
         - googleapis.com
         - googleusercontent.com
         - ggpht.com
-      action: route
-      server: google
-    - rule_set: [ai-domains, geosite-openai]
       action: route
       server: google
     - rule_set: [geosite-telegram]
@@ -369,11 +487,16 @@ dns_rules:
     - rule_set: [china-direct]
       action: route
       server: domestic
+    - domain_suffix: [cn, xn--fiqs8s]
+      action: route
+      server: domestic
     # kingemby 走 Cloudflare（104.21.8.8 / 172.67.156.153），国内直连可达，
-    # 用国内解析器拿到国内优化的边缘即可。同为直连的 bbqwq/wawajiao 之所以
-    # 走 google，是因为那两个域名的国内解析拿不到可用地址。
-    # kingemby 不在 emby-domains 名单里，放在这里不会被上方的 google 规则抢走。
-    - domain_suffix: [emby.kingemby.com]
+    # 用国内解析器拿到国内优化的边缘即可。
+    # media.wybcs.work 同为 Cloudflare 代理的 Emby（172.67.131.1 /
+    # 104.21.3.181），AliDNS 给出的就是这对 anycast 地址，直连可达，
+    # 同样用国内解析器。
+    # 两者都不在 emby-domains 名单里，放在这里不会被上方的 google 规则抢走。
+    - domain_suffix: [emby.kingemby.com, media.wybcs.work]
       action: route
       server: domestic
     - domain_suffix: *ntp_domains
@@ -387,40 +510,16 @@ dns_rules:
     - rule_set: [spotify-direct]
       action: route
       server: domestic
-    - rule_set: [geosite-geolocation-!cn]
-      action: route
-      server: google
     - rule_set: [geosite-cn]
       action: route
       server: domestic
-  # 兜底 DNS（sing-box 1.14 evaluate + match_response 响应匹配）。
-  # 只处理未命中上方所有规则的查询，即两张 geosite 名单都没收录的域名。
-  #
-  # 历史教训（2026-09-13 实测）：这里曾让国内、海外四路解析器"谁先返回用谁"。
-  # AliDNS 直连通常比代理内 DoH 快 100ms 以上，于是名单外的海外域名多数由
-  # AliDNS 作答，而 AliDNS 对被墙域名返回的是污染 IP（annas-archive.org →
-  # 199.59.148.222、genius.com → 173.244.217.42 等），连接走代理也打不开；
-  # 缓存过期后重赛，偶尔换 Google 赢就又能打开，表现为"间歇性无法访问、
-  # 换节点或放一会儿又好了"。竞速的胜负取决于网络抖动，本质是不确定的。
-  #
-  # 现在的判定是确定性的（类 ChinaDNS）：
-  #   1. 四条 evaluate 并行发起（国内两条直连、海外两条走 Available）。
-  #   2. 国内解析结果只有落在 geoip-cn（中国大陆 IP 段）时才采信——说明这是
-  #      国内站点，路由层也会按 IP 直连；两条国内腿之间用 race 互为备份。
-  #   3. 否则（海外站点，或国内结果被污染）一律采用海外解析结果；这两条不带
-  #      race，会等国内两条 race 规则都判定"不命中"后才生效，保证顺序确定。
-  #   4. 四路都失败时立即返回 SERVFAIL，不再重复等待 dns.final。
-  # 顺序要求：evaluate 规则必须位于引用它的 match_response 规则之前；
-  # 响应 tag 与解析器 tag 有意区分开：tag 命名的是"某个 evaluate 的结果"。
+    - rule_set: [geosite-geolocation-!cn]
+      action: route
+      server: google
+  # 未命中的域名走代理出口（route.final: Available），解析也必须走代理出口。
+  # 不向国内 DoH 发送这些查询，避免泄露未知海外域名并减少冗余请求。
+  # 国内站点由上面的直连域名规则和用户自定义直连规则使用国内 DoH。
   final_rules:
-    - action: evaluate
-      server: domestic
-      tag: cn-primary
-      timeout: 2s
-    - action: evaluate
-      server: domestic-backup
-      tag: cn-backup
-      timeout: 2s
     - action: evaluate
       server: google
       tag: overseas
@@ -429,17 +528,20 @@ dns_rules:
       server: cloudflare
       tag: overseas-backup
       timeout: 2s
-    - match_response: cn-primary
-      rule_set: [geoip-cn]
-      action: respond
-      race: true
-    - match_response: cn-backup
-      rule_set: [geoip-cn]
-      action: respond
-      race: true
     - match_response: overseas
+      response_rcode: NOERROR
+      action: respond
+      race: true
+    - match_response: overseas-backup
+      response_rcode: NOERROR
+      action: respond
+      race: true
+    # 等待两路均无成功响应后再接受正常的 NXDOMAIN；SERVFAIL/REFUSED 不抢跑。
+    - match_response: overseas
+      response_rcode: NXDOMAIN
       action: respond
     - match_response: overseas-backup
+      response_rcode: NXDOMAIN
       action: respond
     - action: predefined
       rcode: SERVFAIL

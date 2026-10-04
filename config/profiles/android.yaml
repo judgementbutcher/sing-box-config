@@ -4,13 +4,32 @@ resolve_node_ipv4: false
 strip_rule_set_initial_path: true
 
 config:
-  dns:
-    cache_capacity: 4096
   inbounds:
     - type: tun
       tag: tun-in
+      # 仅声明 IPv4 地址是有意取舍：全局 IPv6 不进 TUN，ip_version: 6 的
+      # reject 规则在安卓上不会命中（保留它只为与桌面规则保持一致）。
+      # ipv4_only 的 DNS 策略下应用几乎拿不到 IPv6 目标，硬编码 IPv6
+      # 字面量的流量会绕过代理直接出物理网卡（暴露面很小）；换取的是
+      # 挂 VPN 时手机仍能访问 IPv6 资源。如需与桌面一致（IPv6 进入
+      # TUN 后被拒绝），在下方追加 fdfe:dcba:9876::1/126 即可。
       address: [172.18.0.1/30]
       auto_route: true
+      # 局域网地址不进入 TUN。手机开着 VPN 时，SFA 自己拉取发布链接、以及
+      # 其他 App 访问局域网设备，都属于“到本地网络”的连接：一旦被 TUN 接管，
+      # 就要依赖 route.rules 里 ip_is_private→direct 的判断，配置稍旧或规则
+      # 顺序变化就会把请求送进代理，表现为 SFA 拉取时报 EOF/连接重置。
+      # 在路由层面排除掉，这类连接根本不经过 sing-box，最彻底。
+      # 注意：不能排除 172.16.0.0/12 —— TUN 自身地址 172.18.0.1/30 与
+      # dns_mode=hijack 的 DNS 对端 172.18.0.2 都在该网段内。
+      # IPv6 的 ULA、链路本地和 IPv4 链路本地地址同样属于本地网络，
+      # 排除后可保留局域网发现、IPv6 家庭服务和无 DHCP 地址设备的访问。
+      route_exclude_address:
+        - 10.0.0.0/8
+        - 169.254.0.0/16
+        - 192.168.0.0/16
+        - fc00::/7
+        - fe80::/10
       udp_timeout: 1m
       mtu: 1360
       # 不写 stack：sing-box 1.15 起 TUN 默认使用 sing-tun 自带的 TCP/IP 栈，
@@ -20,27 +39,16 @@ config:
       # root 服务或 root shell），非 root 设备启用会导致启动失败，故默认不开。
       # 已 root 的设备可取消下一行注释，获得更好的路由性能与热点转发支持。
       # auto_redirect: true
-  experimental:
-    cache_file:
-      enabled: true
-      path: cache.android.db
-      # 1.14 can persist the DNS cache; this avoids repeated mobile lookups
-      # after SFA restarts without using the deprecated store_rdrc option.
-      store_dns: true
-      # 1.15 起缓存写入先进内存缓冲，减少移动端磁盘写入与耗电；定时 flush
-      # 限制 SFA 被系统强杀时丢失的分组选择与 DNS 缓存不超过五分钟。
-      flush_interval: 5m
-
 route_rules:
   - package_name:
       - com.android.vending
       - com.google.android.gms
       - com.google.android.gsf
     action: route
-    outbound: Available
+    outbound: Google Play
   - rule_set: google-play
     action: route
-    outbound: Available
+    outbound: Google Play
 
 dns_rules_front:
   - rule_set: google-play

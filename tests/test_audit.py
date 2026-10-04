@@ -91,6 +91,28 @@ def test_audit_rejects_selector_cycles():
     assert report["selector_cycles"] == ["A -> B -> A"]
 
 
+def test_audit_checks_provider_references_and_cache_paths():
+    conf = {
+        "providers": [
+            {"type": "remote", "tag": "airport", "url": "https://example.invalid/sub", "path": "providers/a.json"},
+            {"type": "remote", "tag": "airport-2", "url": "https://example.invalid/sub2", "path": "providers/a.json"},
+        ],
+        "outbounds": [
+            {"type": "urltest", "tag": "Available", "providers": ["missing"], "outbounds": ["n1", "n2"]},
+            node("n1", "one.example"),
+            node("n2", "two.example"),
+        ],
+        "route": {"rules": [], "rule_set": []},
+    }
+
+    report = audit_config(conf)
+
+    assert report["duplicate_provider_paths"] == ["providers/a.json"]
+    assert report["missing_provider_references"] == [
+        {"location": "outbound[Available].providers", "tag": "missing"}
+    ]
+
+
 def test_audit_rejects_dns_dependency_and_missing_response_tag():
     conf = {
         "dns": {

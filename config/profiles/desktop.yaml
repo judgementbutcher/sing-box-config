@@ -1,12 +1,11 @@
 schema_version: 1
 platform: windows
-resolve_node_ipv4: true
+# auto_detect_interface 在内核拨号时防止回环，不再由生成器解析节点并写死 /32 路由。
+resolve_node_ipv4: false
 embed_local_rule_sets: true
 strip_rule_set_initial_path: true
 
 config:
-  dns:
-    cache_capacity: 8192
   inbounds:
     - type: tun
       tag: tun-in
@@ -21,25 +20,10 @@ config:
       # 峰值吞吐、能耗与内存都优于 system/gvisor/mixed；stack 选项已弃用，
       # 1.17 删除。生成器审计会拒绝再次写入 stack。
       dns_mode: hijack
-      # Keep domestic direct sockets out of the TUN so sing-box cannot capture
-      # its own Windows connections recursively.
-      route_exclude_address_set: [geoip-cn]
     - type: mixed
       tag: mixed-in
       listen: 127.0.0.1
       listen_port: 7890
-  route:
-    find_process: true
-  experimental:
-    cache_file:
-      enabled: true
-      path: cache.db
-      store_dns: true
-      # 1.15 起缓存写入先进内存缓冲（默认 1MB），缓冲满、内存压力或退出时
-      # 才落盘。定时 flush 限制异常退出（崩溃、强杀）时丢失的分组选择与
-      # DNS 缓存不超过一分钟。
-      flush_interval: 1m
-
 route_rules:
   - process_name:
       - WinStore.App.exe

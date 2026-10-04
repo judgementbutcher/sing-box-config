@@ -6,6 +6,7 @@ param(
     [string]$Name,
     [string]$Link,
     [string]$Pattern,
+    [string]$AdvertiseHost,
     [ValidateSet("auto", "uri", "clash", "sing-box-json")]
     [string]$Format = "auto"
 )
@@ -22,6 +23,7 @@ $Subscriptions = Join-Path $ProjectRoot "config\local\subscriptions.yaml"
 $RoutingGroups = Join-Path $ProjectRoot "config\local\routing-groups.json"
 $OutputRoot = Join-Path $ProjectRoot "dist"
 $RuntimeRoot = Join-Path $ProjectRoot "runtime"
+$PreferredCoreVersion = "1.15.0-alpha.9-reF1nd"
 
 function Get-PythonCommand {
     $venv = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
@@ -39,6 +41,12 @@ function Get-CoreExecutable {
     }
     $cores = Join-Path $RuntimeRoot "cores"
     if (Test-Path -LiteralPath $cores) {
+        $preferred = Join-Path $cores $PreferredCoreVersion
+        if (Test-Path -LiteralPath $preferred) {
+            $candidate = Get-ChildItem -LiteralPath $preferred -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($candidate) { return $candidate.FullName }
+        }
         $candidate = Get-ChildItem -LiteralPath $cores -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($candidate) { return $candidate.FullName }
@@ -135,13 +143,16 @@ function Invoke-Generate {
             $versionOutput = @(& $core version 2>&1)
             if ($LASTEXITCODE -ne 0) { throw "无法运行校验核心：$core" }
             $version = $versionOutput | Select-Object -First 1
+            if ([string]$version -ne "sing-box version $PreferredCoreVersion") {
+                throw "校验核心版本不匹配：$version；本项目要求 $PreferredCoreVersion。请更新 runtime\cores 或 SING_BOX_CORE。"
+            }
             foreach ($name in $names) {
                 & $core check -c (Join-Path $stage "$name\config.json")
                 if ($LASTEXITCODE -ne 0) { throw "$name 配置未通过 sing-box 核心校验。" }
             }
             $validator = [string]$version
         } else {
-            Write-Host "[提示] 未找到 sing-box CLI 核心，已完成生成器内置结构校验。可用 SING_BOX_CORE 指定核心路径。" -ForegroundColor Yellow
+            throw "未找到 $PreferredCoreVersion CLI 核心，未发布配置。请安装到 runtime\cores 或通过 SING_BOX_CORE 指定路径。"
         }
 
         foreach ($name in $names) {
@@ -162,7 +173,41 @@ function Invoke-Generate {
 
 function Invoke-Publisher {
     param([string[]]$Extra = @())
+    Ensure-PublisherFirewall
+    if ($AdvertiseHost) {
+        # 自动探测到的是 TUN/虚拟网卡地址时（例如本机 sing-box 以服务+TUN 运行），
+        # 发布链接会让手机连到它自己的 TUN，表现为 SFA 拉取报 EOF。此时手动指定
+        # 真实局域网地址：-Action publisher -AdvertiseHost 192.168.1.31
+        $Extra = @("--advertise-host", $AdvertiseHost) + $Extra
+    }
     Invoke-Python -Arguments (@("-m", "singbox_config.publisher") + $Extra) | Out-Host
+}
+
+function Ensure-PublisherFirewall {
+    $displayName = "sing-box Android publisher (LAN)"
+    $rule = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
+    $portFilter = if ($rule) { $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue } else { $null }
+    $profiles = if ($rule) { [string]$rule.Profile } else { "" }
+    $portAllowed = $portFilter -and (@($portFilter | Where-Object {
+        $_.Protocol -eq "TCP" -and [string]$_.LocalPort -eq "18080"
+    }).Count -gt 0)
+    if ($rule -and $rule.Enabled -eq "True" -and $rule.Direction -eq "Inbound" -and
+        $rule.Action -eq "Allow" -and $profiles -match "(Private.*Public|Public.*Private|Any)" -and $portAllowed) {
+        return
+    }
+
+    $command = "`$ErrorActionPreference = 'Stop'; New-NetFirewallRule -DisplayName '$displayName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18080 -Profile Private,Public -ErrorAction Stop | Out-Null"
+    try {
+        $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command
+        )
+        if ($elevated.ExitCode -ne 0) {
+            throw "管理员进程返回退出码 $($elevated.ExitCode)"
+        }
+        Write-Host "已允许 Private/Public 网络访问 TCP 18080。" -ForegroundColor Green
+    } catch {
+        Write-Warning "无法自动配置 Windows 防火墙。请以管理员身份允许 Private/Public 网络的 TCP 18080，否则 Android 无法访问发布链接。"
+    }
 }
 
 function ConvertTo-SafeFileStem {
@@ -252,6 +297,11 @@ function Invoke-QuickAdd {
     $manifestText = $existingManifest
     $escapedName = $nameValue.Replace("'", "''")
     $escapedFormat = $detected.Format
+    $sourceOptions = if ($detected.Source -eq "url_file") {
+        "    provider: false"
+    } else {
+        "    node_tag: '$escapedName'"
+    }
     $block = @"
 
   - name: '$escapedName'
@@ -259,13 +309,12 @@ function Invoke-QuickAdd {
     format: $escapedFormat
     source: $($detected.Source)
     path: $relative
+$sourceOptions
     user_agent: sing-box
     group: '$escapedName'
     prefix_node_tags: false
-    node_tag: '$escapedName'
     order: 60
     ai: auto
-    urltest: true
 "@
     try {
         [IO.File]::WriteAllText($Subscriptions, $manifestText.TrimEnd() + $block + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))

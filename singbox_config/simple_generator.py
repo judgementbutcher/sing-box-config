@@ -59,7 +59,6 @@ SUBSCRIPTION_KEYS = {
     "prefix_node_tags",
     "node_tag",
     "order",
-    "urltest",
     "ai",
     "ai_include",
     "ai_exclude",
@@ -71,6 +70,7 @@ SUBSCRIPTION_KEYS = {
     "deduplicate",
     "allow_unsupported",
     "allow_insecure",
+    "provider",
 }
 PROCESS_RULE_KEYS = {"process_name", "process_path", "process_path_regex", "user", "user_id"}
 PACKAGE_RULE_KEYS = {"package_name", "package_name_regex"}
@@ -86,6 +86,9 @@ class BuiltSource:
     groups: list[dict[str, Any]]
     ai_node_tags: list[str]
     allows_duplicate_nodes: bool = False
+    provider: dict[str, Any] | None = None
+    original_node_names: dict[str, str] | None = None
+    allow_insecure: bool = False
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -298,6 +301,10 @@ def is_placeholder_node(node: Mapping[str, Any]) -> bool:
         return True
     if not server:
         return True
+    # Some providers encode subscription quota/help entries as ordinary
+    # proxy nodes and use this sentinel hostname instead of loopback.
+    if server.lower() == "dont.use.this.node":
+        return True
     try:
         ip = ipaddress.ip_address(server)
     except ValueError:
@@ -325,6 +332,16 @@ def build_source(
 ) -> BuiltSource:
     validate_manifest_item(item)
     name = str(item["name"]).strip()
+    native_provider = (
+        str(item.get("source")) == "url_file"
+        and bool_value((policy.get("providers") or {}).get("enabled"))
+        and bool_value(item.get("provider"), True)
+    )
+    if native_provider and (item.get("exclude_types") or int(item.get("max_nodes") or 0) > 0):
+        raise ValueError(
+            f"{name}: 原生 Provider 不支持 exclude_types/max_nodes；"
+            "请移除这些限制，或为该订阅设置 provider: false 使用静态生成"
+        )
     text = load_subscription_text(item, manifest_dir, policy, offline=offline, fetch_proxy=fetch_proxy)
     nodes, _info, warnings = parse_subscription_text(str(item["format"]), text)
     if warnings and not bool_value(item.get("allow_unsupported")):
@@ -343,6 +360,7 @@ def build_source(
         str(value).strip().lower() for value in as_list(item.get("exclude_types")) if str(value).strip()
     }
     dropped_types: dict[str, int] = {}
+    placeholder_names: list[str] = []
     selected: list[dict[str, Any]] = []
     for node in nodes:
         original = node_name(node)
@@ -351,6 +369,7 @@ def build_source(
             dropped_types[node_type] = dropped_types.get(node_type, 0) + 1
             continue
         if is_placeholder_node(node):
+            placeholder_names.append(original)
             print(f"[占位节点] {name}: {original} 指向 {node.get('server')}:{node.get('server_port')}，已忽略。", file=sys.stderr)
             continue
         if exclude_node_tags and matches_any(exclude_node_tags, original):
@@ -372,10 +391,11 @@ def build_source(
     group_value = item.get("group")
     group_tag = str(group_value or name).strip()
     # ``group: false`` keeps multiple source nodes as independent outbounds.
-    is_group = len(selected) > 1 and group_value is not False
+    is_group = (len(selected) > 1 or native_provider) and group_value is not False
     built_nodes: list[dict[str, Any]] = []
     node_tags: list[str] = []
     ai_tags: list[str] = []
+    original_node_names: dict[str, str] = {}
     ai_mode = item.get("ai", "auto")
     ai_enabled = ai_mode is not False and str(ai_mode).strip().lower() not in {"false", "off", "disabled", "0"}
     ai_force = str(ai_mode).strip().lower() in {"true", "on", "enabled", "1"}
@@ -383,6 +403,14 @@ def build_source(
     ai_include = compile_patterns(item.get("ai_include"), f"{name}.ai_include")
     ai_exclude = compile_patterns(item.get("ai_exclude"), f"{name}.ai_exclude")
     deduplicate = bool_value(item.get("deduplicate"), True)
+    # AI 分组的地区白名单来自 policy.selectors.ai_regions（缺省仅 US）。
+    # HK/大陆与未识别地区永远不在名单内：Claude/ChatGPT 等服务拒绝这些出口。
+    raw_selectors = policy.get("selectors")
+    ai_regions = {
+        str(value).strip().upper()
+        for value in as_list(raw_selectors.get("ai_regions") if isinstance(raw_selectors, Mapping) else None)
+        if str(value).strip()
+    } or {"US"}
 
     for index, raw in enumerate(selected):
         original = node_name(raw)
@@ -427,22 +455,72 @@ def build_source(
         used_fingerprints.setdefault(fingerprint, tag)
         built_nodes.append(node)
         node_tags.append(tag)
-        if ai_enabled and not is_insecure_outbound(node):
-            allowed = ai_force or detect_region(tag) == "US" or matches_any(ai_include, original)
+        original_node_names[tag] = original
+        # ``ai`` controls whether the subscription participates and whether
+        # insecure TLS nodes may participate; membership still requires a
+        # policy-allowed region match (selectors.ai_regions, default US) or an
+        # explicit include pattern.
+        if ai_enabled and (ai_force or not is_insecure_outbound(node)):
+            allowed = detect_region(tag) in ai_regions or matches_any(ai_include, original)
             if allowed and not matches_any(ai_exclude, original):
                 ai_tags.append(tag)
 
     if not node_tags:
         raise ValueError(f"{name}: 节点全部与其他订阅重复")
 
+    provider: dict[str, Any] | None = None
+    source = str(item.get("source") or "file").strip().lower()
+    if source == "url_file" and bool_value(item.get("provider"), True):
+        url_path = (manifest_dir / str(item.get("path") or "")).resolve()
+        provider_url = url_path.read_text(encoding="utf-8").strip()
+        if provider_url.startswith(("http://", "https://")):
+            provider_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-") or "provider"
+            provider_suffix = hashlib.sha256(provider_url.encode("utf-8")).hexdigest()[:8]
+            provider = {
+                "type": "remote",
+                "tag": f"provider-{provider_tag}-{provider_suffix}",
+                "url": provider_url,
+                "path": f"providers/{provider_tag}-{provider_suffix}.json",
+                "update_interval": str(policy.get("providers", {}).get("update_interval") or "24h"),
+                "http_client": {
+                    "headers": {"User-Agent": str(item.get("user_agent") or "sing-box")},
+                },
+            }
+            if node_resolver:
+                provider["override_dialer"] = {"domain_resolver": copy.deepcopy(node_resolver)}
+            if not allow_insecure:
+                provider["override_tls"] = {"insecure": False}
+            include = item.get("include")
+            if include:
+                provider["include"] = "|".join(str(value) for value in as_list(include))
+            exclude_patterns = [
+                str(value).strip()
+                for value in [*as_list(item.get("exclude")), *as_list(item.get("exclude_node_tags"))]
+                if str(value).strip()
+            ]
+            # Provider-level filters see ORIGINAL names, before the core adds
+            # its namespace. Keep the exact placeholder names found by parsing,
+            # including notices that do not contain the usual traffic keywords.
+            exclude_patterns.extend(f"^{re.escape(value)}$" for value in placeholder_names)
+            if exclude_patterns:
+                provider["exclude"] = "|".join(f"(?:{pattern})" for pattern in exclude_patterns)
+            health = policy.get("providers", {}).get("health_check")
+            if isinstance(health, Mapping) and bool_value(health.get("enabled"), False):
+                provider["health_check"] = {
+                    "enabled": True,
+                    "url": str(health.get("url") or "https://www.gstatic.com/generate_204"),
+                    "interval": str(health.get("interval") or "10m"),
+                    "timeout": str(health.get("timeout") or "3s"),
+                }
+
     groups: list[dict[str, Any]] = []
     entry_tag = node_tags[0]
     if is_group:
         members = list(node_tags)
         default = members[0]
-        # All subscription groups are intentionally manual selectors.  The
-        # historical ``urltest`` option is accepted for manifest
-        # compatibility, but never creates an implicit ``*/Auto`` group.
+        # All subscription groups are intentionally manual selectors; there is
+        # no implicit ``*/Auto`` urltest group (the legacy ``urltest`` manifest
+        # option was removed and is rejected as an unknown field).
         groups.insert(
             0,
             {
@@ -451,6 +529,7 @@ def build_source(
                 "outbounds": members,
                 "default": default,
                 "interrupt_exist_connections": True,
+                **({"providers": [str(provider["tag"])]} if provider else {}),
             },
         )
         entry_tag = group_tag
@@ -463,6 +542,9 @@ def build_source(
         groups=groups,
         ai_node_tags=ai_tags,
         allows_duplicate_nodes=not deduplicate,
+        provider=provider,
+        original_node_names=original_node_names,
+        allow_insecure=allow_insecure,
     )
 
 
@@ -508,10 +590,30 @@ def build_outbounds(
     policy: Mapping[str, Any],
     profile: Mapping[str, Any],
     routing_groups: Mapping[str, Any] | None = None,
+    providers: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     selectors = policy.get("selectors", {})
     interrupt = bool_value(selectors.get("interrupt_exist_connections"), True)
-    nodes = [node for source in sources for node in source.nodes]
+    native = bool_value((policy.get("providers") or {}).get("enabled"), False)
+    native_sources = [source for source in sources if native and source.provider]
+    static_sources = [source for source in sources if not (native and source.provider)]
+    nodes = [node for source in static_sources for node in source.nodes]
+    bootstrap = provider_bootstrap(sources, policy) if native_sources else None
+
+    def dynamic_tag(source: BuiltSource, tag: str) -> str:
+        original = (source.original_node_names or {}).get(tag)
+        if original is None:
+            prefix = source.entry_tag + "/"
+            original = tag[len(prefix):] if tag.startswith(prefix) else tag
+        return f"{source.provider['tag']}/{original}"
+
+    native_ai = [source for source in native_sources if source.ai_node_tags]
+    for source in native_ai:
+        if source.allow_insecure:
+            raise ValueError(
+                f"{source.name}: 允许 insecure 的动态订阅不能保证 AI 节点刷新后的 TLS 边界；"
+                "请设置 ai: false、allow_insecure: false 或 provider: false"
+            )
     region_groups: list[dict[str, Any]] = []
     region_group_tags: list[str] = []
     for raw_group in as_list(selectors.get("region_groups")):
@@ -527,15 +629,27 @@ def build_outbounds(
             for node in nodes
             if node.get("tag") and detect_region(str(node.get("tag"))) in regions
         ]
-        if not members:
+        provider_members = [
+            (source, dynamic_tag(source, str(node["tag"])))
+            for source in native_sources
+            for node in source.nodes
+            if node.get("tag") and detect_region(str(node["tag"])) in regions
+        ]
+        if not members and not provider_members:
             raise ValueError(f"地区分组 {tag} 没有匹配到 {','.join(regions)} 节点")
+        if provider_members and not members:
+            raise ValueError(f"地区分组 {tag} 需要一个同地区的独立节点作为空 Provider 后备")
         region_group_tags.append(tag)
         region_groups.append(
             {
                 "type": "selector",
                 "tag": tag,
                 "outbounds": members,
-                "default": members[0],
+                **({"default": members[0]} if members and not provider_members else {}),
+                **({
+                    "providers": list(dict.fromkeys(str(source.provider["tag"]) for source, _ in provider_members)),
+                    "include": "^(?:" + "|".join(re.escape(tag) for _, tag in provider_members) + ")$",
+                } if provider_members else {}),
                 "interrupt_exist_connections": interrupt,
             }
         )
@@ -544,6 +658,7 @@ def build_outbounds(
     source_entries = [
         tag
         for source in sources
+        if not (native and source.provider and not source.groups)
         for tag in (source.node_tags if len(source.node_tags) > 1 and not source.groups else [source.entry_tag])
     ]
     # Keep the existing default entry stable; region groups are additional
@@ -554,9 +669,24 @@ def build_outbounds(
         if str(tag).strip()
     ]
     available_entries = [*source_entries, *region_group_tags, *profile_available_entries]
-    ai_entries = list(dict.fromkeys(tag for source in sources for tag in source.ai_node_tags))
-    if not ai_entries:
+    ai_entries = list(dict.fromkeys(tag for source in static_sources for tag in source.ai_node_tags))
+    if native_ai and not ai_entries:
+        raise ValueError("动态 AI 分组需要一个通过 AI 筛选的独立节点作为空 Provider 后备")
+    if not ai_entries and not native_ai:
         ai_entries = [str(selectors.get("available") or "Available")]
+    # selectors.ai_regions 的顺序即地区优先级：美国排最前并作为 AI 默认出口，
+    # 其余白名单地区（JP/SG/TW）只作备用。组内相对顺序保持订阅原序。
+    ai_region_order = [
+        str(value).strip().upper()
+        for value in as_list(selectors.get("ai_regions"))
+        if str(value).strip()
+    ] or ["US"]
+
+    def ai_region_priority(tag: str) -> int:
+        region = detect_region(tag)
+        return ai_region_order.index(region) if region in ai_region_order else len(ai_region_order)
+
+    ai_entries.sort(key=ai_region_priority)
     # Keep the AI selector scoped to explicitly eligible nodes.  Adding the
     # general Available selector as a singleton fallback would allow an AI
     # rule to silently leave the intended region/policy boundary.
@@ -565,23 +695,42 @@ def build_outbounds(
     ai_tag = str(selectors.get("ai") or "AI")
     emby_tag = str(selectors.get("emby") or "Emby")
     youtube_tag = str(selectors.get("youtube") or "YouTube")
+    spotify_tag = str(selectors.get("spotify") or "Spotify")
+    telegram_tag = str(selectors.get("telegram") or "Telegram")
+    twitch_tag = str(selectors.get("twitch") or "Twitch")
+    google_play_tag = str(selectors.get("google_play") or "Google Play")
     direct_outbound: dict[str, Any] = {"type": "direct", "tag": direct_tag}
     direct_interface = str(profile.get("direct_interface") or "").strip()
     if direct_interface:
         direct_outbound["bind_interface"] = direct_interface
+    # Provider refresh must not turn the user's global choice into URLTest.
+    # Keep grouped subscriptions nested and allow explicit standalone choices.
+    available: dict[str, Any] = {
+        "type": "selector",
+        "tag": available_tag,
+        "outbounds": available_entries,
+        "default": available_entries[0],
+        "interrupt_exist_connections": interrupt,
+    }
+    if providers:
+        available["providers"] = [str(item["tag"]) for item in providers]
     outbounds: list[dict[str, Any]] = [
-        {
-            "type": "selector",
-            "tag": available_tag,
-            "outbounds": available_entries,
-            "default": available_entries[0],
-            "interrupt_exist_connections": interrupt,
-        },
+        available,
         {
             "type": "selector",
             "tag": ai_tag,
             "outbounds": ai_entries,
-            "default": ai_entries[0],
+            **({"default": ai_entries[0]} if ai_entries else {}),
+            **({
+                "providers": [str(source.provider["tag"]) for source in native_ai],
+                # Restrict AI to names audited by the generator; new nodes join
+                # the ordinary subscription selector immediately, and enter AI
+                # only after the next generation checks region and TLS policy.
+                "include": "^(?:" + "|".join(
+                    re.escape(dynamic_tag(source, tag))
+                    for source in native_ai for tag in source.ai_node_tags
+                ) + ")$",
+            } if native_ai else {}),
             "interrupt_exist_connections": interrupt,
         },
         direct_outbound,
@@ -602,11 +751,61 @@ def build_outbounds(
             "default": available_tag,
             "interrupt_exist_connections": interrupt,
         },
+        # Spotify keeps direct as the default member: the account-region check
+        # judges the egress IP, and datacentre proxy exits get rejected (see
+        # policy.yaml). Proxy nodes stay selectable in the panel.
+        {
+            "type": "selector",
+            "tag": spotify_tag,
+            "outbounds": list(dict.fromkeys([direct_tag, available_tag, *available_entries])),
+            "default": direct_tag,
+            "interrupt_exist_connections": interrupt,
+        },
+        # Telegram and the profile-scoped groups below are proxy-only: their
+        # traffic must never silently fall back to direct.
+        {
+            "type": "selector",
+            "tag": telegram_tag,
+            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
+            "default": available_tag,
+            "interrupt_exist_connections": interrupt,
+        },
+        # Twitch mirrors Telegram: proxy-only, tracks Available until a node
+        # is pinned for stream quality in the panel.
+        {
+            "type": "selector",
+            "tag": twitch_tag,
+            "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
+            "default": available_tag,
+            "interrupt_exist_connections": interrupt,
+        },
     ]
+    # Profile-scoped selectors (Google Play on Android) are generated only when
+    # a profile rule hands traffic to them, so the desktop panel never shows an
+    # empty group.
+    if profile_references_outbound(profile, google_play_tag):
+        outbounds.append(
+            {
+                "type": "selector",
+                "tag": google_play_tag,
+                "outbounds": list(dict.fromkeys([available_tag, *available_entries])),
+                "default": available_tag,
+                "interrupt_exist_connections": interrupt,
+            }
+        )
     outbounds.extend(region_groups)
     for source in sources:
-        outbounds.extend(copy.deepcopy(source.groups))
-    for source in sources:
+        for group in copy.deepcopy(source.groups):
+            if bool_value((policy.get("providers") or {}).get("enabled"), False) and source.provider:
+                group["providers"] = [str(source.provider["tag"])]
+                group["outbounds"] = [bootstrap]
+                # Dynamic members do not exist at Selector.Start(). A default
+                # pointing at a provider node would make the core fail startup.
+                group.pop("default", None)
+            elif not providers and "providers" in group:
+                group.pop("providers", None)
+            outbounds.append(group)
+    for source in static_sources:
         outbounds.extend(copy.deepcopy(source.nodes))
     outbounds.extend(copy.deepcopy(as_list(profile.get("static_outbounds"))))
     known_tags = {
@@ -659,6 +858,42 @@ def build_outbounds(
     # members may include Available, and doing so would create a selector cycle.
     outbounds.extend(managed_outbounds)
     return outbounds
+
+
+def provider_bootstrap(sources: Sequence[BuiltSource], policy: Mapping[str, Any]) -> str:
+    """Use an independent secure node for startup and empty-provider fallback."""
+    static_sources = [source for source in sources if source.provider is None]
+    secure = {
+        str(node["tag"]): node
+        for source in static_sources for node in source.nodes
+        if node.get("server") and not is_insecure_outbound(node)
+    }
+    preferred = str((policy.get("providers") or {}).get("bootstrap_outbound") or "").strip()
+    if preferred:
+        if preferred not in secure:
+            raise ValueError("providers.bootstrap_outbound 必须指向独立的、启用 TLS 校验的静态代理节点")
+        return preferred
+    for source in static_sources:
+        for tag in source.ai_node_tags:
+            if tag in secure:
+                return tag
+    if secure:
+        return next(iter(secure))
+    raise ValueError("原生 Provider 需要一个独立代理节点用于下载自举及空分组后备；请添加单节点或设置 provider: false")
+
+
+def profile_references_outbound(profile: Mapping[str, Any], tag: str) -> bool:
+    """True when a profile route rule hands traffic to ``tag``.
+
+    Profile-scoped selectors (Google Play on Android) must only exist on the
+    platforms whose rules reference them; emitting them everywhere would show
+    an unused group in the other platform's panel.
+    """
+    for key in ("route_rules_front", "route_rules"):
+        for rule in as_list(profile.get(key)):
+            if isinstance(rule, dict) and str(rule.get("outbound") or "") == tag:
+                return True
+    return False
 
 
 def filter_rule_for_platform(rule: Mapping[str, Any], platform: str) -> dict[str, Any] | None:
@@ -827,7 +1062,14 @@ def expand_dns_failover_rules(
                 }
             )
         for response_tag in response_tags:
-            expanded.append({"match_response": response_tag, "action": "respond", "race": True})
+            expanded.append({
+                "match_response": response_tag, "response_rcode": "NOERROR",
+                "action": "respond", "race": True,
+            })
+        for response_tag in response_tags:
+            expanded.append({
+                "match_response": response_tag, "response_rcode": "NXDOMAIN", "action": "respond",
+            })
         expanded.append({**copy.deepcopy(matcher), "action": "predefined", "rcode": "SERVFAIL"})
     return expanded
 
@@ -909,6 +1151,7 @@ def build_managed_rules(
     direct_tag: str,
     domestic_server: str | None,
     proxy_server: str | None,
+    group_servers: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Turn routing-groups domains into typed route + DNS rules.
 
@@ -942,7 +1185,7 @@ def build_managed_rules(
             route_rules.append({kind: members, "action": "route", "outbound": tag})
             if kind == "ip_cidr":
                 continue
-            server = domestic_server if tag == direct_tag else proxy_server
+            server = domestic_server if tag == direct_tag else (group_servers or {}).get(tag, proxy_server)
             if server:
                 dns_rules.append({kind: members, "action": "route", "server": server})
     return route_rules, dns_rules
@@ -1064,7 +1307,7 @@ def assemble_rules(
     domestic_server = str(resolvers.get("domestic") or "").strip() or None
     proxy_server = str(resolvers.get("proxy") or "").strip() or None
     managed_rules, managed_dns_rules = build_managed_rules(
-        routing_groups, direct_tag, domestic_server, proxy_server
+        routing_groups, direct_tag, domestic_server, proxy_server, resolvers.get("groups")
     )
     conf.setdefault("route", {})["rules"] = [
         *filtered_rules(custom.get("route_rules_front"), platform),
@@ -1102,7 +1345,27 @@ def build_config(
     routing_groups: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     conf = deep_merge(policy.get("config", {}), profile.get("config", {}))
-    conf["outbounds"] = build_outbounds(sources, policy, profile, routing_groups)
+    enabled_providers = bool_value((policy.get("providers") or {}).get("enabled"), False)
+    # A grouped subscription already has a stable selector entry. Referencing
+    # its Provider from Available would flatten every remote node into the
+    # top-level list and defeat that grouping. Providers are therefore exposed
+    # to Available only for sources whose nodes are standalone entries.
+    providers = [source.provider for source in sources if source.provider] if enabled_providers else []
+    providers = copy.deepcopy(providers)
+    if providers:
+        bootstrap = provider_bootstrap(sources, policy)
+        for provider in providers:
+            client = provider.setdefault("http_client", {})
+            # Subscription downloads cannot use Available while its providers
+            # are still loading. The standalone outbound has no such dependency.
+            client["detour"] = bootstrap
+    available_providers = [
+        source.provider for source in sources
+        if enabled_providers and source.provider and not source.groups
+    ]
+    conf["outbounds"] = build_outbounds(sources, policy, profile, routing_groups, available_providers)
+    if providers:
+        conf["providers"] = copy.deepcopy(providers)
     conf.setdefault("route", {})["rule_set"] = build_rule_sets(policy, profile, custom)
     assemble_rules(conf, policy, profile, custom, routing_groups)
     nodes = [node for source in sources for node in source.nodes]

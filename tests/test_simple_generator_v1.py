@@ -50,6 +50,91 @@ def test_single_ai_does_not_escape_ai_policy_boundary():
     assert ai["default"] == "US-One"
 
 
+def test_ai_region_whitelist_gates_membership(tmp_path):
+    """AI 组成员由 selectors.ai_regions 白名单决定；HK 永远进不了 AI 组。
+
+    Claude/ChatGPT 拒绝香港出口，所以即使订阅设置 ai: true（放宽 insecure
+    限制），地区门槛仍然生效。
+    """
+    source = tmp_path / "provider.txt"
+    source.write_text(
+        "\n".join(
+            [
+                "vless" + "://11111111-1111-1111-1111-111111111111@one.example:443?security=tls#US-One",
+                "vless" + "://22222222-2222-2222-2222-222222222222@two.example:443?security=tls#JP-One",
+                "vless" + "://33333333-3333-3333-3333-333333333333@three.example:443?security=tls#SG-One",
+                "vless" + "://44444444-4444-4444-4444-444444444444@four.example:443?security=tls#TW-One",
+                "vless" + "://55555555-5555-5555-5555-555555555555@five.example:443?security=tls#HK-One",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "subscriptions.yaml"
+    manifest.write_text(
+        """schema_version: 1
+subscriptions:
+  - name: provider
+    format: uri
+    source: file
+    path: provider.txt
+    group: Provider
+    prefix_node_tags: false
+""",
+        encoding="utf-8",
+    )
+
+    allowed = simple.load_sources(
+        manifest,
+        {"selectors": {"ai_regions": ["US", "JP", "SG", "TW"]}},
+        offline=False,
+        fetch_proxy=None,
+    )
+    assert allowed[0].ai_node_tags == ["US-One", "JP-One", "SG-One", "TW-One"]
+
+    # Without an explicit whitelist the historical US-only behaviour applies.
+    default = simple.load_sources(
+        manifest, {"selectors": {}}, offline=False, fetch_proxy=None
+    )
+    assert default[0].ai_node_tags == ["US-One"]
+
+    # ai: true only lifts the insecure-TLS restriction, never the region gate.
+    force_manifest = tmp_path / "force.yaml"
+    force_manifest.write_text(
+        manifest.read_text(encoding="utf-8") + "    ai: true\n",
+        encoding="utf-8",
+    )
+    forced = simple.load_sources(
+        force_manifest,
+        {"selectors": {"ai_regions": ["US", "JP", "SG", "TW"]}},
+        offline=False,
+        fetch_proxy=None,
+    )
+    assert forced[0].ai_node_tags == ["US-One", "JP-One", "SG-One", "TW-One"]
+
+
+def test_ai_group_orders_regions_by_whitelist_and_defaults_to_first():
+    """ai_regions 列表顺序即优先级：美国默认出口，其余地区只作备用。"""
+    source = simple.BuiltSource(
+        name="provider",
+        order=10,
+        entry_tag="Provider",
+        node_tags=["JP-One", "US-One", "US-Two"],
+        nodes=[],
+        groups=[],
+        ai_node_tags=["JP-One", "US-One", "US-Two"],
+    )
+    outbounds = simple.build_outbounds(
+        [source],
+        {"selectors": {"available": "Available", "ai": "AI", "ai_regions": ["US", "JP"]}},
+        {"platform": "desktop"},
+    )
+    ai = next(outbound for outbound in outbounds if outbound.get("tag") == "AI")
+    # Region priority reorders members; the original order inside one region
+    # (US-One before US-Two) is preserved.
+    assert ai["outbounds"] == ["US-One", "US-Two", "JP-One"]
+    assert ai["default"] == "US-One"
+
+
 def test_managed_group_adds_selector_and_domain_route():
     source = simple.BuiltSource(
         name="provider",
@@ -153,66 +238,170 @@ def test_current_sources_generate_small_valid_profiles(monkeypatch, tmp_path):
         sources,
     )
 
-    assert [item["tag"] for item in desktop["outbounds"][:5]] == [
+    assert [item["tag"] for item in desktop["outbounds"][:8]] == [
         "Available",
         "AI",
         "direct",
         "Emby",
         "YouTube",
+        "Spotify",
+        "Telegram",
+        "Twitch",
     ]
     selector_by_tag = {item["tag"]: item for item in desktop["outbounds"] if item.get("type") == "selector"}
+    outbound_by_tag = {item["tag"]: item for item in desktop["outbounds"] if item.get("tag")}
     # The YouTube group mirrors Available's entries and follows Available by
     # default, so it only changes behaviour once a node is pinned in the panel.
     assert selector_by_tag["YouTube"]["outbounds"] == [
         "Available",
-        *selector_by_tag["Available"]["outbounds"],
+        *outbound_by_tag["Available"]["outbounds"],
     ]
     assert selector_by_tag["YouTube"]["default"] == "Available"
-    assert "clash_api" not in desktop["experimental"]
+    # Spotify keeps direct as the default: the account-region check rejects
+    # datacentre proxy exits. Proxy members remain selectable in the panel.
+    assert selector_by_tag["Spotify"]["outbounds"] == [
+        "direct",
+        "Available",
+        *outbound_by_tag["Available"]["outbounds"],
+    ]
+    assert selector_by_tag["Spotify"]["default"] == "direct"
+    # Telegram is proxy-only: no direct member, follows Available by default.
+    assert selector_by_tag["Telegram"]["outbounds"] == [
+        "Available",
+        *outbound_by_tag["Available"]["outbounds"],
+    ]
+    assert selector_by_tag["Telegram"]["default"] == "Available"
+    assert "direct" not in selector_by_tag["Telegram"]["outbounds"]
+    # Twitch mirrors Telegram: proxy-only, follows Available by default.
+    assert selector_by_tag["Twitch"]["outbounds"] == selector_by_tag["Telegram"]["outbounds"]
+    assert selector_by_tag["Twitch"]["default"] == "Available"
+    assert "direct" not in selector_by_tag["Twitch"]["outbounds"]
+    # AI membership stays inside the selectors.ai_regions whitelist: HK and
+    # unidentified-region nodes must never appear, whatever the subscriptions
+    # refresh to.
+    assert {simple.detect_region(member) for member in selector_by_tag["AI"]["outbounds"]} <= {"US", "JP", "SG", "TW"}
+    # Region priority follows the whitelist order: US members lead and the
+    # group default is a US node; JP/SG/TW only serve as backup.
+    ai_region_order = [simple.detect_region(member) for member in selector_by_tag["AI"]["outbounds"]]
+    priority = {"US": 0, "JP": 1, "SG": 2, "TW": 3}
+    assert [priority[r] for r in ai_region_order] == sorted(priority[r] for r in ai_region_order)
+    assert simple.detect_region(selector_by_tag["AI"]["default"]) == "US"
+    # Google Play is referenced only by the Android profile, so the desktop
+    # panel must not contain the group.
+    assert "Google Play" not in outbound_by_tag
+    android_selector_by_tag = {
+        item["tag"]: item for item in android["outbounds"] if item.get("type") == "selector"
+    }
+    assert [item["tag"] for item in android["outbounds"][:9]] == [
+        "Available",
+        "AI",
+        "direct",
+        "Emby",
+        "YouTube",
+        "Spotify",
+        "Telegram",
+        "Twitch",
+        "Google Play",
+    ]
+    assert android_selector_by_tag["Google Play"]["outbounds"] == selector_by_tag["Telegram"]["outbounds"]
+    assert android_selector_by_tag["Google Play"]["default"] == "Available"
+    assert outbound_by_tag["Available"]["type"] == "selector"
+    assert "providers" not in outbound_by_tag["Available"]
+    assert "providers" not in desktop
+    for subscription_tag in ("特朗普云", "羽迹"):
+        assert "Meow-US" not in outbound_by_tag[subscription_tag]["outbounds"]
+    assert desktop["experimental"]["urltest_unified_delay"] is True
+    assert outbound_by_tag["Available"]["default"] == outbound_by_tag["Available"]["outbounds"][0]
+    assert "fallback" not in outbound_by_tag["Available"]
+    assert "clash_api" not in desktop.get("experimental", {})
     assert "services" not in desktop
+    # The current manifest uses static expansion so the original node names
+    # remain visible in each subscription selector.
     assert len([item for item in desktop["outbounds"] if item.get("type") == "vless"]) >= 4
-    assert len(desktop["route"]["rules"]) == 22
+    assert desktop["experimental"]["cache_file"]["store_dns"] is True
+    assert len(desktop["route"]["rules"]) == 26
     assert {
-        "domain_suffix": ["emby.bbqwq.com", "emby.wawajiao.cc.cd", "emby.kingemby.com"],
+        "domain_suffix": ["emby.kingemby.com", "media.wybcs.work"],
         "action": "route",
         "outbound": "direct",
     } in desktop["route"]["rules"]
-    emby_dns_evaluations = [
+    # bbqwq/wawajiao are retired: neither route nor DNS rules may keep them.
+    assert not any(
+        "emby.bbqwq.com" in simple.as_list(rule.get("domain_suffix") or [])
+        or "emby.wawajiao.cc.cd" in simple.as_list(rule.get("domain_suffix") or [])
+        for rule in desktop["route"]["rules"]
+    )
+    assert not any(
+        dns_matcher_covers(rule, "domain_suffix", "emby.bbqwq.com")
+        or dns_matcher_covers(rule, "domain_suffix", "emby.wawajiao.cc.cd")
+        for rule in desktop["dns"]["rules"]
+    )
+    # Emby group domains resolve through both proxy resolvers.
+    emby_group_evaluations = [
         rule
         for rule in desktop["dns"]["rules"]
-        if rule.get("action") == "evaluate"
-        and dns_matcher_covers(rule, "domain_suffix", "emby.bbqwq.com")
+        if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "emby-domains")
     ]
-    assert {rule["server"] for rule in emby_dns_evaluations} == {"google", "cloudflare"}
-    # Adjacent same-resolver rules are folded into one block, so the emby
-    # hosts share their evaluate legs with the other proxy-resolved matchers.
-    assert all(dns_matcher_covers(rule, "rule_set", "geosite-telegram") for rule in emby_dns_evaluations)
-    # respond legs carry no matcher: an unevaluated response tag never matches.
+    assert {rule["server"] for rule in emby_group_evaluations} == {"google", "cloudflare"}
+    # The exact folded matcher set depends on the business-rule ordering; the
+    # important contract here is that both proxy resolvers cover the Emby host.
+    # Response-code matching separates successful answers from NXDOMAIN; only
+    # successful answers participate in the race.
     for rule in desktop["dns"]["rules"]:
         if rule.get("action") == "respond" and str(rule.get("match_response", "")).startswith("failover-"):
-            assert set(rule) == {"match_response", "action", "race"}, rule
+            assert {"match_response", "action", "response_rcode"}.issubset(rule), rule
+            if rule["response_rcode"] == "NOERROR":
+                assert rule.get("race") is True
+            else:
+                assert "race" not in rule
     assert desktop["inbounds"][0]["strict_route"] is True
-    assert desktop["inbounds"][0]["route_exclude_address_set"] == ["geoip-cn"]
+    assert "route_exclude_address_set" not in desktop["inbounds"][0]
+    dns_server_ips = {
+        f"{server['server']}/32"
+        for server in desktop["dns"]["servers"]
+        if simple._is_ip_address(str(server.get("server") or ""))
+    }
+    # Desktop relies on auto_detect_interface instead of materializing node
+    # address exclusions, so DNS server IPs do not need a generated list.
+    assert "route_exclude_address" not in desktop["inbounds"][0]
+    assert desktop["route"]["auto_detect_interface"] is True
+    assert "find_process" not in desktop["route"]
+    route_rules = desktop["route"]["rules"]
+    hijack_index = next(i for i, rule in enumerate(route_rules) if rule.get("action") == "hijack-dns")
+    peer_index = next(i for i, rule in enumerate(route_rules) if rule.get("ip_cidr") == [
+        "172.18.0.0/30", "fdfe:dcba:9876::/126"
+    ])
+    private_index = next(i for i, rule in enumerate(route_rules) if rule.get("ip_is_private"))
+    assert hijack_index < peer_index < private_index
+    assert route_rules[peer_index]["action"] == "reject"
+    assert route_rules[peer_index]["method"] == "drop"
     assert not any("bind_interface" in outbound for outbound in desktop["outbounds"])
-    assert desktop["experimental"]["cache_file"]["path"] == "cache.db"
     # sing-box 1.15: the built-in sing-tun stack is selected by omitting
-    # ``stack``; cache writes are buffered and flushed on a timer.
+    # ``stack``. Provider cache paths are separate per remote source.
     assert "stack" not in desktop["inbounds"][0]
     assert "stack" not in android["inbounds"][0]
-    assert desktop["experimental"]["cache_file"]["flush_interval"] == "1m"
-    assert android["experimental"]["cache_file"]["flush_interval"] == "5m"
+    assert android["inbounds"][0]["route_exclude_address"] == [
+        "10.0.0.0/8",
+        "169.254.0.0/16",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    assert desktop["experimental"]["urltest_unified_delay"] is True
+    assert android["experimental"]["urltest_unified_delay"] is True
     assert "optimistic" not in desktop["dns"]
     assert "optimistic" not in android["dns"]
     assert desktop["route"]["default_domain_resolver"] == {
         "server": "domestic",
         "timeout": "2s",
     }
-    domain_node = next(
+    domain_nodes = [
         outbound
         for outbound in desktop["outbounds"]
         if outbound.get("server") and not simple._is_ip_address(str(outbound["server"]))
-    )
-    assert domain_node["domain_resolver"] == {"server": "domestic", "timeout": "2s"}
+    ]
+    assert domain_nodes
+    assert all(node["domain_resolver"] == {"server": "domestic", "timeout": "2s"} for node in domain_nodes)
     assert not any("initial_path" in item for item in desktop["route"]["rule_set"])
     china_rule_set = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "china-direct")
     assert china_rule_set["tag"] == "china-direct"
@@ -220,8 +409,36 @@ def test_current_sources_generate_small_valid_profiles(monkeypatch, tmp_path):
     assert china_rule_set["rules"]
     assert "path" not in china_rule_set
     assert "format" not in china_rule_set
-    assert len(android["route"]["rules"]) == 22
-    assert any(rule.get("rule_set") == ["geosite-telegram"] and rule.get("outbound") == "Available" for rule in desktop["route"]["rules"])
+    assert len(android["route"]["rules"]) == 26
+    assert any(rule.get("rule_set") == ["geosite-telegram"] and rule.get("outbound") == "Telegram" for rule in desktop["route"]["rules"])
+    assert any(rule.get("rule_set") == ["geosite-twitch"] and rule.get("outbound") == "Twitch" for rule in desktop["route"]["rules"])
+    assert any(
+        "91.108.4.0/22" in simple.as_list(rule.get("ip_cidr") or []) and rule.get("outbound") == "Telegram"
+        for rule in desktop["route"]["rules"]
+    )
+    assert any(rule.get("rule_set") == ["spotify-direct"] and rule.get("outbound") == "Spotify" for rule in desktop["route"]["rules"])
+    # AI vendor coverage: Anthropic's newer domains (claude.com etc.) and the
+    # shared Turnstile/Arkose auth endpoints must ride the AI group. Letting
+    # them fall through to geolocation-!cn would exit via Available, whose
+    # default node sits in an unsupported region (HK) for Claude/ChatGPT.
+    ai_route_rule = next(rule for rule in desktop["route"]["rules"] if rule.get("outbound") == "AI")
+    assert ai_route_rule["rule_set"] == ["geosite-anthropic", "geosite-openai", "ai-domains"]
+    assert {
+        rule["server"]
+        for rule in desktop["dns"]["rules"]
+        if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "geosite-anthropic")
+    } == {"google-ai", "cloudflare-ai"}
+    ai_domain_rule_set = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "ai-domains")
+    ai_suffixes = ai_domain_rule_set["rules"][0]["domain_suffix"]
+    assert {
+        "claude.com",
+        "claude.dev",
+        "clau.de",
+        "claudemcpclient.com",
+        "claudemcpcontent.com",
+        "challenges.cloudflare.com",
+        "client-api.arkoselabs.com",
+    } <= set(ai_suffixes)
     # YouTube must be carved out before the generic Google suffixes, or
     # googlevideo.com would be routed to Available again.
     youtube_rule = next(
@@ -264,7 +481,28 @@ def test_current_sources_generate_small_valid_profiles(monkeypatch, tmp_path):
         for rule in desktop["dns"]["rules"]
         if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "geosite-telegram")
     } == {"google", "cloudflare"}
-    assert not any(outbound.get("type") == "urltest" or "/Auto" in str(outbound.get("tag") or "") for outbound in [*desktop["outbounds"], *android["outbounds"]])
+    # Twitch resolves through resolvers detoured via the Twitch selector, same
+    # rationale as YouTube: stream edges follow the egress region.
+    twitch_evaluations = [
+        rule
+        for rule in desktop["dns"]["rules"]
+        if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "geosite-twitch")
+    ]
+    assert {rule["server"] for rule in twitch_evaluations} == {"google-twitch", "cloudflare-twitch"}
+    assert {
+        server["detour"] for server in desktop["dns"]["servers"] if server["tag"] in {"google-twitch", "cloudflare-twitch"}
+    } == {"Twitch"}
+    assert next(outbound for outbound in android["outbounds"] if outbound["tag"] == "Available")["type"] == "selector"
+    assert any(
+        rule.get("rule_set") == "google-play" and rule.get("outbound") == "Google Play"
+        for rule in android["route"]["rules"]
+    )
+    assert any(
+        "com.android.vending" in simple.as_list(rule.get("package_name") or [])
+        and rule.get("outbound") == "Google Play"
+        for rule in android["route"]["rules"]
+    )
+    assert not any("/Auto" in str(outbound.get("tag") or "") for outbound in [*desktop["outbounds"], *android["outbounds"]])
     assert not any("clash_mode" in rule for conf in (desktop, android) for rule in conf["route"]["rules"])
     assert "services" not in android
 
@@ -339,7 +577,7 @@ def test_subscription_user_agent_is_forwarded(monkeypatch, tmp_path):
     assert calls == [("https://example.com/subscription", 20, None, "sing-box")]
 
 
-def test_provider_group_and_urltest_are_explicit(tmp_path):
+def test_subscription_groups_are_manual_selectors(tmp_path):
     source = tmp_path / "provider.txt"
     source.write_text(
         "\n".join(
@@ -359,25 +597,180 @@ subscriptions:
     source: file
     path: provider.txt
     group: Provider
-    urltest: true
 """,
         encoding="utf-8",
     )
     sources = simple.load_sources(
         manifest,
-        {
-            "subscription": {},
-            "urltest": {"url": "https://example.com/204", "interval": "10m", "tolerance": 80},
-        },
+        {"subscription": {}},
         offline=False,
         fetch_proxy=None,
     )
     assert sources[0].entry_tag == "Provider"
     assert sources[0].node_tags == ["Provider/US-One", "Provider/HK-Two"]
-    # ``urltest: true`` is accepted for manifest compatibility but never
-    # creates an implicit ``*/Auto`` group.
+    # Subscription groups are intentionally manual selectors; there is no
+    # implicit ``*/Auto`` urltest group.
     assert [group["tag"] for group in sources[0].groups] == ["Provider"]
     assert all(group["type"] == "selector" for group in sources[0].groups)
+
+
+def test_legacy_urltest_field_is_rejected(tmp_path):
+    source = tmp_path / "provider.txt"
+    source.write_text(
+        "vless" + "://11111111-1111-1111-1111-111111111111@one.example:443?security=tls&sni=one.example#US-One",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "subscriptions.yaml"
+    manifest.write_text(
+        """schema_version: 1
+subscriptions:
+  - name: provider
+    format: uri
+    source: file
+    path: provider.txt
+    group: Provider
+    urltest: true
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="不支持的旧订阅字段: urltest"):
+        simple.load_sources(manifest, {"subscription": {}}, offline=False, fetch_proxy=None)
+
+
+def test_remote_subscription_builds_stable_provider_cache_and_filters(tmp_path):
+    url_file = tmp_path / "source.url.txt"
+    url_file.write_text("https://example.invalid/subscription", encoding="utf-8")
+    source_file = tmp_path / "source.json"
+    source_file.write_text(
+        json.dumps({"outbounds": [
+            {"type": "vless", "tag": "One", "server": "one.example", "server_port": 443, "uuid": "one"},
+            {"type": "vless", "tag": "Two", "server": "two.example", "server_port": 443, "uuid": "two"},
+        ]}),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "subscriptions.yaml"
+    manifest.write_text(
+        """schema_version: 1
+subscriptions:
+  - name: 测试订阅
+    format: singbox-json
+    source: url_file
+    path: source.url.txt
+    group: Test
+    exclude: [过期]
+    exclude_node_tags: [剩余流量]
+""",
+        encoding="utf-8",
+    )
+    # The fetched body is independently supplied by the existing generator.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(simple, "download_text", lambda *_args, **_kwargs: source_file.read_text(encoding="utf-8"))
+    try:
+        sources = simple.load_sources(
+            manifest,
+            {"subscription": {"cache_max_age": "1d"}, "providers": {"update_interval": "12h"}},
+            offline=False,
+            fetch_proxy=None,
+        )
+    finally:
+        monkeypatch.undo()
+
+    provider = sources[0].provider
+    assert provider["type"] == "remote"
+    assert provider["tag"].startswith("provider-")
+    assert provider["path"].startswith("providers/")
+    assert provider["update_interval"] == "12h"
+    assert "过期" in provider["exclude"] and "剩余流量" in provider["exclude"]
+
+
+def test_remote_provider_is_enabled_for_both_platforms_and_stays_in_group():
+    bootstrap = simple.BuiltSource(
+        name="bootstrap",
+        order=1,
+        entry_tag="Bootstrap",
+        node_tags=["Bootstrap"],
+        nodes=[{
+            "type": "vless",
+            "tag": "Bootstrap",
+            "server": "bootstrap.example",
+            "server_port": 443,
+            "uuid": "bootstrap",
+            "tls": {"enabled": True, "server_name": "bootstrap.example"},
+        }],
+        groups=[],
+        ai_node_tags=["Bootstrap"],
+    )
+    source = simple.BuiltSource(
+        name="airport",
+        order=10,
+        entry_tag="Airport",
+        node_tags=["Airport/One", "Airport/Two"],
+        nodes=[
+            {"type": "vless", "tag": "Airport/One", "server": "one.example", "server_port": 443, "uuid": "one"},
+            {"type": "vless", "tag": "Airport/Two", "server": "two.example", "server_port": 443, "uuid": "two"},
+        ],
+        groups=[{"type": "selector", "tag": "Airport", "outbounds": ["Airport/One", "Airport/Two"], "default": "Airport/One"}],
+        ai_node_tags=["Airport/One"],
+        provider={
+            "type": "remote",
+            "tag": "provider-airport-12345678",
+            "url": "https://example.invalid/subscription",
+            "path": "providers/airport-12345678.json",
+            "update_interval": "24h",
+        },
+    )
+    policy = {
+        "providers": {"enabled": True},
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct", "emby": "Emby", "youtube": "YouTube"},
+    }
+    custom = {"schema_version": 1}
+
+    desktop = simple.build_config("desktop", policy, {"platform": "desktop"}, custom, [bootstrap, source])
+    android = simple.build_config("android", policy, {"platform": "android"}, custom, [bootstrap, source])
+
+    available = next(item for item in desktop["outbounds"] if item.get("tag") == "Available")
+    assert available["type"] == "selector"
+    assert "providers" not in available
+    assert available["outbounds"] == ["Bootstrap", "Airport"]
+    assert available["default"] == "Bootstrap"
+    assert "fallback" not in available
+    for config in (desktop, android):
+        provider = config["providers"][0]
+        assert {key: provider[key] for key in source.provider} == source.provider
+        assert provider["http_client"] == {"detour": "Bootstrap"}
+    assert next(item for item in desktop["outbounds"] if item.get("tag") == "Airport")["providers"] == ["provider-airport-12345678"]
+    assert next(item for item in android["outbounds"] if item.get("tag") == "Airport")["providers"] == ["provider-airport-12345678"]
+
+
+def test_available_manually_selects_subscription_group_and_standalone_node():
+    grouped = simple.BuiltSource(
+        name="airport",
+        order=10,
+        entry_tag="Airport",
+        node_tags=["Airport/One", "Airport/Two"],
+        nodes=[{"type": "direct", "tag": "Airport/One"}, {"type": "direct", "tag": "Airport/Two"}],
+        groups=[{"type": "selector", "tag": "Airport", "outbounds": ["Airport/One", "Airport/Two"]}],
+        ai_node_tags=[],
+    )
+    standalone = simple.BuiltSource(
+        name="single",
+        order=20,
+        entry_tag="Single",
+        node_tags=["Single"],
+        nodes=[{"type": "direct", "tag": "Single"}],
+        groups=[],
+        ai_node_tags=[],
+    )
+    outbounds = simple.build_outbounds(
+        [grouped, standalone],
+        {"providers": {"enabled": True}},
+        {"platform": "android"},
+    )
+    available = next(item for item in outbounds if item["tag"] == "Available")
+    assert available["type"] == "selector"
+    assert available["outbounds"] == ["Airport", "Single"]
+    assert available["default"] == "Airport"
+    assert next(item for item in outbounds if item["tag"] == "Airport")["type"] == "selector"
 
 
 def test_placeholder_info_nodes_are_dropped_before_group_default(tmp_path):
@@ -419,11 +812,12 @@ def test_placeholder_detection_rules():
     assert simple.is_placeholder_node({"server": "0.0.0.0", "server_port": 443})
     assert simple.is_placeholder_node({"server": "real.example", "server_port": 0})
     assert simple.is_placeholder_node({"server": "localhost", "server_port": 443})
+    assert simple.is_placeholder_node({"server": "Dont.use.this.node", "server_port": 8888})
     assert not simple.is_placeholder_node({"server": "real.example", "server_port": 443})
     assert not simple.is_placeholder_node({"server": "192.168.1.10", "server_port": 8443})
 
 
-def test_provider_can_keep_all_named_nodes_without_urltest(tmp_path):
+def test_provider_can_keep_all_named_nodes_with_dedup_disabled(tmp_path):
     source = tmp_path / "provider.txt"
     source.write_text(
         "\n".join(
@@ -443,7 +837,6 @@ subscriptions:
     source: file
     path: provider.txt
     group: Provider
-    urltest: false
     deduplicate: false
 """,
         encoding="utf-8",
@@ -756,13 +1149,35 @@ def test_dns_failover_expands_route_into_bounded_response_race():
         "evaluate",
         "respond",
         "respond",
+        "respond",
+        "respond",
         "predefined",
     ]
     assert [rule.get("server") for rule in rules[:2]] == ["primary", "backup"]
     assert all(rule["timeout"] == "1500ms" for rule in rules[:2])
-    assert all(rule["domain_suffix"] == ["example.com"] for rule in (rules[0], rules[1], rules[4]))
-    assert rules[2] == {"match_response": "failover-1-primary", "action": "respond", "race": True}
-    assert rules[3] == {"match_response": "failover-1-backup", "action": "respond", "race": True}
+    assert all(rule["domain_suffix"] == ["example.com"] for rule in (rules[0], rules[1], rules[-1]))
+    assert rules[2] == {
+        "match_response": "failover-1-primary",
+        "response_rcode": "NOERROR",
+        "action": "respond",
+        "race": True,
+    }
+    assert rules[3] == {
+        "match_response": "failover-1-backup",
+        "response_rcode": "NOERROR",
+        "action": "respond",
+        "race": True,
+    }
+    assert rules[4] == {
+        "match_response": "failover-1-primary",
+        "response_rcode": "NXDOMAIN",
+        "action": "respond",
+    }
+    assert rules[5] == {
+        "match_response": "failover-1-backup",
+        "response_rcode": "NXDOMAIN",
+        "action": "respond",
+    }
     assert rules[-1]["rcode"] == "SERVFAIL"
 
 
@@ -873,39 +1288,49 @@ def test_dns_final_rules_are_appended_last():
     assert {"domain_suffix": ["a.com"], "action": "route", "server": "google"} == rules[-6]
 
 
-def test_policy_dns_fallback_never_trusts_domestic_answers_blindly():
-    """Regression guard for the 2026-09-13 intermittent-failure root cause.
-
-    The fallback used to race domestic and overseas resolvers with plain
-    ``respond`` rules, so the (faster) domestic resolver usually won for
-    unlisted foreign domains and handed out GFW-polluted addresses.  Domestic
-    answers may only be accepted when they land in geoip-cn; every other case
-    must deterministically fall through to the proxy-side resolvers.
-    """
+def test_policy_dns_fallback_stays_on_proxy_path():
+    """Unknown proxy-routed domains must never be sent to a domestic resolver."""
     policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
     final_rules = policy["dns_rules"]["final_rules"]
-    domestic_tags = {"domestic", "domestic-backup"}
 
     evaluates = [rule for rule in final_rules if rule.get("action") == "evaluate"]
     responders = [rule for rule in final_rules if rule.get("action") == "respond"]
-    assert evaluates and responders
-    # Every evaluate must precede the first rule that references a response.
+    assert {rule["server"] for rule in evaluates} == {"google", "cloudflare"}
+    assert {
+        server["detour"]
+        for server in policy["config"]["dns"]["servers"]
+        if server["tag"] in {"google", "cloudflare"}
+    } == {"Available"}
+    assert {rule["match_response"] for rule in responders} == {
+        rule["tag"] for rule in evaluates
+    }
+    assert all(
+        rule.get("race") is True
+        for rule in responders
+        if rule.get("response_rcode") == "NOERROR"
+    )
     first_reference = next(i for i, rule in enumerate(final_rules) if rule.get("match_response"))
     assert all(final_rules.index(rule) < first_reference for rule in evaluates)
-
-    tag_to_server = {rule["tag"]: rule["server"] for rule in evaluates}
-    domestic_responders = [r for r in responders if tag_to_server[r["match_response"]] in domestic_tags]
-    overseas_responders = [r for r in responders if tag_to_server[r["match_response"]] not in domestic_tags]
-    assert domestic_responders and overseas_responders
-    for rule in domestic_responders:
-        assert "geoip-cn" in rule.get("rule_set", []), rule
-    for rule in overseas_responders:
-        assert not rule.get("race"), rule
-    # Domestic (race) responders are listed before the ordered overseas ones,
-    # and the block is bounded by an explicit SERVFAIL.
-    assert max(final_rules.index(r) for r in domestic_responders) < min(
-        final_rules.index(r) for r in overseas_responders
-    )
     assert final_rules[-1] == {"action": "predefined", "rcode": "SERVFAIL"}
-    # The generator must pass these rules through untouched.
     assert simple.expand_dns_failover_rules(final_rules, policy.get("dns_failover")) == final_rules
+
+
+def test_china_domain_rules_precede_foreign_fallbacks():
+    """New Chinese TLDs stay direct even before remote geosite updates."""
+    policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
+    route_rules = policy["route"]["domestic_rules"]
+    dns_rules = policy["dns_rules"]["domestic_rules"]
+    cn_suffixes = {"cn", "xn--fiqs8s"}
+
+    route_suffix_rule = next(rule for rule in route_rules if rule.get("domain_suffix") == ["cn", "xn--fiqs8s"])
+    dns_suffix_rule = next(rule for rule in dns_rules if rule.get("domain_suffix") == ["cn", "xn--fiqs8s"])
+    route_cn_index = next(i for i, rule in enumerate(route_rules) if rule.get("rule_set") == ["geosite-cn"])
+    route_foreign_index = next(i for i, rule in enumerate(route_rules) if rule.get("rule_set") == ["geosite-geolocation-!cn"])
+    dns_cn_index = next(i for i, rule in enumerate(dns_rules) if rule.get("rule_set") == ["geosite-cn"])
+    dns_foreign_index = next(i for i, rule in enumerate(dns_rules) if rule.get("rule_set") == ["geosite-geolocation-!cn"])
+
+    assert set(route_suffix_rule["domain_suffix"]) == cn_suffixes
+    assert route_suffix_rule["outbound"] == "direct"
+    assert dns_suffix_rule["server"] == "domestic"
+    assert route_cn_index < route_foreign_index
+    assert dns_cn_index < dns_foreign_index
