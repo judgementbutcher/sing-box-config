@@ -165,3 +165,46 @@ def test_audit_rejects_deprecated_tun_stack():
 
     conf["inbounds"][0].pop("stack")
     assert audit_config(conf, {"platform": "android"})["deprecated_tun_stack"] is False
+
+
+def test_audit_rejects_duplicate_dns_server_tags():
+    conf = {
+        "dns": {
+            "servers": [
+                {"tag": "remote-hk", "type": "https", "server": "1.1.1.1"},
+                {"tag": "remote-jp", "type": "https", "server": "8.8.8.8"},
+                # A proxy_detours suffix collision renders the same tag twice.
+                {"tag": "remote-hk", "type": "https", "server": "9.9.9.9"},
+            ]
+        },
+        "route": {"rules": [], "rule_set": []},
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+        ],
+    }
+
+    report = audit_config(conf)
+
+    assert not report["ok"]
+    assert report["duplicate_dns_server_tags"] == ["remote-hk"]
+    assert any("重复 DNS server tag" in message for message in report["errors"])
+
+
+def test_audit_warns_only_on_unbounded_optimistic_cache():
+    def dns(optimistic):
+        return {
+            "dns": {"servers": [{"tag": "remote", "type": "https", "server": "1.1.1.1"}], "optimistic": optimistic},
+            "route": {"rules": [], "rule_set": []},
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+        }
+
+    def warned(conf):
+        return any("optimistic" in message for message in audit_config(conf)["warnings"])
+
+    # Bounded opt-ins are a deliberate trade, not a misconfiguration.
+    assert not warned(dns({"enabled": True, "timeout": "3d"}))
+    assert not warned(dns({"enabled": False, "timeout": "3d"}))
+    assert not warned(dns(None))
+    # Unbounded ones can serve an expired address forever.
+    assert warned(dns(True))
+    assert warned(dns({"enabled": True}))

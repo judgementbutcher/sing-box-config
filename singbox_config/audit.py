@@ -46,6 +46,18 @@ def is_insecure_outbound(outbound: Dict[str, Any]) -> bool:
     return isinstance(tls, dict) and tls.get("insecure") is True
 
 
+def _dns_response_tags(rule: Any) -> list[str]:
+    if not isinstance(rule, dict):
+        return []
+    tags: list[str] = []
+    response_tag = rule.get("match_response")
+    if isinstance(response_tag, str) and response_tag.strip():
+        tags.append(response_tag)
+    for child in rule.get("rules") or []:
+        tags.extend(_dns_response_tags(child))
+    return tags
+
+
 def _dns_resolver_tag(value: Any) -> str | None:
     if isinstance(value, str):
         return value.strip() or None
@@ -199,11 +211,19 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
                     {"location": f"outbound[{outbound.get('tag')}]", "tag": str(reference)}
                 )
 
-    dns_servers = {
+    dns_server_tags = [
         str(server.get("tag"))
         for server in conf.get("dns", {}).get("servers", [])
         if isinstance(server, dict) and server.get("tag")
-    }
+    ]
+    dns_servers = set(dns_server_tags)
+    # Two resolvers sharing a tag make every lookup resolve through whichever
+    # one the core happened to keep.  A dns rule then names the intended exit
+    # while the query leaves through another one, which no static check catches
+    # and which is invisible at runtime apart from a wrong CDN edge.
+    duplicate_dns_server_tags = sorted(
+        tag for tag, count in Counter(dns_server_tags).items() if count > 1
+    )
     missing_dns_references: List[Dict[str, str]] = []
     evaluate_tags = [
         str(rule.get("tag"))
@@ -223,11 +243,11 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
             missing_dns_references.append(
                 {"location": f"dns.rules[{index}].server", "tag": str(rule["server"])}
             )
-        response_tag = rule.get("match_response") if isinstance(rule, dict) else None
-        if isinstance(response_tag, str) and response_tag not in evaluate_tag_set:
-            missing_response_references.append(
-                {"location": f"dns.rules[{index}].match_response", "tag": response_tag}
-            )
+        for response_tag in _dns_response_tags(rule):
+            if response_tag not in evaluate_tag_set:
+                missing_response_references.append(
+                    {"location": f"dns.rules[{index}].match_response", "tag": response_tag}
+                )
     default_resolver = _dns_resolver_tag(conf.get("route", {}).get("default_domain_resolver"))
     if default_resolver and default_resolver not in dns_servers:
         missing_dns_references.append(
@@ -451,6 +471,8 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         errors.append(f"存在 {len(missing_dns_references)} 个不存在的 DNS server 引用")
     if duplicate_evaluate_tags:
         errors.append(f"存在重复 DNS evaluate tag: {', '.join(duplicate_evaluate_tags)}")
+    if duplicate_dns_server_tags:
+        errors.append(f"存在重复 DNS server tag: {', '.join(duplicate_dns_server_tags)}")
     if missing_response_references:
         errors.append(f"存在 {len(missing_response_references)} 个不存在的 DNS evaluate 响应引用")
     if dns_dependency_cycles:
@@ -470,9 +492,16 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
     insecure_nodes = sum(1 for item in nodes if is_insecure_outbound(item))
     if insecure_nodes:
         warnings.append(f"有 {insecure_nodes} 个节点关闭了 TLS 证书校验")
+    # Optimistic caching is a deliberate trade (stale answer during the refresh
+    # window).  Only flag it when that window is unbounded: an explicit
+    # ``timeout`` bounds how long an expired answer may be served, so a bounded
+    # opt-in is a configured choice, not a misconfiguration.
     optimistic = conf.get("dns", {}).get("optimistic")
-    if optimistic is True or (isinstance(optimistic, dict) and optimistic.get("enabled") is True):
-        warnings.append("已启用 optimistic DNS，过期地址可能继续被返回")
+    if optimistic is True:
+        warnings.append("已启用 optimistic DNS 且未设 timeout，过期地址可能被无限期返回")
+    elif isinstance(optimistic, dict) and optimistic.get("enabled") is True:
+        if not optimistic.get("timeout"):
+            warnings.append("已启用 optimistic DNS 且未设 timeout，过期地址可能被无限期返回")
 
     report = {
         "ok": not errors,
@@ -500,6 +529,7 @@ def audit_config(conf: Dict[str, Any], limits: Dict[str, Any] | None = None) -> 
         "missing_references": missing_references,
         "missing_dns_references": missing_dns_references,
         "duplicate_evaluate_tags": duplicate_evaluate_tags,
+        "duplicate_dns_server_tags": duplicate_dns_server_tags,
         "missing_response_references": missing_response_references,
         "dns_dependency_cycles": dns_dependency_cycles,
         "local_dns_loop_risk": local_dns_loop_risk,

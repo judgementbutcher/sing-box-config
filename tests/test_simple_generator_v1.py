@@ -241,10 +241,11 @@ def test_current_sources_generate_small_valid_profiles():
         sources,
     )
 
-    assert [item["tag"] for item in desktop["outbounds"][:8]] == [
+    assert [item["tag"] for item in desktop["outbounds"][:9]] == [
         "Available",
         "AI",
         "direct",
+        "Other",
         "Emby",
         "YouTube",
         "Spotify",
@@ -253,52 +254,91 @@ def test_current_sources_generate_small_valid_profiles():
     ]
     selector_by_tag = {item["tag"]: item for item in desktop["outbounds"] if item.get("type") == "selector"}
     outbound_by_tag = {item["tag"]: item for item in desktop["outbounds"] if item.get("tag")}
-    # The YouTube group mirrors Available's entries and follows Available by
-    # default, so it only changes behaviour once a node is pinned in the panel.
-    assert selector_by_tag["YouTube"]["outbounds"] == [
-        "Available",
-        *outbound_by_tag["Available"]["outbounds"],
-    ]
+    # Service groups mirror Available's entries and follow Available by default,
+    # so they only diverge once a node is pinned in the panel.  The cold-region
+    # "Other" pool is the one exception: it joins Available after those groups
+    # captured their membership, so it is not repeated in each of them.
+    available_members = outbound_by_tag["Available"]["outbounds"]
+    assert available_members[-1] == "Other"
+    service_members = ["Available", *available_members[:-1]]
+    assert selector_by_tag["YouTube"]["outbounds"] == service_members
     assert selector_by_tag["YouTube"]["default"] == "Available"
     # Spotify keeps direct as the default: the account-region check rejects
     # datacentre proxy exits. Proxy members remain selectable in the panel.
-    assert selector_by_tag["Spotify"]["outbounds"] == [
-        "direct",
-        "Available",
-        *outbound_by_tag["Available"]["outbounds"],
-    ]
+    assert selector_by_tag["Spotify"]["outbounds"] == ["direct", *service_members]
     assert selector_by_tag["Spotify"]["default"] == "direct"
     # Telegram is proxy-only: no direct member, follows Available by default.
-    assert selector_by_tag["Telegram"]["outbounds"] == [
-        "Available",
-        *outbound_by_tag["Available"]["outbounds"],
-    ]
+    assert selector_by_tag["Telegram"]["outbounds"] == service_members
     assert selector_by_tag["Telegram"]["default"] == "Available"
     assert "direct" not in selector_by_tag["Telegram"]["outbounds"]
     # Twitch mirrors Telegram: proxy-only, follows Available by default.
     assert selector_by_tag["Twitch"]["outbounds"] == selector_by_tag["Telegram"]["outbounds"]
     assert selector_by_tag["Twitch"]["default"] == "Available"
     assert "direct" not in selector_by_tag["Twitch"]["outbounds"]
-    # AI membership stays inside the selectors.ai_regions whitelist: HK and
-    # unidentified-region nodes must never appear, whatever the subscriptions
-    # refresh to.
-    assert {simple.detect_region(member) for member in selector_by_tag["AI"]["outbounds"]} <= {"US", "JP", "SG", "TW"}
+    # AI membership stays inside the selectors.ai_regions whitelist plus any node
+    # a subscription explicitly opts in via ai_include (PPFlight names carry no
+    # region keyword, so its nodes are Others and only qualify through the
+    # pattern).  The trailing "Other" entry is the cold-region pool selector
+    # (selectors.other), not a node — it only routes there when explicitly
+    # picked in the panel.
+    manifest = simple.load_yaml(ROOT / "config" / "local" / "subscriptions.yaml")
+    ai_includes = [
+        pattern
+        for item in manifest.get("subscriptions", [])
+        for pattern in simple.compile_patterns(item.get("ai_include"), "ai_include")
+    ]
+    ai_members = selector_by_tag["AI"]["outbounds"]
+    assert ai_members[-1] == "Other"
+    for member in ai_members[:-1]:
+        assert simple.detect_region(member) in {"US", "JP", "SG", "TW"} or simple.matches_any(
+            ai_includes, member
+        ), member
     # Region priority follows the whitelist order: US members lead and the
-    # group default is a US node; JP/SG/TW only serve as backup.
-    ai_region_order = [simple.detect_region(member) for member in selector_by_tag["AI"]["outbounds"]]
+    # group default is a US node; JP/SG/TW only serve as backup.  ai_include
+    # nodes have no whitelist region, so they sort last, right before "Other".
     priority = {"US": 0, "JP": 1, "SG": 2, "TW": 3}
-    assert [priority[r] for r in ai_region_order] == sorted(priority[r] for r in ai_region_order)
+    ordered_regions = [
+        r
+        for r in (priority.get(simple.detect_region(member)) for member in ai_members[:-1])
+        if r is not None
+    ]
+    assert ordered_regions == sorted(ordered_regions)
     assert simple.detect_region(selector_by_tag["AI"]["default"]) == "US"
+    # The cold-region pool holds only Others-region nodes.  It is a member of
+    # Available (so it can be picked at all) and of AI (after the whitelist
+    # nodes), but NOT of the service groups: those follow Available
+    # member-for-member, and every Other node has an unrecognised region.
+    other_group = selector_by_tag["Other"]
+    assert other_group["outbounds"] and simple.detect_region(other_group["default"]) == "Others"
+    assert {simple.detect_region(member) for member in other_group["outbounds"]} == {"Others"}
+    assert "Other" in selector_by_tag["Available"]["outbounds"]
+    assert "Other" in selector_by_tag["AI"]["outbounds"]
+    # The service groups are built from the Available membership captured before
+    # Other joins it, so they mirror Available minus that trailing entry.  Other
+    # stays reachable through them by being picked inside Available itself.
+    declared = {
+        str(group["tag"]): str(group.get("direct") or "")
+        for group in policy["selectors"]["groups"]
+    }
+    for tag in ("Emby", "YouTube", "Spotify", "Telegram", "Twitch"):
+        expected = list(service_members)
+        if declared[tag] == "last":
+            expected.append("direct")
+        elif declared[tag] == "default":
+            expected.insert(0, "direct")
+        assert "Other" not in selector_by_tag[tag]["outbounds"], tag
+        assert selector_by_tag[tag]["outbounds"] == expected, tag
     # Google Play is referenced only by the Android profile, so the desktop
     # panel must not contain the group.
     assert "Google Play" not in outbound_by_tag
     android_selector_by_tag = {
         item["tag"]: item for item in android["outbounds"] if item.get("type") == "selector"
     }
-    assert [item["tag"] for item in android["outbounds"][:9]] == [
+    assert [item["tag"] for item in android["outbounds"][:10]] == [
         "Available",
         "AI",
         "direct",
+        "Other",
         "Emby",
         "YouTube",
         "Spotify",
@@ -322,7 +362,7 @@ def test_current_sources_generate_small_valid_profiles():
     # remain visible in each subscription selector.
     assert len([item for item in desktop["outbounds"] if item.get("type") == "vless"]) >= 4
     assert desktop["experimental"]["cache_file"]["store_dns"] is True
-    assert len(desktop["route"]["rules"]) == 26
+    assert len(desktop["route"]["rules"]) == 33
     assert {
         "domain_suffix": ["emby.kingemby.com", "media.wybcs.work"],
         "action": "route",
@@ -345,18 +385,26 @@ def test_current_sources_generate_small_valid_profiles():
         for rule in desktop["dns"]["rules"]
         if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "emby-domains")
     ]
-    assert {rule["server"] for rule in emby_group_evaluations} == {"google", "cloudflare"}
+    assert {rule["server"] for rule in emby_group_evaluations} == {"google-emby", "cloudflare-emby"}
+    assert {
+        server["detour"] for server in desktop["dns"]["servers"] if server["tag"] in {"google-emby", "cloudflare-emby"}
+    } == {"Emby"}
     # The exact folded matcher set depends on the business-rule ordering; the
     # important contract here is that both proxy resolvers cover the Emby host.
     # Response-code matching separates successful answers from NXDOMAIN; only
     # successful answers participate in the race.
     for rule in desktop["dns"]["rules"]:
-        if rule.get("action") == "respond" and str(rule.get("match_response", "")).startswith("failover-"):
-            assert {"match_response", "action", "response_rcode"}.issubset(rule), rule
-            if rule["response_rcode"] == "NOERROR":
-                assert rule.get("race") is True
-            else:
-                assert "race" not in rule
+        if rule.get("action") != "respond" or not str(rule.get("match_response", "")).startswith("failover-"):
+            continue
+        # Domestic races answer only when the NOERROR is outside the sinkhole set.
+        if rule.get("rule_set") == ["domestic-dns-answers"]:
+            assert rule.get("race") is True and rule.get("response_rcode") == "NOERROR"
+            continue
+        assert {"match_response", "action", "response_rcode"}.issubset(rule), rule
+        if rule["response_rcode"] == "NOERROR":
+            assert rule.get("race") is True
+        else:
+            assert "race" not in rule
     assert desktop["inbounds"][0]["strict_route"] is True
     assert "route_exclude_address_set" not in desktop["inbounds"][0]
     dns_server_ips = {
@@ -371,6 +419,11 @@ def test_current_sources_generate_small_valid_profiles():
     assert "find_process" not in desktop["route"]
     route_rules = desktop["route"]["rules"]
     hijack_index = next(i for i, rule in enumerate(route_rules) if rule.get("action") == "hijack-dns")
+    dns_pin = route_rules[hijack_index + 1]
+    assert dns_pin["outbound"] == "direct" and dns_pin["port"] == 443
+    assert dns_pin["ip_cidr"] == ["223.5.5.5/32", "1.12.12.12/32"]
+    sniff_index = next(i for i, rule in enumerate(route_rules) if rule.get("action") == "sniff")
+    assert hijack_index < route_rules.index(dns_pin) < sniff_index
     peer_index = next(i for i, rule in enumerate(route_rules) if rule.get("ip_cidr") == [
         "172.18.0.0/30", "fdfe:dcba:9876::/126"
     ])
@@ -383,19 +436,22 @@ def test_current_sources_generate_small_valid_profiles():
     # ``stack``. Provider cache paths are separate per remote source.
     assert "stack" not in desktop["inbounds"][0]
     assert "stack" not in android["inbounds"][0]
-    assert android["inbounds"][0]["route_exclude_address"] == [
-        "10.0.0.0/8",
-        "169.254.0.0/16",
-        "192.168.0.0/16",
-        "fc00::/7",
-        "fe80::/10",
-    ]
+    assert "udp_timeout" not in android["inbounds"][0]
+    assert "mtu" not in android["inbounds"][0]
+    assert "mtu" not in desktop["inbounds"][0]
+    assert "udp_timeout" not in desktop["inbounds"][0]
+    assert "172.18.0.0/30" not in android["inbounds"][0]["route_exclude_address"]
+    assert "172.16.0.0/15" in android["inbounds"][0]["route_exclude_address"]
+    assert "172.18.0.4/30" in android["inbounds"][0]["route_exclude_address"]
     assert desktop["experimental"]["urltest_unified_delay"] is True
     assert android["experimental"]["urltest_unified_delay"] is True
-    assert "optimistic" not in desktop["dns"]
-    assert "optimistic" not in android["dns"]
+    # Optimistic caching serves the stale record immediately and refreshes in
+    # the background, so an expired TTL never costs an application a DoH race.
+    expected_optimistic = {"enabled": True, "timeout": "3d"}
+    assert desktop["dns"]["optimistic"] == expected_optimistic
+    assert android["dns"]["optimistic"] == expected_optimistic
     assert desktop["route"]["default_domain_resolver"] == {
-        "server": "domestic",
+        "server": "domestic-bootstrap",
         "timeout": "2s",
     }
     domain_nodes = [
@@ -404,7 +460,12 @@ def test_current_sources_generate_small_valid_profiles():
         if outbound.get("server") and not simple._is_ip_address(str(outbound["server"]))
     ]
     assert domain_nodes
-    assert all(node["domain_resolver"] == {"server": "domestic", "timeout": "2s"} for node in domain_nodes)
+    assert all(node["domain_resolver"] == {"server": "domestic-bootstrap", "timeout": "2s"} for node in domain_nodes)
+    assert desktop["dns"]["cache_capacity"] == 4096
+    assert desktop["dns"]["min_cache_ttl"] == 60
+    assert desktop["dns"]["max_cache_ttl"] == 1800
+    bootstrap = next(server for server in desktop["dns"]["servers"] if server.get("tag") == "domestic-bootstrap")
+    assert bootstrap == {"type": "group", "tag": "domestic-bootstrap", "servers": ["domestic", "domestic-backup"]}
     assert not any("initial_path" in item for item in desktop["route"]["rule_set"])
     china_rule_set = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "china-direct")
     assert china_rule_set["tag"] == "china-direct"
@@ -412,11 +473,35 @@ def test_current_sources_generate_small_valid_profiles():
     assert china_rule_set["rules"]
     assert "path" not in china_rule_set
     assert "format" not in china_rule_set
-    assert len(android["route"]["rules"]) == 26
+    assert len(android["route"]["rules"]) == 33
+    # B 站 PCDN（MCDN）取流节点必须被拒：手机端 playurl 的主地址和第一备用
+    # 都是这类节点（os=mcdn，8082/4483 端口），走 TUN 时对传建不起来会卡住
+    # 播放器；拒掉后播放器改用已签发的普通 CDN 备用地址（upos-*，443）。
+    # 规则必须排在 china-direct 之前——mcdn.bilivideo.cn 本身命中 bilivideo.cn。
+    pcdn_index = next(
+        i
+        for i, rule in enumerate(desktop["route"]["rules"])
+        if rule.get("action") == "reject" and dns_matcher_covers(rule, "domain_suffix", "mcdn.bilivideo.cn")
+    )
+    china_direct_index = next(
+        i for i, rule in enumerate(desktop["route"]["rules"]) if rule.get("rule_set") == ["china-direct"]
+    )
+    assert pcdn_index < china_direct_index
+    for suffix in ("mcdn.bilivideo.cn", "mcdn.bilivideo.com", "szbdyd.com", "edge.mountaintoys.cn"):
+        assert dns_matcher_covers(desktop["route"]["rules"][pcdn_index], "domain_suffix", suffix)
+        # 同一个 reject 规则会推导出同序的 NXDOMAIN，取流地址连解析都拿不到。
+        assert any(
+            rule.get("action") == "predefined"
+            and rule.get("rcode") == "NXDOMAIN"
+            and dns_matcher_covers(rule, "domain_suffix", suffix)
+            for rule in desktop["dns"]["rules"]
+        )
     assert any(rule.get("rule_set") == ["geosite-telegram"] and rule.get("outbound") == "Telegram" for rule in desktop["route"]["rules"])
     assert any(rule.get("rule_set") == ["geosite-twitch"] and rule.get("outbound") == "Twitch" for rule in desktop["route"]["rules"])
     assert any(
-        "91.108.4.0/22" in simple.as_list(rule.get("ip_cidr") or []) and rule.get("outbound") == "Telegram"
+        "91.105.192.0/23" in simple.as_list(rule.get("ip_cidr") or [])
+        and "91.108.4.0/22" in simple.as_list(rule.get("ip_cidr") or [])
+        and rule.get("outbound") == "Telegram"
         for rule in desktop["route"]["rules"]
     )
     assert any(rule.get("rule_set") == ["spotify-direct"] and rule.get("outbound") == "Spotify" for rule in desktop["route"]["rules"])
@@ -452,10 +537,12 @@ def test_current_sources_generate_small_valid_profiles():
         rule
         for rule in desktop["route"]["rules"]
         if rule.get("outbound") == "Available" and rule.get("domain_suffix") == [
+            "google.com",
+            "google.com.hk",
+            "gmail.com",
             "gstatic.com",
             "googleapis.com",
             "googleusercontent.com",
-            "ggpht.com",
         ]
     )
     assert desktop["route"]["rules"].index(youtube_rule) < desktop["route"]["rules"].index(google_rule)
@@ -467,6 +554,7 @@ def test_current_sources_generate_small_valid_profiles():
         if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "domain_suffix", "googlevideo.com")
     ]
     assert {rule["server"] for rule in youtube_evaluations} == {"google-youtube", "cloudflare-youtube"}
+    assert all(rule.get("rewrite_ttl") == 60 and rule.get("remove_client_subnet") is True for rule in youtube_evaluations)
     assert {
         server["detour"] for server in desktop["dns"]["servers"] if server["tag"] in {"google-youtube", "cloudflare-youtube"}
     } == {"YouTube"}
@@ -483,7 +571,30 @@ def test_current_sources_generate_small_valid_profiles():
         rule.get("server")
         for rule in desktop["dns"]["rules"]
         if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "rule_set", "geosite-telegram")
-    } == {"google", "cloudflare"}
+    } == {"google-telegram", "cloudflare-telegram"}
+    assert {
+        server["detour"]
+        for server in desktop["dns"]["servers"]
+        if server["tag"] in {"google-telegram", "cloudflare-telegram"}
+    } == {"Telegram"}
+    # Google Play exists only on Android, so its resolvers must not detour a
+    # missing outbound on desktop.
+    assert not any(server.get("detour") == "Google Play" for server in desktop["dns"]["servers"])
+    assert {
+        server["detour"] for server in android["dns"]["servers"] if server["tag"] in {"google-play", "cloudflare-play"}
+    } == {"Google Play"}
+    assert {
+        rule["server"]
+        for rule in android["dns"]["rules"]
+        if rule.get("action") == "evaluate" and dns_matcher_covers(rule, "package_name", "com.android.vending")
+    } == {"google-play", "cloudflare-play"}
+    play_suffixes = next(
+        item["rules"][0]["domain_suffix"]
+        for item in android["route"]["rule_set"]
+        if item.get("tag") == "google-play"
+    )
+    assert "play-lh.googleusercontent.com" in play_suffixes
+    assert "googleusercontent.com" not in play_suffixes
     # Twitch resolves through resolvers detoured via the Twitch selector, same
     # rationale as YouTube: stream edges follow the egress region.
     twitch_evaluations = [
@@ -1008,6 +1119,49 @@ def test_custom_rules_are_inserted_between_pre_rules_and_business():
     assert front_index < sniff_index < normal_index < store_index
 
 
+def test_ssh_port_is_routed_direct_after_the_pre_rule_guards():
+    """Port 22 must bypass route.final (Available), whose proxy exits drop it.
+
+    The rule has to sit after the IPv6 and TUN-address rejects so those still
+    win, and it must not carry ``ip_version: 4``: that matcher only compares
+    literal addresses, so a domain destination (``ssh host``) would slip past
+    it and fall through to the proxy exit.
+    """
+    conf: dict = {}
+    policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
+    simple.assemble_rules(
+        conf,
+        policy,
+        simple.load_yaml(ROOT / "config" / "profiles" / "desktop.yaml"),
+        {"schema_version": 1},
+        layout=simple.build_dns_layout(policy),
+    )
+    rules = conf["route"]["rules"]
+
+    ssh_index = next(
+        i
+        for i, rule in enumerate(rules)
+        if rule.get("port") == 22 and rule.get("action") == "route"
+    )
+    assert rules[ssh_index] == {"port": 22, "action": "route", "outbound": "direct"}
+
+    # The IPv6 and TUN-self rejects must still match before the direct rule.
+    ipv6_reject = next(i for i, rule in enumerate(rules) if rule.get("ip_version") == 6)
+    tun_reject = next(
+        i
+        for i, rule in enumerate(rules)
+        if rule.get("ip_cidr") == ["172.18.0.0/30", "fdfe:dcba:9876::/126"]
+    )
+    assert ipv6_reject < ssh_index
+    assert tun_reject < ssh_index
+    # It must still beat every domain-based rule: a proxy exit that drops :22
+    # would otherwise be chosen for a host whose domain matches a later rule.
+    business_index = next(
+        i for i, rule in enumerate(rules) if rule.get("rule_set") == ["geosite-geolocation-!cn"]
+    )
+    assert ssh_index < business_index
+
+
 @requires_local
 def test_generated_json_contains_no_legacy_download_detour(tmp_path):
     simple.generate("all", output_dir=tmp_path)
@@ -1143,7 +1297,42 @@ def test_derived_dns_rules_follow_outbound_resolvers():
         {"domain_suffix": ["emby.example"], "action": "route", "server": "google"},
         {"rule_set": ["spotify"], "action": "route", "server": "domestic"},
         {"rule_set": ["ads"], "action": "predefined", "rcode": "NXDOMAIN"},
+        {"process_name": ["app.exe"], "action": "route", "server": "google"},
     ]
+
+
+def test_proxy_detour_skips_optional_groups_and_rejects_unknown():
+    policy = {
+        "selectors": {"groups": [{"tag": "Google Play", "when_referenced": True}]},
+        "dns_upstreams": {**SINGLE_UPSTREAMS, "proxy_detours": {"Available": "", "Google Play": "play"}},
+    }
+    layout = simple.build_dns_layout(policy, {"Available", "direct"})
+    assert {server["tag"] for server in layout.servers} == {"domestic", "google"}
+    policy["dns_upstreams"] = {**policy["dns_upstreams"], "proxy_detours": {"Available": "", "Missing": "x"}}
+    with pytest.raises(ValueError, match="不存在的出站: Missing"):
+        simple.build_dns_layout(policy, {"Available", "direct"})
+
+
+def test_proxy_detour_rejects_colliding_suffixes():
+    """Two detours sharing a suffix would render the same tag twice.
+
+    The core keeps whichever server it saw first, so a dns rule naming the
+    intended exit would quietly resolve through another one — a far-away CDN
+    edge, or a domestic answer handed to proxied traffic.  Nothing downstream
+    can detect it, so the generator refuses to render the config.
+    """
+    policy = {
+        "dns_upstreams": {
+            **SINGLE_UPSTREAMS,
+            "proxy_detours": {"Available": "", "YouTube": "dup", "Twitch": "dup"},
+        }
+    }
+    with pytest.raises(ValueError, match="重复的 DNS server tag: google-dup"):
+        simple.build_dns_layout(policy, {"Available", "YouTube", "Twitch"})
+    # Distinct suffixes still render fine.
+    policy["dns_upstreams"]["proxy_detours"] = {"Available": "", "YouTube": "yt", "Twitch": "tw"}
+    tags = [server["tag"] for server in simple.build_dns_layout(policy, {"Available", "YouTube", "Twitch"}).servers]
+    assert tags == ["domestic", "google", "google-yt", "google-tw"]
 
 
 def test_derived_dns_rejects_mixed_route_only_matchers():
@@ -1300,8 +1489,20 @@ def test_dns_final_race_is_appended_last():
     assert rules[0] == {"domain_suffix": ["a.cn"], "action": "route", "server": "cn"}
     # Unknown domains race both proxy resolvers and never reach the domestic one.
     assert rules[1:] == [
-        {"action": "evaluate", "server": "google", "tag": "failover-1-google", "timeout": "2s"},
-        {"action": "evaluate", "server": "cloudflare", "tag": "failover-1-cloudflare", "timeout": "2s"},
+        {
+            "action": "evaluate",
+            "server": "google",
+            "tag": "failover-1-google",
+            "timeout": "2s",
+            "remove_client_subnet": True,
+        },
+        {
+            "action": "evaluate",
+            "server": "cloudflare",
+            "tag": "failover-1-cloudflare",
+            "timeout": "2s",
+            "remove_client_subnet": True,
+        },
         {"match_response": "failover-1-google", "response_rcode": "NOERROR", "action": "respond", "race": True},
         {"match_response": "failover-1-cloudflare", "response_rcode": "NOERROR", "action": "respond", "race": True},
         {"match_response": "failover-1-google", "response_rcode": "NXDOMAIN", "action": "respond"},
@@ -1311,6 +1512,89 @@ def test_dns_final_race_is_appended_last():
     assert {server["detour"] for server in conf["dns"]["servers"] if server["tag"] in {"google", "cloudflare"}} == {
         "Available"
     }
+
+
+def test_dns_race_strips_ecs_caps_proxy_ttl_and_drops_domestic_sinkholes():
+    source = simple.BuiltSource(
+        name="provider",
+        order=10,
+        entry_tag="Provider",
+        node_tags=["Provider"],
+        nodes=[{"type": "direct", "tag": "Provider"}],
+        groups=[],
+        ai_node_tags=["Provider"],
+    )
+    policy = {
+        "selectors": {"available": "Available", "ai": "AI", "direct": "direct"},
+        "dns_upstreams": {
+            "timeout": "2s",
+            "proxy_rewrite_ttl": 60,
+            "domestic_reject_answers": ["0.0.0.0/32", "10.0.0.0/8"],
+            "domestic": [
+                {"tag": "domestic", "server": "223.5.5.5", "server_name": "dns.alidns.com"},
+                {"tag": "domestic-backup", "server": "1.12.12.12", "server_name": "doh.pub"},
+            ],
+            "proxy": [
+                {"tag": "google", "server": "8.8.8.8", "server_name": "dns.google"},
+                {"tag": "cloudflare", "server": "1.1.1.1", "server_name": "cloudflare-dns.com"},
+            ],
+            "proxy_detours": {"Available": ""},
+        },
+        "config": {"dns": {"final": "google"}},
+        "route": {
+            "pre_rules": [
+                {"port": 53, "action": "hijack-dns"},
+                {"action": "sniff", "timeout": "300ms"},
+            ],
+            "domestic_rules": [
+                {"domain_suffix": ["a.cn"], "action": "route", "outbound": "direct"},
+                {"domain_suffix": ["a.com"], "action": "route", "outbound": "Available"},
+            ],
+        },
+    }
+    conf = simple.build_config("desktop", policy, {"platform": "desktop"}, {"schema_version": 1}, [source])
+    route_rules = conf["route"]["rules"]
+    assert route_rules[0]["action"] == "hijack-dns"
+    assert route_rules[1] == {
+        "port": 443,
+        "ip_cidr": ["223.5.5.5/32", "1.12.12.12/32"],
+        "action": "route",
+        "outbound": "direct",
+    }
+    assert route_rules[2]["action"] == "sniff"
+    assert "8.8.8.8/32" not in route_rules[1]["ip_cidr"]
+
+    domestic = next(
+        rule for rule in conf["dns"]["rules"]
+        if rule.get("action") == "respond" and rule.get("match_response") == "failover-1-domestic"
+    )
+    assert domestic == {
+        "match_response": "failover-1-domestic",
+        "response_rcode": "NOERROR",
+        "rule_set": ["domestic-dns-answers"],
+        "action": "respond",
+        "race": True,
+    }
+    answer_set = next(item for item in conf["route"]["rule_set"] if item.get("tag") == "domestic-dns-answers")
+    assert answer_set["rules"] == [{"ip_cidr": ["0.0.0.0/32", "10.0.0.0/8"], "invert": True}]
+    proxy = next(
+        rule for rule in conf["dns"]["rules"]
+        if rule.get("action") == "respond" and rule.get("match_response") == "failover-2-google"
+    )
+    assert proxy == {
+        "match_response": "failover-2-google",
+        "response_rcode": "NOERROR",
+        "action": "respond",
+        "race": True,
+    }
+    proxy_query = next(rule for rule in conf["dns"]["rules"] if rule.get("tag") == "failover-2-google")
+    assert proxy_query["rewrite_ttl"] == 60 and proxy_query["remove_client_subnet"] is True
+    domestic_query = next(rule for rule in conf["dns"]["rules"] if rule.get("tag") == "failover-1-domestic")
+    assert "rewrite_ttl" not in domestic_query and domestic_query["remove_client_subnet"] is True
+
+    policy["dns_upstreams"]["domestic_reject_answers"] = ["not-a-prefix"]
+    with pytest.raises(ValueError, match="domestic_reject_answers"):
+        simple.build_config("desktop", policy, {"platform": "desktop"}, {"schema_version": 1}, [source])
 
 
 def test_profiles_reject_hand_written_dns_rules():
@@ -1330,3 +1614,178 @@ def test_china_domain_rules_precede_foreign_fallbacks():
     assert route_suffix_rule["outbound"] == "direct"
     assert "dns" not in route_suffix_rule
     assert route_cn_index < route_foreign_index
+
+
+def test_route_follows_official_sets_and_kernel_defaults():
+    """Playback domains, Telegram DCs and TUN defaults follow upstream, not stale local copies."""
+    policy = simple.load_yaml(ROOT / "config" / "policy.yaml")
+    source = simple.BuiltSource(
+        name="node",
+        order=1,
+        entry_tag="US-One",
+        node_tags=["US-One"],
+        nodes=[{"type": "direct", "tag": "US-One"}],
+        groups=[],
+        ai_node_tags=["US-One"],
+    )
+    empty = {"schema_version": 1}
+    desktop = simple.build_config(
+        "desktop", policy, simple.load_yaml(ROOT / "config" / "profiles" / "desktop.yaml"), empty, [source]
+    )
+    android = simple.build_config(
+        "android", policy, simple.load_yaml(ROOT / "config" / "profiles" / "android.yaml"), empty, [source]
+    )
+
+    for conf in (desktop, android):
+        inbound = conf["inbounds"][0]
+        assert "mtu" not in inbound
+        assert "udp_timeout" not in inbound
+        assert "stack" not in inbound
+        assert conf["log"]["level"] == "warn"
+        assert "disabled" not in conf["log"]
+
+    rules = desktop["route"]["rules"]
+    youtube = next(rule for rule in rules if rule.get("outbound") == "YouTube" and rule.get("domain_suffix"))
+    youtube_set = next(rule for rule in rules if rule.get("rule_set") == ["geosite-youtube"])
+    google = next(rule for rule in rules if rule.get("domain_suffix") and "googleapis.com" in rule["domain_suffix"])
+    assert rules.index(youtube) < rules.index(youtube_set) < rules.index(google)
+    for name in (
+        "googlevideo.com",
+        "ggpht.com",
+        "yt3.googleusercontent.com",
+        "youtubeembeddedplayer.googleapis.com",
+        "wide-youtube.l.google.com",
+    ):
+        assert name in youtube["domain_suffix"]
+    assert "ggpht.com" not in google["domain_suffix"]
+    assert {"google.com", "google.com.hk", "gmail.com"} <= set(google["domain_suffix"])
+    ai_index = next(i for i, rule in enumerate(rules) if rule.get("outbound") == "AI")
+    assert ai_index < rules.index(google)
+
+    telegram = next(rule for rule in rules if rule.get("outbound") == "Telegram" and rule.get("ip_cidr"))
+    assert "91.105.192.0/23" in telegram["ip_cidr"]
+    assert not any("/" in item and ":" in item.split("/")[0] for item in telegram["ip_cidr"])
+
+    china = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "china-direct")
+    china_names = china["rules"][0]["domain_suffix"]
+    assert china_names
+    assert not any(name == "cn" or name.endswith(".cn") for name in china_names)
+    assert "bilibili.com" in china_names and "bilivideo.cn" not in china_names
+
+    spotify = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "spotify-direct")
+    spotify_names = set(spotify["rules"][0]["domain_suffix"])
+    assert {
+        "spotifycdn.net",
+        "audio4-ak-spotify-com.akamaized.net",
+        "audio-akp-spotify-com.akamaized.net",
+    } <= spotify_names
+    cdn = next(item for item in desktop["route"]["rule_set"] if item.get("tag") == "direct-cdn")
+    assert "steamcdn-a.akamaihd.net" in cdn["rules"][0]["domain_suffix"]
+    assert "akamaihd.net" not in cdn["rules"][0]["domain_suffix"]
+
+    remote_tags = [
+        tag
+        for item in desktop["route"]["rule_set"]
+        if item.get("type") == "remote"
+        for tag in simple.rule_set_tags(item)
+    ]
+    assert "geosite-youtube" in remote_tags
+
+    pcdn = next(
+        i
+        for i, rule in enumerate(rules)
+        if rule.get("action") == "reject" and "mcdn.bilivideo.cn" in simple.as_list(rule.get("domain_suffix"))
+    )
+    cn_suffix = next(i for i, rule in enumerate(rules) if rule.get("domain_suffix") == ["cn", "xn--fiqs8s"])
+    assert pcdn < cn_suffix
+
+
+CLASH_WITH_HOSTS = """
+hosts:
+  node.example.com: real.example.net
+  chain.example.com: node.example.com
+proxies:
+  - name: HK
+    type: trojan
+    server: node.example.com
+    port: 443
+    password: secret
+    sni: cover.example
+    skip-cert-verify: true
+  - name: Chained
+    type: trojan
+    server: chain.example.com
+    port: 8443
+    password: secret
+    sni: cover.example
+    skip-cert-verify: true
+"""
+
+
+def test_use_hosts_rewrites_only_the_marked_clash_subscription(tmp_path):
+    (tmp_path / "west.yaml").write_text(CLASH_WITH_HOSTS, encoding="utf-8")
+    (tmp_path / "plain.yaml").write_text(
+        CLASH_WITH_HOSTS.replace("name: HK", "name: PlainHK").replace("name: Chained", "name: PlainChain"),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "subscriptions.yaml"
+    manifest.write_text(
+        """schema_version: 1
+subscriptions:
+  - name: west
+    format: clash
+    source: file
+    path: west.yaml
+    provider: false
+    group: West
+    prefix_node_tags: false
+    allow_insecure: true
+    use_hosts: true
+  - name: plain
+    format: clash
+    source: file
+    path: plain.yaml
+    provider: false
+    group: Plain
+    prefix_node_tags: false
+    allow_insecure: true
+""",
+        encoding="utf-8",
+    )
+    sources = simple.load_sources(
+        manifest,
+        {"subscription": {}, "node_dns_resolver": {"server": "domestic", "timeout": "2s"}},
+        offline=False,
+        fetch_proxy=None,
+    )
+    by_name = {source.name: source for source in sources}
+    west = {node["tag"]: node for node in by_name["west"].nodes}
+    plain = {node["tag"]: node for node in by_name["plain"].nodes}
+    assert west["HK"]["server"] == "real.example.net"
+    assert west["Chained"]["server"] == "real.example.net"
+    assert west["HK"]["tls"]["server_name"] == "cover.example"
+    assert west["HK"]["domain_resolver"] == {"server": "domestic", "timeout": "2s"}
+    assert plain["PlainHK"]["server"] == "node.example.com"
+    assert plain["PlainChain"]["server"] == "chain.example.com"
+
+
+def test_use_hosts_rejects_non_clash_subscription(tmp_path):
+    (tmp_path / "node.json").write_text(
+        json.dumps({"outbounds": [{"type": "vless", "tag": "One", "server": "one.example", "server_port": 443, "uuid": "one"}]}),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "subscriptions.yaml"
+    manifest.write_text(
+        """schema_version: 1
+subscriptions:
+  - name: local
+    format: singbox-json
+    source: file
+    path: node.json
+    provider: false
+    use_hosts: true
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="use_hosts 只适用于 clash 订阅"):
+        simple.load_sources(manifest, {"subscription": {}}, offline=False, fetch_proxy=None)

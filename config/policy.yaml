@@ -11,22 +11,25 @@ subscription:
 providers:
   enabled: true
   update_interval: 24h
-  health_check:
-    enabled: false
-    url: https://www.gstatic.com/generate_204
-    interval: 10m
-    timeout: 3s
 
 # 节点 server 域名的解析器：必须是不经过 TUN/代理的直连 DNS。
 # 节点域名若走 dns.final（google → detour Available），会依赖当前选中节点，
 # 当前节点不稳时测速就超时（忽隐忽现）。domain_resolver 直连解析后与代理解耦。
+# 指定 server 后核心跳过 dns.rules，所以节点域名使用 domestic-bootstrap 组，
+# 并发尝试下面两条国内 DoH；任一路失败不会阻塞节点拨号。
+# 生成器把这两条国内 DoH 的 IP:443 固定直连，并且排在 sniff 之前：规则集还没
+# 加载时，这条连接不会掉进 route.final（Available）再回头解析节点域名。
 node_dns_resolver:
-  server: domestic
+  # 节点域名解析不能只依赖单个 DoH。这个组由生成器配置为
+  # domestic + domestic-backup 并行请求，任一路不可用时仍能启动节点。
+  server: domestic-bootstrap
   timeout: 2s
 
 # DoH 解析器模板。每项展开为 443 端口、/dns-query 路径、启用 TLS 的 https
-# 服务器；同一组内的解析器在每次查询时并行竞速（evaluate ×N → respond
-# NOERROR ×N → respond NXDOMAIN ×N → SERVFAIL），timeout 是单路上限。
+# 服务器；同一组内的解析器在每次查询时并行竞速（evaluate ×N → 未污染的
+# NOERROR 竞速 → NXDOMAIN ×N → SERVFAIL），timeout 是单路上限。
+# 每一路竞速都会去掉 EDNS Client Subnet，让解析器只看连接的真实来源：
+# 国内 DoH 看到家里的地址，代理 DoH 看到节点出口，而不是应用自己塞的前缀。
 #
 # server 一律写 IP，避免"解析器自己需要被解析"的自举问题。
 #
@@ -38,12 +41,37 @@ node_dns_resolver:
 # 过滤器还会拦截非 TUN 接口上的 53 端口，所以直连 DNS 一律走 443 上的 DoH。
 #
 # proxy 按 proxy_detours 为每个出口各展开一组，tag 为 <tag>-<后缀>，空后缀
-# 即 google/cloudflare 本身。解析出口必须与连接出口一致：googlevideo.com、
-# ttvnw.net 等按解析器出口所在地分配 CDN 边缘，解析走 Available、播放走单独
-# 挑的节点时边缘与出口不在一地，取流会绕远。路由规则交给某个出口时，DNS
-# 自动使用该出口的解析器；出口不在此列表中时使用 Available 的解析器。
+# 即 google/cloudflare 本身。解析出口必须与连接出口一致：面板里单独挑了节点
+# 之后，解析仍走 Available 会拿到另一地的 CDN 边缘，取流绕远。能在面板里
+# 独立于 Available 切换的分组都列在这里。when_referenced 的分组在该端没有
+# 生成时跳过（桌面端没有 Google Play）。Spotify 默认直连，规则上单独指定
+# dns: domestic，不在此列。出口不在此列表中时使用 Available 的解析器。
+# proxy_rewrite_ttl 把代理侧答案的 TTL 改成这个秒数，避免选择器换节点后
+# 还拿着上一个出口的 CDN 边缘（YouTube/Twitch 会因此 403）。
 dns_upstreams:
   timeout: 2s
+  proxy_rewrite_ttl: 60
+  # 国内解析器对下列地址返回的 NOERROR 视为失败：0.0.0.0/8（整段"本网络"，
+  # 实测 idqqimg.com / myqcloud.com 会返回 0.0.0.1 这种黑洞地址）、回环、
+  # 组播/保留，以及公开记录里反复出现的 DNS 污染地址。另一路仍可胜出；
+  # 两路都是黑洞则 SERVFAIL。240.0.0.0/4 已覆盖 243.185.187.0/24 那组保留地址。
+  domestic_reject_answers:
+    - 0.0.0.0/8
+    - 127.0.0.0/8
+    - 198.18.0.0/15
+    - 240.0.0.0/4
+    - 4.36.66.178/32
+    - 8.7.198.45/32
+    - 37.61.54.158/32
+    - 46.82.174.68/32
+    - 59.24.3.173/32
+    - 64.33.88.161/32
+    - 64.33.99.47/32
+    - 64.66.163.251/32
+    - 78.16.49.15/32
+    - 93.46.8.89/32
+    - 159.106.121.75/32
+    - 203.98.7.65/32
   domestic:
     - {tag: domestic, server: 223.5.5.5, server_name: dns.alidns.com}
     - {tag: domestic-backup, server: 1.12.12.12, server_name: doh.pub}
@@ -55,6 +83,9 @@ dns_upstreams:
     AI: ai
     YouTube: youtube
     Twitch: twitch
+    Emby: emby
+    Telegram: telegram
+    Google Play: play
 
 config:
   experimental:
@@ -69,7 +100,6 @@ config:
     # not dominate the reported delay.
     urltest_unified_delay: true
   log:
-    disabled: false
     level: warn
     timestamp: true
   dns:
@@ -80,10 +110,26 @@ config:
     reverse_mapping: true
     # 单次查询最多等待 3 秒；所有竞速块均在 2 秒内结束。
     timeout: 3s
+    # 手机应用会同时产生大量短域名查询；扩大缓存可避免反复建立 DoH 请求。
+    cache_capacity: 4096
     # reF1nd：缓存时把过短的 TTL 抬到 60 秒。每次缓存未命中都要经代理发起
     # 两路 DoH 竞速，CDN 常见的 10–30 秒 TTL 会让同一域名反复查询；60 秒内
     # 地址变化对代理与直连都无影响。
     min_cache_ttl: 60
+    # 实测（2026-10-10，本机临时测量脚本，未随仓库提交）：国内域名真实 TTL
+    # 低至 6–120 秒，CDN 8–72 秒，而 api.bilibili.com 559 秒、
+    # file.myqcloud.com 可达 3000 秒以上。上限设为 1800 秒让稳定记录不再
+    # 每 5 分钟重解析一次；代理侧答案由 dns_upstreams.proxy_rewrite_ttl
+    # 单独压到 60 秒，换节点/换网络后 CDN 边缘仍会在一分钟内跟上。
+    max_cache_ttl: 1800
+    # 乐观缓存：TTL 过期后立刻返回旧地址并在后台刷新，而不是让应用等一次
+    # 代理 DoH 竞速。实测把上游解析次数从 15.7 次/分降到 3.2 次/分（5 分钟
+    # A/B），热查询 p99 不变（0.77→0.67ms）。
+    # 代价是 TTL 刚过期的窗口内可能返回上一个地址；对已建连的会话与
+    # 已缓存的 CDN 边缘影响很小，换来的是冷启动抖动基本消失。
+    optimistic:
+      enabled: true
+      timeout: 3d
   http_clients:
     # 规则集通过代理下载，域名也用代理侧解析：国内解析器给出的是面向国内的
     # CDN 边缘，经由海外出口回连会绕远甚至失败。
@@ -94,7 +140,7 @@ config:
     auto_detect_interface: true
     default_http_client: rule-set-downloader
     default_domain_resolver:
-      server: domestic
+      server: domestic-bootstrap
       timeout: 2s
     final: Available
 
@@ -104,11 +150,19 @@ selectors:
   direct: direct
   # AI 分组地区白名单：ai: auto 只把命中这些地区的节点放进 AI 组
   # （ai: true 也只放宽 insecure 限制，地区门槛不变）。只收录 Claude/
-  # ChatGPT 等官方支持的地区；香港/大陆被上游封锁，未识别地区（Others）
-  # 不会进入，写错地区名等于收不进节点。
+  # ChatGPT 等官方支持的地区；香港/大陆被上游封锁。未识别地区（Others）
+  # 默认不进入，除非订阅用 ai_include 按节点名显式纳入（自建 ppflight-*
+  # 这类不含地区关键词的节点），写错地区名等于收不进节点。
   # 列表顺序即优先级：分组默认选中第一个地区（美国）里最靠前的节点，
-  # 其余地区仅作备用；组内同一地区的节点保持订阅原序。
+  # 其余地区仅作备用；组内同一地区的节点保持订阅原序，ai_include 进来的
+  # Others 节点排在最后。
   ai_regions: [US, JP, SG, TW]
+  # 冷门地区池：把未识别地区（Others）的分散节点收进一个名为 Other 的
+  # selector，供面板手动选用；它同时是 Available 与 AI 分组的成员（AI 里
+  # 排在白名单节点之后）。不加入业务分组：业务分组逐项跟随 Available，
+  # 而 Other 里全是未识别地区的节点，列进去会让一次误选把 YouTube/
+  # Telegram 的流量交给未经地区审核的出口。置空则不生成该分组。
+  other: Other
   interrupt_exist_connections: true
   # 业务分组：成员为 Available 及其全部条目，默认跟随 Available，需要时
   # 可在面板里单独挑节点而不影响其他流量。
@@ -166,6 +220,7 @@ rule_sets:
       - geosite-openai
       - geosite-telegram
       - geosite-twitch
+      - geosite-youtube
       - geosite-category-ads-all
     type: remote
     format: binary
@@ -183,10 +238,49 @@ route:
   pre_rules:
     - port: 53
       action: hijack-dns
+    # 系统 53 端口已被劫持。公共 DoH 的固定 IP 若放行，浏览器和系统会自己解析，
+    # 国内域名也会拿到海外边缘。核心自己的 8.8.8.8/1.1.1.1 查询带 detour，不经
+    # 路由，不会被这里丢掉。223.5.5.5 与 1.12.12.12 是国内 DoH，由生成器另固定直连。
+    - port: 443
+      ip_cidr:
+        - 1.1.1.1/32
+        - 1.0.0.1/32
+        - 8.8.8.8/32
+        - 8.8.4.4/32
+        - 9.9.9.9/32
+        - 149.112.112.112/32
+        - 208.67.222.222/32
+        - 208.67.220.220/32
+        - 223.6.6.6/32
+        - 120.53.53.53/32
+      action: reject
+      method: drop
+      dns: false
+    # DoT。Android 若把私人 DNS 设成「指定主机名」，系统不会在 853 失败后回落到
+    # 被劫持的 53，手机会表现为没有网络；自动或关闭才是这套配置的用法。
+    - port: 853
+      action: reject
+      method: drop
+      dns: false
     - action: sniff
       timeout: 300ms
     - protocol: dns
       action: hijack-dns
+    # IP 会变的公共 DoH 主机名。放在 sniff 之后才能看到 SNI；对应的 DNS 查询
+    # 直接 NXDOMAIN，查询本身也不会再发给任何解析器。
+    - domain_suffix:
+        - dns.google
+        - dns.google.com
+        - cloudflare-dns.com
+        - one.one.one.one
+        - dns.quad9.net
+        - dns.nextdns.io
+        - dns.adguard-dns.com
+        - dns.alidns.com
+        - doh.pub
+        - dns.pub
+      action: reject
+      method: drop
     # Never route packets addressed to the TUN itself back into direct.
     # The DNS peer is handled by hijack-dns above; other ports must be dropped.
     - ip_cidr: [172.18.0.0/30, 'fdfe:dcba:9876::/126']
@@ -200,11 +294,25 @@ route:
     - protocol: [bittorrent]
       action: route
       outbound: direct
+    # SSH 一律直连。route.final 是 Available，而多数机场出口封 22 端口：走代理时
+    # TCP 能建连，但服务器会在 kex_exchange_identification 阶段立刻断开（报
+    # "Connection closed by ... port 22"；连 github.com:22 也一样），所有 ssh 都失败。
+    #
+    # 放在 pre_rules 末尾（而不是 sniff 之前）是有意的：前面几条守卫必须先跑——
+    # TUN 自身网段要拒（否则到 TUN 的 22 端口会被送去直连再兜回来）、IPv6 字面量
+    # 要拒（桌面策略整体不用 IPv6）。这样一条规则就够，不必重复这些判断。
+    # 实测 sniff 对真实 SSH 客户端不增加延迟：客户端建连后立刻发 banner，嗅探
+    # 在收到首包时就结束，不会等满 300ms。
+    - port: 22
+      action: route
+      outbound: direct
+      dns: false
   business_rules:
-    # YouTube 视频链路：播放地址与取流请求的出口 IP 绑定，这些域名必须落在
-    # 同一个出口，否则分到两个节点就会 403。googlevideo.com 承载实际视频流，
-    # youtubei.googleapis.com 是取流接口，yt3/yt4.ggpht.com 是头像与封面。
-    # 必须排在下面的通用 Google 规则之前，否则会被那条规则先摘走。
+    # 播放清单和 googlevideo 取流绑在同一个出口上，拆开就会 403。
+    # 本地后缀在 geosite-youtube 下载完成前就生效，并且必须排在后面的
+    # google.com / googleapis.com / googleusercontent.com 之前。
+    # 官方 geosite-youtube 把整个 ggpht.com 和 yt3.googleusercontent.com
+    # 算进 YouTube；只写 yt3/yt4.ggpht.com 会让其余封面和播放器资源掉进通用 Google 规则。
     - domain_suffix:
         - youtube.com
         - youtu.be
@@ -213,10 +321,18 @@ route:
         - youtubekids.com
         - ytimg.com
         - googlevideo.com
+        - ggpht.com
         - youtubei.googleapis.com
         - youtube.googleapis.com
-        - yt3.ggpht.com
-        - yt4.ggpht.com
+        - youtubeembeddedplayer.googleapis.com
+        - yt3.googleusercontent.com
+        - wide-youtube.l.google.com
+        - youtube-ui.l.google.com
+      action: route
+      outbound: YouTube
+    # youtube.com.hk 这类国家域名不是 youtube.com 的后缀，交给官方规则集。
+    # 与上一条出口相同且相邻，生成时会合并成同一个 DNS 竞速块。
+    - rule_set: [geosite-youtube]
       action: route
       outbound: YouTube
     # Twitch 直播取流对节点质量敏感（twitch.tv、ttvnw.net、jtvnw.net 等），
@@ -242,17 +358,22 @@ route:
     - rule_set: [geosite-telegram]
       action: route
       outbound: Telegram
-    # Google services frequently split requests across these CDN/API domains.
-    # Keep them on the proxy path instead of letting the domestic fallback win.
+    # 页面、账号和 CDN 会拆到这些域名上。写在 geosite-cn / geoip-cn 之前，
+    # 国内规则集或污染地址就不能把它们送去直连。ggpht 已归 YouTube。
     - domain_suffix:
+        - google.com
+        - google.com.hk
+        - gmail.com
         - gstatic.com
         - googleapis.com
         - googleusercontent.com
-        - ggpht.com
       action: route
       outbound: Available
-    # Telegram data centres (apps connect by bare IP, so domain rules never see them).
+    # 数据中心 IPv4，与 https://core.telegram.org/resources/cidr.txt 对齐
+    # （含 91.105.192.0/23）。不写 IPv6：桌面更早的规则会拒绝 IPv6，安卓
+    # TUN 不接管 IPv6，DNS 又是 ipv4_only，客户端使用 A 记录。
     - ip_cidr:
+        - 91.105.192.0/23
         - 91.108.4.0/22
         - 91.108.8.0/22
         - 91.108.12.0/22
@@ -287,6 +408,24 @@ route:
       action: route
       outbound: Spotify
       dns: domestic
+    # B 站 PCDN（MCDN）取流节点。手机端 playurl 下发的主地址和第一备用都是
+    # 这类节点（URL 里带 os=mcdn，端口 8082/4483），普通 CDN（upos-*.bilivideo.com，
+    # os=coso1bv，443）只排最后一条备用。PCDN 节点是家宽/移动网里的 P2P 节点，
+    # 除下载外还要参与对传：走 TUN 时对传建不起来，播放器会挂在主地址上等
+    # （表现为刷视频时卡死），关掉 SFA 反而正常——这正是"走代理才卡"的来源，
+    # 而不是 DNS 或分流把 B 站送进了代理（实测 api.bilibili.com 走的就是家庭 IP）。
+    # 这里直接 reject（DNS 同步 NXDOMAIN），播放器会立刻改用已签发的普通 CDN
+    # 备用地址，切换在毫秒级。reject 用默认方式（RST/ICMP 不可达）保证快速失败，
+    # 不要写 method: drop。只列 PCDN 边缘域，bilivideo.com/hdslb.com 本体保持直连；
+    # 以后新增节点域时，判断依据是取流 URL 里的 os=mcdn。
+    - domain_suffix:
+        - mcdn.bilivideo.cn
+        - mcdn.bilivideo.com
+        - szbdyd.com
+        - edge.mountaintoys.cn
+      action: reject
+    # 只保留 geosite-cn 还没加载时不能走代理的名字。.cn / .com.cn / .中国
+    # 由紧随其后的后缀规则覆盖，不再写进这个名单。
     - rule_set: [china-direct]
       action: route
       outbound: direct
