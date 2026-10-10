@@ -137,23 +137,14 @@ function Invoke-Generate {
         Invoke-Python -Arguments $arguments
 
         $names = if ($Target -eq "all") { @("desktop", "android") } else { @($Target) }
-        $core = Get-CoreExecutable
-        $validator = "内置结构校验"
-        if ($core) {
-            $versionOutput = @(& $core version 2>&1)
-            if ($LASTEXITCODE -ne 0) { throw "无法运行校验核心：$core" }
-            $version = $versionOutput | Select-Object -First 1
-            if ([string]$version -ne "sing-box version $PreferredCoreVersion") {
-                throw "校验核心版本不匹配：$version；本项目要求 $PreferredCoreVersion。请更新 runtime\cores 或 SING_BOX_CORE。"
-            }
-            foreach ($name in $names) {
-                & $core check -c (Join-Path $stage "$name\config.json")
-                if ($LASTEXITCODE -ne 0) { throw "$name 配置未通过 sing-box 核心校验。" }
-            }
-            $validator = [string]$version
-        } else {
-            throw "未找到 $PreferredCoreVersion CLI 核心，未发布配置。请安装到 runtime\cores 或通过 SING_BOX_CORE 指定路径。"
+        # 校验核心必须与项目要求的版本一致，且没有可用核心时宁可不发布。
+        $core = Resolve-ValidationCore
+        if (-not $core.Path) { throw $core.Reason }
+        foreach ($name in $names) {
+            & $core.Path check -c (Join-Path $stage "$name\config.json")
+            if ($LASTEXITCODE -ne 0) { throw "$name 配置未通过 sing-box 核心校验。" }
         }
+        $validator = [string]$core.Version
 
         foreach ($name in $names) {
             $sourceConfig = Join-Path $stage "$name\config.json"
@@ -171,32 +162,45 @@ function Invoke-Generate {
     }
 }
 
-function Invoke-Publisher {
-    param([string[]]$Extra = @())
-    Ensure-PublisherFirewall
-    if ($AdvertiseHost) {
-        # 自动探测到的是 TUN/虚拟网卡地址时（例如本机 sing-box 以服务+TUN 运行），
-        # 发布链接会让手机连到它自己的 TUN，表现为 SFA 拉取报 EOF。此时手动指定
-        # 真实局域网地址：-Action publisher -AdvertiseHost 192.168.1.31
-        $Extra = @("--advertise-host", $AdvertiseHost) + $Extra
+function Get-TcpBindError {
+    param([Parameter(Mandatory)][int]$Port)
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
+        $listener.Start()
+        return 0
+    } catch [System.Net.Sockets.SocketException] {
+        $code = $_.Exception.NativeErrorCode
+        if (-not $code) { $code = $_.Exception.ErrorCode }
+        if ($code -eq 10048 -or $code -eq 10013) { return $code }
+        return 10013
+    } catch {
+        return 10013
+    } finally {
+        if ($listener) { $listener.Stop() }
     }
-    Invoke-Python -Arguments (@("-m", "singbox_config.publisher") + $Extra) | Out-Host
 }
 
-function Ensure-PublisherFirewall {
-    $displayName = "sing-box Android publisher (LAN)"
-    $rule = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
-    $portFilter = if ($rule) { $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue } else { $null }
-    $profiles = if ($rule) { [string]$rule.Profile } else { "" }
-    $portAllowed = $portFilter -and (@($portFilter | Where-Object {
-        $_.Protocol -eq "TCP" -and [string]$_.LocalPort -eq "18080"
-    }).Count -gt 0)
-    if ($rule -and $rule.Enabled -eq "True" -and $rule.Direction -eq "Inbound" -and
-        $rule.Action -eq "Allow" -and $profiles -match "(Private.*Public|Public.*Private|Any)" -and $portAllowed) {
-        return
-    }
-
-    $command = "`$ErrorActionPreference = 'Stop'; New-NetFirewallRule -DisplayName '$displayName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18080 -Profile Private,Public -ErrorAction Stop | Out-Null"
+function Enable-PublisherPort {
+    param([Parameter(Mandatory)][int]$Port)
+    # 10048 means something is already listening; the publisher reports that itself.
+    # 10013 means Windows reserved the port. Keep the saved port and ask for admin
+    # so WinNAT stops covering it, instead of moving the publisher elsewhere.
+    $code = Get-TcpBindError -Port $Port
+    if ($code -eq 0 -or $code -eq 10048) { return }
+    Write-Host "端口 $Port 被 Windows 保留（WinError $code）。需要管理员权限把这个端口留下来，不会改成其他端口。请在弹出的授权窗口里允许。" -ForegroundColor Yellow
+    $command = @"
+`$ErrorActionPreference = 'Stop'
+`$service = Get-Service -Name winnat -ErrorAction SilentlyContinue
+`$wasRunning = `$service -and `$service.Status -eq 'Running'
+if (`$wasRunning) { Stop-Service -Name winnat -Force }
+`$add = (& netsh interface ipv4 add excludedportrange protocol=tcp startport=$Port numberofports=1 2>&1 | Out-String).Trim()
+if (`$LASTEXITCODE -ne 0 -and `$add -notmatch 'exists') {
+    if (`$wasRunning) { Start-Service -Name winnat }
+    throw `$add
+}
+if (`$wasRunning) { Start-Service -Name winnat }
+"@
     try {
         $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
             "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command
@@ -204,9 +208,73 @@ function Ensure-PublisherFirewall {
         if ($elevated.ExitCode -ne 0) {
             throw "管理员进程返回退出码 $($elevated.ExitCode)"
         }
-        Write-Host "已允许 Private/Public 网络访问 TCP 18080。" -ForegroundColor Green
     } catch {
-        Write-Warning "无法自动配置 Windows 防火墙。请以管理员身份允许 Private/Public 网络的 TCP 18080，否则 Android 无法访问发布链接。"
+        throw "未能取得管理员权限，端口 $Port 仍然无法绑定。发布地址保持 $Port，没有改用其他端口。$($_.Exception.Message)"
+    }
+    $again = Get-TcpBindError -Port $Port
+    if ($again -ne 0 -and $again -ne 10048) {
+        throw "授权之后端口 $Port 仍无法绑定（Windows 错误 $again）。发布地址保持 $Port。"
+    }
+    Write-Host "已让 Windows 保留 TCP $Port 给发布器。" -ForegroundColor Green
+}
+
+function Invoke-Publisher {
+    param([string[]]$Extra = @())
+    $inspecting = @($Extra) -contains "--show-info" -or @($Extra) -contains "--rotate-credentials"
+    if ($AdvertiseHost) {
+        # 自动探测到的是 TUN/虚拟网卡地址时（例如本机 sing-box 以服务+TUN 运行），
+        # 发布链接会让手机连到它自己的 TUN，表现为 SFA 拉取报 EOF。此时手动指定
+        # 真实局域网地址：-Action publisher -AdvertiseHost 192.168.1.31
+        $Extra = @("--advertise-host", $AdvertiseHost) + $Extra
+    }
+    if (-not $inspecting) {
+        Enable-PublisherPort -Port 18080
+        Ensure-PublisherFirewall -Port 18080
+    }
+    Invoke-Python -Arguments (@("-m", "singbox_config.publisher") + $Extra) | Out-Host
+}
+
+function Ensure-PublisherFirewall {
+    param([Parameter(Mandatory)][int]$Port)
+    $displayName = "sing-box Android publisher (LAN)"
+    $rule = $null
+    $portFilter = $null
+    try {
+        $rule = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if ($rule) { $portFilter = @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue) }
+    } catch {
+        $rule = $null
+    }
+    $profiles = if ($rule) { [string]$rule.Profile } else { "" }
+    $portAllowed = @($portFilter | Where-Object {
+        $_.Protocol -eq "TCP" -and @($_.LocalPort) -contains "$Port"
+    }).Count -gt 0
+    if ($rule -and $rule.Enabled -eq "True" -and $rule.Direction -eq "Inbound" -and
+        $rule.Action -eq "Allow" -and $profiles -match "(Private.*Public|Public.*Private|Any)" -and $portAllowed) {
+        return
+    }
+
+    $command = @"
+`$ErrorActionPreference = 'Stop'
+`$name = '$displayName'
+`$existing = Get-NetFirewallRule -DisplayName `$name -ErrorAction SilentlyContinue | Select-Object -First 1
+if (`$existing) {
+    Set-NetFirewallRule -DisplayName `$name -Enabled True -Direction Inbound -Action Allow -Profile Private,Public | Out-Null
+    Set-NetFirewallPortFilter -DisplayName `$name -Protocol TCP -LocalPort $Port | Out-Null
+} else {
+    New-NetFirewallRule -DisplayName `$name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Private,Public | Out-Null
+}
+"@
+    try {
+        $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command
+        )
+        if ($elevated.ExitCode -ne 0) {
+            throw "管理员进程返回退出码 $($elevated.ExitCode)"
+        }
+        Write-Host "已允许 Private/Public 网络访问 TCP $Port。" -ForegroundColor Green
+    } catch {
+        Write-Warning "无法自动配置 Windows 防火墙。请以管理员身份允许 Private/Public 网络的 TCP $Port，否则 Android 无法访问发布链接。"
     }
 }
 
@@ -271,7 +339,9 @@ function Invoke-QuickAdd {
         Copy-Item -LiteralPath $example -Destination $Subscriptions
     }
     $existingManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $Subscriptions
-    $namePattern = '(?m)^\s*-\s+name:.*' + $quotedName
+    # Match the whole name. A substring pattern treated "a" as already used
+    # whenever any subscription name contained that letter.
+    $namePattern = '(?m)^\s*-\s+name:\s*(?:''' + $quotedName + '''|"' + $quotedName + '"|' + $quotedName + ')\s*$'
     if ($existingManifest -match $namePattern) {
         throw "名称 [$nameValue] 已存在，请换一个名称。"
     }
@@ -560,7 +630,11 @@ function Get-RoutingGroupsData {
     if ($directTag -and $directTag -notin $known -and $directTag -notin $strategyTags) {
         $groups += [pscustomobject]@{ tag = $directTag; outbounds = @(); domains = @() }
     }
-    $data.groups = $groups
+    foreach ($group in @($groups)) {
+        $group | Add-Member -NotePropertyName outbounds -NotePropertyValue (ConvertTo-StringList -Value $group.outbounds) -Force
+        $group | Add-Member -NotePropertyName domains -NotePropertyValue (ConvertTo-StringList -Value $group.domains) -Force
+    }
+    $data.groups = @($groups)
     return $data
 }
 
@@ -589,11 +663,58 @@ function Get-PolicyStrategyTags {
     return @($result)
 }
 
+function ConvertTo-StringList {
+    param($Value)
+    return @(@($Value) | Where-Object { $null -ne $_ -and "$_" -ne "" } | ForEach-Object { [string]$_ })
+}
+
+function ConvertTo-JsonString {
+    param([string]$Value)
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($char in $Value.ToCharArray()) {
+        switch ([int]$char) {
+            34 { [void]$builder.Append('\"') }
+            92 { [void]$builder.Append('\\') }
+            8  { [void]$builder.Append('\b') }
+            12 { [void]$builder.Append('\f') }
+            10 { [void]$builder.Append('\n') }
+            13 { [void]$builder.Append('\r') }
+            9  { [void]$builder.Append('\t') }
+            default {
+                if ([int]$char -lt 32) { [void]$builder.AppendFormat('\u{0:x4}', [int]$char) }
+                else { [void]$builder.Append($char) }
+            }
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-JsonStringArray {
+    param($Value)
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(ConvertTo-StringList -Value $Value)) {
+        $items.Add((ConvertTo-JsonString -Value $item))
+    }
+    return '[' + ($items -join ',') + ']'
+}
+
 function Save-RoutingGroupsData {
     param([Parameter(Mandatory)]$Data)
     $parent = Split-Path -Parent $RoutingGroups
     [IO.Directory]::CreateDirectory($parent) | Out-Null
-    $json = $Data | ConvertTo-Json -Depth 8
+    # Windows PowerShell 5.1 ConvertTo-Json unwraps a one-element array into a
+    # string. The next added rule is then concatenated instead of appended.
+    $groups = New-Object System.Collections.Generic.List[string]
+    foreach ($group in @($Data.groups)) {
+        $groups.Add(
+            '{ "tag": ' + (ConvertTo-JsonString -Value ([string]$group.tag)) +
+            ', "outbounds": ' + (ConvertTo-JsonStringArray -Value $group.outbounds) +
+            ', "domains": ' + (ConvertTo-JsonStringArray -Value $group.domains) + ' }'
+        )
+    }
+    $json = '{ "schema_version": 1, "groups": [' + ($groups -join ',') + '] }'
     $temporary = $RoutingGroups + ".new-" + [Guid]::NewGuid().ToString("N")
     try {
         [IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
@@ -728,7 +849,9 @@ function Remove-RoutingGroup {
     $target = $groups[$index]
     $confirm = (Read-Host "删除 [$($target.tag)] 及其全部分流规则？输入 y 确认").Trim().ToLowerInvariant()
     if ($confirm -ne "y") { Write-Host "已取消。"; return }
-    $data.groups = @($groups | Where-Object { $_ -ne $target })
+    # Keep policy selectors and the direct group. Filtering down to groups that
+    # have outbound members used to erase every other group's saved rules.
+    $data.groups = @($data.groups | Where-Object { [string]$_.tag -ne [string]$target.tag })
     Invoke-RoutingGroupsUpdate -Data $data
     Write-Host "[完成] 已删除分组“$($target.tag)”。" -ForegroundColor Green
 }
@@ -747,7 +870,7 @@ function Add-RoutingRule {
     foreach ($item in (Split-RuleInput -Value $input)) {
         $matcher = ConvertTo-RouteMatcher -Value $item
         if ($all -contains $matcher) { $skipped += (Format-RouteMatcher -Matcher $matcher); continue }
-        $target.domains += $matcher
+        $target | Add-Member -NotePropertyName domains -NotePropertyValue (@(ConvertTo-StringList -Value $target.domains) + $matcher) -Force
         $all += $matcher
         $added += (Format-RouteMatcher -Matcher $matcher)
     }
@@ -774,7 +897,7 @@ function Add-DirectRule {
     foreach ($item in (Split-RuleInput -Value $input)) {
         $matcher = ConvertTo-RouteMatcher -Value $item
         if ($all -contains $matcher) { $skipped += (Format-RouteMatcher -Matcher $matcher); continue }
-        $target.domains += $matcher
+        $target | Add-Member -NotePropertyName domains -NotePropertyValue (@(ConvertTo-StringList -Value $target.domains) + $matcher) -Force
         $all += $matcher
         $added += (Format-RouteMatcher -Matcher $matcher)
     }
@@ -881,25 +1004,48 @@ function Test-PublishedConfig {
     return $ok
 }
 
+function Resolve-ValidationCore {
+    # 返回 @{ Path = <可用核心路径，不可用为 $null>; Version = <版本行>; Reason = <不可用原因> }。
+    # 与 Invoke-Generate 共用同一套版本门控：Get-CoreExecutable 在没有匹配版本的
+    # 目录时会退回到"runtime\cores 下最新的 sing-box.exe"，甚至 PATH 上的
+    # sing-box.exe（Program Files 那个 Electron 桩会静默 exit 0）。不校验版本
+    # 就拿来 check，会把核心根本没解析的配置报成"通过"。
+    $core = Get-CoreExecutable
+    if (-not $core) {
+        return @{ Path = $null; Version = ""; Reason = "未找到 $PreferredCoreVersion CLI 核心。请安装到 runtime\cores 或通过 SING_BOX_CORE 指定路径。" }
+    }
+    $versionOutput = @(& $core version 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        return @{ Path = $null; Version = ""; Reason = "无法运行核心：$core" }
+    }
+    $version = [string]($versionOutput | Select-Object -First 1)
+    if ($version -ne "sing-box version $PreferredCoreVersion") {
+        return @{ Path = $null; Version = $version; Reason = "核心版本不匹配：$version（要求 $PreferredCoreVersion）。请更新 runtime\cores 或 SING_BOX_CORE。" }
+    }
+    return @{ Path = $core; Version = $version; Reason = $null }
+}
+
 function Invoke-Check {
     $ok = $true
-    $core = Get-CoreExecutable
+    $core = Resolve-ValidationCore
+    if ($core.Path) {
+        Write-Host "核心校验：$($core.Path)" -ForegroundColor DarkGray
+    } else {
+        # 没有可用核心时不能报"有效"——摘要校验只能证明文件没被改过，
+        # 不能证明这个配置能被核心加载。
+        Write-Host "无法进行核心校验：$($core.Reason) 仅完成摘要校验。" -ForegroundColor Yellow
+        $ok = $false
+    }
     foreach ($name in @("desktop", "android")) {
         if (-not (Test-PublishedConfig -Name $name)) { $ok = $false; continue }
-        if ($core) {
-            & $core check -c (Join-Path $OutputRoot "$name\config.json")
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "核心校验失败：$name" -ForegroundColor Red
-                $ok = $false
-            } else {
-                Write-Host "核心校验通过：$name" -ForegroundColor Green
-            }
+        if (-not $core.Path) { continue }
+        & $core.Path check -c (Join-Path $OutputRoot "$name\config.json")
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "核心校验失败：$name" -ForegroundColor Red
+            $ok = $false
+        } else {
+            Write-Host "核心校验通过：$name" -ForegroundColor Green
         }
-    }
-    if ($core) {
-        Write-Host "核心校验：$core" -ForegroundColor DarkGray
-    } else {
-        Write-Host "未找到 sing-box 核心，仅完成摘要校验。" -ForegroundColor Yellow
     }
     return $ok
 }

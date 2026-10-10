@@ -31,6 +31,7 @@ DEFAULT_DESKTOP_CONFIG = ROOT / "dist" / "desktop" / "config.json"
 DEFAULT_DESKTOP_STAMP = ROOT / "dist" / "desktop" / "config.validated.json"
 DEFAULT_CREDENTIALS = ROOT / ".secrets" / "android-publisher.json"
 DEFAULT_ACCESS_LOG = ROOT / "runtime" / "publisher.log"
+DEFAULT_LISTEN_PORT = 18080
 ACCESS_LOG_LIMIT = 1024 * 1024
 # ``route print`` needs about 1.5s on a machine with a TUN adapter and several
 # virtual switches: a tighter bound silently produced a fallback address that
@@ -312,6 +313,44 @@ def print_publication_info(
     print(f"  拉取记录与中断原因: {DEFAULT_ACCESS_LOG}", flush=True)
 
 
+def parse_excluded_tcp_ranges(output: str) -> tuple[tuple[int, int], ...]:
+    """Parse ``netsh interface ipv4 show excludedportrange protocol=tcp``."""
+    ranges: list[tuple[int, int]] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        start, end = int(parts[0]), int(parts[1])
+        if start <= end:
+            ranges.append((start, end))
+    return tuple(ranges)
+
+
+def excluded_tcp_ranges() -> tuple[tuple[int, int], ...]:
+    """Ports Windows refuses to bind, commonly reserved by Hyper-V, WSL, or WinNAT.
+
+    Binding one of them fails with WinError 10013 even though nothing is listening.
+    """
+    if sys.platform != "win32":
+        return ()
+    try:
+        completed = subprocess.run(
+            ["netsh", "interface", "ipv4", "show", "excludedportrange", "protocol=tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    return parse_excluded_tcp_ranges(completed.stdout or "")
+
+
+def port_is_excluded(port: int, ranges: Sequence[tuple[int, int]]) -> bool:
+    return any(start <= port <= end for start, end in ranges)
+
+
 def publisher_running(host: str, port: int) -> bool:
     try:
         with closing(socket.create_connection((host, port), timeout=1)) as connection:
@@ -360,8 +399,12 @@ class PublisherHandler(BaseHTTPRequestHandler):
         )
 
     def authenticated(self) -> bool:
+        # hmac.compare_digest rejects ``str`` containing non-ASCII with a
+        # TypeError, which would kill the handler thread (the client sees a
+        # dropped connection) instead of returning 401.  Compare bytes so a
+        # non-ASCII password works and a non-ASCII *guess* is simply wrong.
         token = parse_qs(urlsplit(self.path).query).get("token", [])
-        if len(token) == 1 and hmac.compare_digest(token[0], self.app.password):
+        if len(token) == 1 and self._secret_matches(token[0], self.app.password):
             return True
         value = self.headers.get("Authorization", "")
         if not value.startswith("Basic "):
@@ -371,8 +414,15 @@ class PublisherHandler(BaseHTTPRequestHandler):
             username, password = decoded.split(":", 1)
         except (ValueError, UnicodeDecodeError):
             return False
-        return hmac.compare_digest(username, self.app.username) and hmac.compare_digest(
+        return self._secret_matches(username, self.app.username) and self._secret_matches(
             password, self.app.password
+        )
+
+    @staticmethod
+    def _secret_matches(candidate: str, expected: str | None = None) -> bool:
+        """Constant-time compare that tolerates non-ASCII input."""
+        return hmac.compare_digest(
+            str(candidate).encode("utf-8"), str(expected or "").encode("utf-8")
         )
 
     def challenge(self) -> None:
@@ -507,7 +557,7 @@ def resolve_advertised_host(args: argparse.Namespace) -> tuple[str, str, str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="发布已校验的 sing-box 配置")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT)
     parser.add_argument(
         "--advertise-host",
         default="",
@@ -528,32 +578,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     credentials = load_or_create_credentials(args.credentials.resolve(), rotate=args.rotate_credentials)
     address_host, source, warning = resolve_advertised_host(args)
+    port = args.port
     if args.rotate_credentials or args.show_info:
-        print_publication_info(address_host, args.port, credentials, source=source, warning=warning)
-        if publisher_running("127.0.0.1", args.port):
+        print_publication_info(address_host, port, credentials, source=source, warning=warning)
+        if publisher_running("127.0.0.1", port):
             print("状态: 发布服务正在监听；请确认手机与电脑处于可互访的网络。", flush=True)
         else:
             print("状态: 发布服务未运行。请先在管理菜单中选择“启动发布”，并保持该窗口运行。", flush=True)
         return 0
 
-    if publisher_running("127.0.0.1", args.port):
+    if publisher_running("127.0.0.1", port):
         print(
-            f"状态: 端口 {args.port} 上已经有一个发布器在监听（多半是上次没关掉的窗口）。"
-            "请先关闭它再启动，或改用 --port；两个进程同时占用同一端口时，请求和日志会分叉，"
+            f"状态: 端口 {port} 上已经有一个发布器在监听（多半是上次没关掉的窗口）。"
+            "请先关闭它再启动；两个进程同时占用同一端口时，请求和日志会分叉，"
             "排查会变得不可信。",
             flush=True,
         )
         return 1
 
-    server = PublisherServer(
-        (args.host, args.port),
-        args.android_config.resolve(),
-        args.android_stamp.resolve(),
-        args.desktop_config.resolve(),
-        args.desktop_stamp.resolve(),
-        credentials,
-        args.access_log.resolve(),
-    )
+    try:
+        server = PublisherServer(
+            (args.host, port),
+            args.android_config.resolve(),
+            args.android_stamp.resolve(),
+            args.desktop_config.resolve(),
+            args.desktop_stamp.resolve(),
+            credentials,
+            args.access_log.resolve(),
+        )
+    except OSError as exc:
+        blocked = next((f"{start}-{end}" for start, end in excluded_tcp_ranges() if start <= port <= end), "")
+        where = f"它落在 Windows 保留段 {blocked}。" if blocked else ""
+        print(
+            f"状态: 无法监听 {args.host}:{port}（{exc}）。{where}"
+            "发布端口保持不变。请允许管理脚本的管理员授权，让 Windows 把这个端口留出来。",
+            flush=True,
+        )
+        return 1
     print_publication_info(address_host, server.server_port, credentials, source=source, warning=warning)
     print("状态: 发布服务正在监听。按 Ctrl+C 停止发布。\n", flush=True)
     try:

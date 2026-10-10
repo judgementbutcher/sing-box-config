@@ -9,7 +9,7 @@ import time
 from argparse import Namespace
 from ipaddress import ip_network
 from urllib.error import HTTPError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from singbox_config.publisher import (
@@ -17,7 +17,9 @@ from singbox_config.publisher import (
     PublisherServer,
     lan_ip,
     load_or_create_credentials,
+    parse_excluded_tcp_ranges,
     parse_route_print,
+    port_is_excluded,
     publisher_running,
     publication_urls,
     resolve_advertised_host,
@@ -294,6 +296,22 @@ def test_tun_networks_are_read_from_the_published_configs(tmp_path):
     assert tun_networks(tmp_path / "missing.json") == ()
 
 
+def test_saved_publisher_port_stays_inside_a_windows_exclusion():
+    sample = """
+Protocol tcp Port Exclusion Ranges
+
+Start Port    End Port
+----------    --------
+     17983       18082
+     18083       18182
+     50000       50059     *
+"""
+    ranges = parse_excluded_tcp_ranges(sample)
+    assert (17983, 18082) in ranges
+    assert port_is_excluded(18080, ranges)
+    assert not port_is_excluded(18080, ((50000, 50059),))
+
+
 def test_advertise_host_overrides_detection(tmp_path, monkeypatch):
     monkeypatch.setattr("singbox_config.publisher.lan_ip", lambda *a, **k: "192.168.1.31")
     args = Namespace(advertise_host="", android_config=tmp_path, desktop_config=tmp_path)
@@ -329,6 +347,52 @@ def test_access_log_records_requests_without_the_token(tmp_path):
         assert "/android/config.json -> 200" in entry
         assert 'ua="Python-urllib' in entry
         assert "tok-secret-value" not in entry
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_non_ascii_credentials_are_rejected_without_killing_the_connection(tmp_path):
+    """A non-ASCII guess must yield 401, not a dropped connection.
+
+    ``hmac.compare_digest`` raises TypeError on ``str`` containing non-ASCII,
+    which would escape the handler and abort the socket — the client sees a
+    reset instead of an auth failure and retries forever.
+    """
+    android, android_stamp = write_validated_config(tmp_path, "android")
+    desktop, desktop_stamp = write_validated_config(tmp_path, "desktop")
+    server = build_server(
+        tmp_path,
+        android,
+        android_stamp,
+        desktop,
+        desktop_stamp,
+        {"username": "sfa", "password": "mật-khẩu-秘密"},
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/android/config.json"
+        # A non-ASCII token that is simply wrong.
+        try:
+            urlopen(f"{url}?token={quote('秘密', safe='')}", timeout=2)
+            raise AssertionError("a wrong non-ASCII token unexpectedly succeeded")
+        except HTTPError as exc:
+            assert exc.code == 401
+        # A non-ASCII Basic guess, and one that is not even UTF-8.
+        for blob in ("sfa:秘密", "sfa:\udcff"):
+            token = base64.b64encode(blob.encode("utf-8", "surrogateescape")).decode("ascii")
+            try:
+                urlopen(Request(url, headers={"Authorization": f"Basic {token}"}), timeout=2)
+                raise AssertionError("a wrong non-ASCII password unexpectedly succeeded")
+            except HTTPError as exc:
+                assert exc.code == 401
+        # The real non-ASCII password still authenticates, via both routes.
+        password = "mật-khẩu-秘密"
+        token = base64.b64encode(f"sfa:{password}".encode("utf-8")).decode("ascii")
+        assert urlopen(Request(url, headers={"Authorization": f"Basic {token}"}), timeout=2).status == 200
+        assert urlopen(f"{url}?token={quote(password, safe='')}", timeout=2).status == 200
     finally:
         server.shutdown()
         server.server_close()

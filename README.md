@@ -59,7 +59,7 @@
 
 ## 配置发布
 
-发布器监听 TCP `18080`，只提供以下配置文件和健康检查：
+发布器固定监听 TCP `18080`。若该端口落在 Windows 的保留段里（Hyper-V、WSL、WinNAT 常见，绑定会报 WinError 10013），管理脚本会申请管理员权限，让系统把 18080 留给发布器，而不是改成别的端口。发布器只提供以下配置文件和健康检查：
 
 - 同一台 Windows 上的 SFW（首选）：`http://127.0.0.1:18080/desktop/config.json`
 - 其他电脑上的 SFW：`http://电脑局域网IP:18080/desktop/config.json`
@@ -84,12 +84,12 @@
 
 排除地址过期后仍失败，才是"手机开着 VPN 时自己的拉取被代理带走"：只要手机当前生效的配置把"到局域网"的流量交给了代理，请求就永远到不了电脑。打破死循环有两条路：
 
-1. 在 SFA 里先断开 VPN，再导入或刷新发布链接，成功一次之后新配置会接管——`config\profiles\android.yaml` 已把 `10.0.0.0/8`、`169.254.0.0/16`、`192.168.0.0/16`、`fc00::/7` 和 `fe80::/10` 排除在 TUN 路由之外，局域网及链路本地流量不再进入 sing-box，这类问题不会复发。
+1. 在 SFA 里先断开 VPN，再导入或刷新发布链接，成功一次之后新配置会接管——`config\profiles\android.yaml` 已把 `10.0.0.0/8`、`172.16.0.0/12`（保留 TUN 自己的 `172.18.0.0/30`）、`192.168.0.0/16`、`169.254.0.0/16`、`fc00::/7` 和 `fe80::/10` 排除在 TUN 路由之外，局域网及链路本地流量不再进入 sing-box，这类问题不会复发。
 2. 直接把 `dist\android\config.json` 传到手机，按本地配置导入（一次性，不带自动更新）。
 
 桌面发布产物是自包含的单个 JSON：项目内的本地规则会被内嵌，远程规则不会引用发布电脑上的缓存路径。SFW 与发布器在同一台电脑时请使用 `127.0.0.1` 地址，避免局域网地址被 TUN 或虚拟网卡路由影响。
 
-建议在路由器中为电脑设置 DHCP 地址保留，避免局域网 IP 改变导致远程配置地址失效。启动发布器时管理脚本会请求管理员权限，自动允许 Windows Private/Public 网络的 TCP `18080`；若拒绝提权，请手动放行该端口。
+建议在路由器中为电脑设置 DHCP 地址保留，避免局域网 IP 改变导致远程配置地址失效。启动发布器时，若 18080 被系统保留或防火墙尚未放行，管理脚本会请求管理员权限；查看地址和轮换凭据不会弹出授权窗口。若拒绝提权，请手动放行 Private/Public 网络的 TCP `18080`。
 
 ## 配置结构
 
@@ -131,6 +131,7 @@ subscriptions:
 默认也会拒绝关闭 TLS 证书校验的节点；只有确认订阅确实需要时，才对该订阅设置 `allow_insecure: true`。
 `exclude_types` 按 outbound `type` 跳过节点，被跳过的类型和数量会在生成时打印。免费节点池常混入本核心加载不了的写法（hysteria v1 的 `up`/`down`、wireguard 的旧 `server` 字段、shadowsocks 的 `plugin_opts` 对象），这些节点留在配置里会让 `sing-box check` 直接 FATAL、连带双端生成一起失败。用类型而不是 `exclude_node_tags` 排除：轮换池的节点名每轮都在变，按名字排除必然漏。
 默认会合并连接参数完全相同的节点；如果需要保留订阅中的每个节点名称，可对该订阅设置 `deduplicate: false`。订阅分组一律是手动选择器，不生成自动测速分组；旧的 `urltest` 清单字段已移除，再写入会被按未知旧字段拒绝。
+`ai` 控制该订阅是否参与 AI 分组：`auto` 只收 `selectors.ai_regions` 白名单地区的节点，`true` 额外放行 insecure 节点但**不**放宽地区判定，`false` 完全不参与。节点名不含地区关键词时（例如自建的 `ppflight-*`，`detect_region` 判为 Others）用 `ai_include` 按正则显式纳入，`ai_exclude` 排除；两者都匹配订阅里的**原始节点名**，不是生成后的 tag。AI 分组顺序是白名单地区优先（US→JP→SG→TW），`ai_include` 进来的 Others 节点排在最后，默认出口取第一个美国节点。
 
 自定义规则 `config\local\custom-rules.yaml` 只接受显式数组：
 
@@ -147,13 +148,14 @@ rule_sets: []
 规则的公共部分在 `config\policy.yaml`：
 
 - `route.business_rules`/`route.domestic_rules` 控制连接走向，按文件顺序匹配，越靠前优先级越高；`outbound: direct` 表示直连，其余值表示交给对应策略组。
-- 业务策略组在 `selectors.groups` 中声明（当前 `Emby`/`YouTube`/`Spotify`/`Telegram`/`Twitch`/`Google Play`）：成员是 `Available` 及其全部条目，默认跟随 `Available`，可以在面板里单独指定节点而不影响其他流量。`direct: last` 在成员末尾追加直连（Emby），`direct: default` 默认直连（Spotify，账号地区校验拒绝机房出口）；`when_referenced: true` 的分组只在 profile 规则引用时生成（`Google Play` 只出现在安卓端）。`AI` 组的成员由 `selectors.ai_regions` 白名单决定（当前 US/JP/SG/TW，香港等被上游封锁的地区不会进入）。
+- 业务策略组在 `selectors.groups` 中声明（当前 `Emby`/`YouTube`/`Spotify`/`Telegram`/`Twitch`/`Google Play`）：成员是 `Available` 及其全部条目，默认跟随 `Available`，可以在面板里单独指定节点而不影响其他流量。`direct: last` 在成员末尾追加直连（Emby），`direct: default` 默认直连（Spotify，账号地区校验拒绝机房出口）；`when_referenced: true` 的分组只在 profile 规则引用时生成（`Google Play` 只出现在安卓端）。`AI` 组的成员由 `selectors.ai_regions` 白名单决定（当前 US/JP/SG/TW，香港等被上游封锁的地区不会进入）。`Other`（`selectors.other`）汇集地区未识别的节点，是 `Available` 和 `AI` 的成员（AI 里排在白名单节点之后），但**不**进入业务分组：一次误选就会把 YouTube/Telegram 的流量交给未经地区审核的出口。置空则不生成该分组。
 - DNS 规则不再单独书写，而是由路由规则自动推导：含域名匹配（`domain*`/`rule_set`）的 `route` 规则使用与出口相同的解析器（`direct` → 国内 DoH，`AI`/`YouTube`/`Twitch` → 经该分组出站的专用 DoH，其余 → 经 `Available` 的 DoH），`reject` 规则返回 NXDOMAIN。规则上写 `dns: <解析器>` 可覆盖（Spotify 固定国内解析），写 `dns: false` 不生成 DNS 规则（`geoip-cn` 这类 IP 规则集）。
-- `dns_upstreams` 声明 DoH 解析器模板：`domestic` 为直连的 AliDNS/DNSPod，`proxy` 为 Google/Cloudflare，按 `proxy_detours` 为每个出口展开一组（例如 `google-youtube`/`cloudflare-youtube` 经 `YouTube` 出站，Google 按解析出口分配视频边缘，解析与播放必须同一出口）。
-- 同组解析器并行竞速；相邻且解析器相同的规则合并成一个竞速块（`evaluate` ×2 → `respond NOERROR` ×2 → `respond NXDOMAIN` ×2 → `SERVFAIL`）。成功响应竞速返回，NXDOMAIN 要等两路成功响应都未返回后再接受。只合并相邻规则，所以 `policy.yaml` 里把同出口的规则排在一起即可减少生成的规则数。
-- 未命中任何规则的域名由 `dns.final`（Google/Cloudflare 经 `Available`）竞速解析，不向国内解析器发送未知域名；双路失败时返回 `SERVFAIL`。
-- 国内分流先匹配 `china-direct`、`.cn`/`.中国` 后缀和 `geosite-cn`，再做广告拦截，最后匹配 `geosite-geolocation-!cn`；新注册的中国域名即使暂未进入规则集也会直连并使用国内 DNS。广告拦截排在业务与国内直连规则之后，上游广告名单误收的服务域名会先被放行。
+- `dns_upstreams` 声明 DoH 解析器模板：`domestic` 为直连的 AliDNS/DNSPod，`proxy` 为 Google/Cloudflare，按 `proxy_detours` 为每个可独立切换的出口展开一组（YouTube、Twitch、AI、Emby、Telegram，以及安卓上的 Google Play）。解析经对应分组出站，和面板里单独挑的节点保持同一出口。按包名或进程把流量整段交给某个分组时，这些应用的 DNS 也走该分组。Spotify 在规则上固定 `dns: domestic`。节点域名使用 `domestic-bootstrap` 组并发请求 AliDNS/DNSPod，任一路故障仍可解析；国内 DoH IP 固定直连并排在 sniff 之前，避免规则集未加载时递归依赖代理节点。
+- 同组解析器并行竞速；相邻且解析器相同的规则合并成一个竞速块（`evaluate` ×2 → 未命中黑洞地址的 `NOERROR` 竞速 → `respond NXDOMAIN` ×2 → `SERVFAIL`）。成功响应竞速返回，NXDOMAIN 要等两路成功响应都未返回后再接受。国内解析器返回 `0.0.0.0`、回环或已知污染地址时，这一路作废。每路查询都去掉 EDNS Client Subnet。代理侧答案的 TTL 改写为 60 秒，选择器换节点后 CDN 边缘会在一分钟内跟上。只合并相邻规则，所以 `policy.yaml` 里把同出口的规则排在一起即可减少生成的规则数。
+- 未命中任何规则的域名由 `dns.final`（Google/Cloudflare 经 `Available`）竞速解析，不向国内解析器发送未知域名；双路失败时返回 `SERVFAIL`。DNS 缓存容量为 4096 条，TTL 抬到 60 秒、上限 30 分钟，代理 CDN 答案最长缓存 60 秒；缓存开启乐观模式（`optimistic`），条目过期后立刻返回旧地址并在后台刷新，冷启动抖动因此消失，代价是 TTL 刚过期的窗口内可能返回上一个地址。53 端口被劫持；公共 DoH 的固定 IP 和 DoT 853 被丢弃，常见 DoH 主机名直接 NXDOMAIN，避免浏览器自己解析后绕过按出口拆开的 DNS。Android 私人 DNS 请用自动或关闭。
+- 国内分流先匹配 `china-direct`、`.cn`/`.中国` 后缀和 `geosite-cn`，再做广告拦截，最后匹配 `geosite-geolocation-!cn`。`china-direct` 只保留 geosite 尚未加载时不能走代理的名字，`.cn` 不再在名单里重复；新注册的中国域名即使暂未进入规则集也会直连并使用国内 DNS。广告拦截排在业务与国内直连规则之后，上游广告名单误收的服务域名会先被放行。YouTube 在通用 Google 后缀之前匹配本地播放域名和 `geosite-youtube`，避免国家域名和封面 CDN 掉进别的出口。
 - Windows TUN 使用 `strict_route` + `dns_mode: hijack`，拦截系统 DNS；不再把整张 `geoip-cn` 地址表排除在 TUN 外，以免某些中国 IP 上的代理分组流量绕过规则，同时减少大量静态路由。TUN 自身网关地址在 DNS 劫持之后拒绝非 DNS 流量，避免直连回环。
+- 22 端口（SSH）一律直连：`pre_rules` 末尾有一条 `port: 22 → direct`。未命中任何规则的流量由 `route.final` 交给 `Available`，而多数机场出口封 22 端口——走代理时 TCP 能建连，但服务器会在 `kex_exchange_identification` 阶段立刻断开（表现为 `Connection closed by ... port 22`，连 `github.com:22` 也一样）。这条规则排在 IPv6 和 TUN 自身网段的 reject 之后，所以那两个判断仍然优先；它也不写 `ip_version: 4`，因为该匹配只看字面量地址，`ssh 某域名` 会绕过它而落到代理出口。
 - 修改后重新生成配置，桌面和 Android 才会生效。
 
 只想为本机临时增加规则时，编辑 `config\local\custom-rules.yaml`（该目录不会提交 Git），将规则分别放入 `route_rules` 和 `dns_rules`；它们会在公共业务规则之前生成。本机自定义规则不做 DNS 自动推导，需要成对书写。例如：
@@ -220,15 +222,18 @@ python .\scripts\quality\check_public_repo.py
 生成的配置面向 sing-box 1.15 预发布系列。Windows Provider 配置锁定 `1.15.0-alpha.9-reF1nd`；Windows SFW 与 CLI 校验核心应使用 [reF1nd/sing-box-releases](https://github.com/reF1nd/sing-box-releases/releases/tag/v1.15.0-alpha.9-reF1nd) 的兼容版本。桌面端 SFW 与安卓端 SFA 必须使用支持下列字段的 1.15 版本核心才能加载对应配置：
 
 - TUN 不再写 `stack`，由 sing-tun 1.15 自带的 TCP/IP 栈接管；该选项已弃用并将在 1.17 删除，生成器审计会拒绝再次出现。
+- 不写 `mtu` 和 `udp_timeout`。reF1nd 1.15 在未指定 `mtu` 时，安卓用 9000（65535 会在部分机型上 ENOBUFS），其它平台用 65535；UDP 映射默认 5 分钟。以前的 1400/1360 是旧 system 栈避免分片的取值，会把新栈的吞吐压低。
 - 配置使用 reF1nd 的 1.15 字段（包括内置 TUN 栈和统一测速延迟），必须由 `1.15.0-alpha.9-reF1nd` 或兼容的下游核心加载；原版核心和 1.14 系列不支持这些字段。只有订阅清单显式设置 `provider: true` 时才会使用 fork 的 Provider 字段。
 - 安卓 `auto_redirect` 在 1.15 已完整支持，但需要 root；`config\profiles\android.yaml` 中留有注释掉的开关，已 root 的设备可自行打开。
 - 安卓 TUN 仅声明 IPv4 地址（172.18.0.1/30）：全局 IPv6 不进入 sing-box，`ip_version: 6 → reject` 只在桌面生效。这是有意取舍——`strategy: ipv4_only` 下应用几乎拿不到 IPv6 目标，仅硬编码 IPv6 字面量的流量会绕过代理（暴露面很小），换来挂 VPN 时手机仍能访问 IPv6 资源；如需与桌面一致，在 android.yaml 的 TUN 地址中追加 IPv6 即可，细节见该文件注释。
 - 1.15.0-alpha.7 新增的 MASQUE/HTTP3 代理、alpha.5 的 Tailcat，以及 alpha.8 的 `dns_server_address`/`dns_search_domain` 规则匹配，只有在配置了对应协议入口或需要按 DHCP/VPN DNS 地址分流时才有作用；当前配置使用普通节点、TUN DNS 劫持和固定 DoH，不启用这些无关选项。
 - 当前 `config\local\subscriptions.yaml` 的订阅使用 `provider: false`，生成器在发布时静态展开节点并保留机场原始名称；`Available` 是可手动切换的 selector，机场分组只包含自己的节点，自建 `Meow-US` 不会作为机场后备混入。需要运行时更新时可对单个订阅设置 `provider: true`，但 fork 会显示 `provider-tag/原节点名`。
-- `runtime\cores\1.15.0-alpha.9-reF1nd\` 下的 `sing-box.exe` 是 CLI 校验核心，不是 SFW 桌面客户端。当前 CLI zip 为 `sing-box-1.15.0-alpha.9-reF1nd-windows-amd64.zip`，SHA-256：`d1523ddc054c2e27eb88dc5f1b6f8ef50d44de16a4d25ce0e8027dae7377a75e`。管理脚本优先使用版本目录中的 CLI 核心校验。
+- `runtime\cores\1.15.0-alpha.9-reF1nd\` 下的 `sing-box.exe` 是 CLI 校验核心，不是 SFW 桌面客户端。当前 CLI zip 为 `sing-box-1.15.0-alpha.9-reF1nd-windows-amd64.zip`，SHA-256：`d1523ddc054c2e27eb88dc5f1b6f8ef50d44de16a4d25ce0e8027dae7377a75e`。管理脚本优先使用版本目录中的 CLI 核心校验；生成与检查都会先核对核心版本，找不到匹配版本就拒绝发布/判定失败，而不是退回 PATH 上任意一个 `sing-box.exe`——`Program Files` 下的 Electron 桩会静默 `exit 0`，用它校验等于什么都没校验（`-Action check` 因此会以退出码 1 结束）。
 - `experimental.urltest_unified_delay: true` 启用下游的二次请求测速，减少首次建连和 TLS 握手对延迟结果的影响。
 - `experimental.cache_file.store_dns: true` 持久化 DNS 缓存；`flush_interval: 1m` 控制 1.15 写缓冲的落盘间隔。
 - `dns.min_cache_ttl: 60` 是 reF1nd 的缓存 TTL 下限：CDN 常见的 10–30 秒 TTL 会让同一域名反复发起两路代理 DoH 竞速，抬到 60 秒后显著减少重复查询。
+- `dns.max_cache_ttl: 1800` 是缓存 TTL 上限。实测国内域名真实 TTL 低至 6–120 秒，但也有 559 秒（`api.bilibili.com`）乃至 3000 秒以上（`file.myqcloud.com`）的稳定记录；上限过小会让这些记录每 5 分钟白重解析一次。代理侧答案仍由 `dns_upstreams.proxy_rewrite_ttl: 60` 单独压到 60 秒。
+- `dns.optimistic`（`enabled: true`，`timeout: 3d`）在 TTL 过期后立刻返回旧地址并在后台刷新。5 分钟 A/B 实测把上游解析次数从 15.7 次/分降到 3.2 次/分，热查询 p99 不变（0.77→0.67ms）。`timeout` 限定旧地址最多还能被返回多久；不写 `timeout` 时审计会给出警告。
 
 ## 官方参考
 
