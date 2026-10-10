@@ -12,7 +12,12 @@
         "cdn-apple.com",
         "mzstatic.com",
         "aaplimg.com",
-        "steamcontent.com"
+        "steamcontent.com",
+        "steamstatic.com",
+        "steamcdn-a.akamaihd.net",
+        "steamuserimages-a.akamaihd.net",
+        "steamcloud-ugc.akamaihd.net",
+        "steampipe.akamaized.net"
       ]
     }
   ]

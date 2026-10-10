@@ -12,11 +12,9 @@ config:
         - fdfe:dcba:9876::1/126
       auto_route: true
       strict_route: true
-      udp_timeout: 5m
-      mtu: 1400
-      # 不写 stack：sing-box 1.15 起 TUN 默认使用 sing-tun 自带的 TCP/IP 栈，
-      # 峰值吞吐、能耗与内存都优于 system/gvisor/mixed；stack 选项已弃用，
-      # 1.17 删除。生成器审计会拒绝再次写入 stack。
+      # 不写 mtu / udp_timeout / stack。reF1nd 1.15 内置栈未指定 mtu 时，
+      # 非安卓平台用 65535，UDP 映射默认 5 分钟；stack 已弃用，1.17 删除。
+      # 旧的 1400 是 system 栈防分片的取值，会把新栈的吞吐压低。
       dns_mode: hijack
     - type: mixed
       tag: mixed-in
