@@ -4,7 +4,6 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,29 +30,6 @@ def parse_duration_seconds(value: Any, *, default_unit: str = "s") -> float:
     amount = float(match.group(1))
     unit = (match.group(2) or default_unit).lower()
     return amount * DURATION_FACTORS[unit]
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def utc_now_iso() -> str:
-    return utc_now().isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_utc_timestamp(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except ValueError:
-        return None
 
 
 def atomic_write_text(path: Path | str, text: str, *, encoding: str = "utf-8") -> None:

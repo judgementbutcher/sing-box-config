@@ -85,6 +85,8 @@ INFO_NODE_KEYWORDS = [
     "流量",
     "到期",
     "订阅",
+    "traffic",
+    "expire",
 ]
 
 

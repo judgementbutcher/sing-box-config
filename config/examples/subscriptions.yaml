@@ -1,13 +1,29 @@
-schema_version: 1
+# 订阅清单示例。复制到 config/local/subscriptions.yaml 后修改（config/local 不进 Git）。
+# 顺序就是面板里的顺序，排第一的是 Available 的默认出口。
+#
+#   name            面板里显示的名字（多节点订阅会生成同名分组；单节点直接叫这个名字）
+#   path            相对清单所在目录的文件。文件里只有一行 http(s) 链接 → 当作订阅地址下载；
+#                   否则文件本身就是订阅内容。格式（sing-box JSON / Clash / URI）自动识别
+#   enabled         false = 暂时停用
+#   user_agent      下载订阅时用的 UA，默认 sing-box
+#   exclude         按节点名排除（正则，不区分大小写）。流量、到期时间等信息条目默认保留在分组末尾
+#   allow_insecure  允许订阅里关闭了 TLS 证书校验的节点（默认遇到就报错）
+#   use_hosts       Clash 订阅：按它自带的 hosts 表改写节点域名
+#   ai              auto（默认）= 白名单地区且证书校验正常的节点进 AI 分组；
+#                   true = 白名单地区的节点全部进（含关闭校验的）；false = 都不进
+#   ai_include      按节点名额外放进 AI 分组（正则），用于名字里没有地区的节点
 subscriptions:
-  - name: example-provider
-    enabled: true
-    format: clash
-    source: url_file
-    path: subscriptions/example-provider.txt
-    # Set true only when provider-tag/node-name labels and runtime refresh are
-    # preferred over original node names in the client UI.
-    provider: false
-    group: example-provider
-    order: 100
-    allow_unsupported: false
+  # 最简写法：subscriptions/example.url.txt 里放一行订阅链接。
+  - name: example
+    path: subscriptions/example.url.txt
+
+  # 常见的附加项。
+  - name: example-clash
+    path: subscriptions/example-clash.url.txt
+    user_agent: clash-verge/v2.4.2
+    exclude: ['官网', 'TG群组']
+
+  # 自建节点：文件里直接放节点 URI（一行一个）或一份 sing-box JSON。
+  - name: my-vps
+    path: subscriptions/my-vps.txt
+    ai_include: ['.']

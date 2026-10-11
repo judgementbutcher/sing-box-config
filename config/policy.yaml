@@ -1,450 +1,186 @@
-schema_version: 1
+# sing-box 配置策略。
+#
+# config 一节就是最终的 sing-box 配置（YAML 写法），写什么就生成什么。
+# 生成器只额外做三件事：
+#   1. 带 only: desktop / only: android 的条目只保留在对应平台；
+#   2. 用订阅生成 outbounds（节点 + 下面 groups 描述的分组）；
+#   3. 规则里引用到的规则集自动补进 route.rule_set：config/rule-sets 下有
+#      同名 .txt 就内嵌，否则按 rule_set_urls 的地址远程下载。
+#
+# 只想改某个域名的走向，不用动这个文件，往 config/rule-sets 的名单里加一行：
+#   direct.txt 直连    proxy.txt 走代理    block.txt 屏蔽
 
 subscription:
-  cache_max_age: 3d
+  cache_max_age: 3d                    # 下载失败时可用的缓存最长保留时间
   timeout_seconds: 20
-  retry_proxy: http://127.0.0.1:7890
+  retry_proxy: http://127.0.0.1:7890   # 直连下载失败后，改走本机代理再试一次
 
-# Provider 能力保留给需要运行时更新的订阅；当前本地订阅显式使用 provider:false，
-# 静态展开节点并保留原始名称，避免 Provider 的 provider-tag/ 前缀污染客户端面板。
-# 将来单独订阅设置 provider:true 后，生成器才会为它启用运行时 Provider。
-providers:
-  enabled: true
-  update_interval: 24h
-
-# 节点 server 域名的解析器：必须是不经过 TUN/代理的直连 DNS。
-# 节点域名若走 dns.final（google → detour Available），会依赖当前选中节点，
-# 当前节点不稳时测速就超时（忽隐忽现）。domain_resolver 直连解析后与代理解耦。
-# 指定 server 后核心跳过 dns.rules，所以节点域名使用 domestic-bootstrap 组，
-# 并发尝试下面两条国内 DoH；任一路失败不会阻塞节点拨号。
-# 生成器把这两条国内 DoH 的 IP:443 固定直连，并且排在 sniff 之前：规则集还没
-# 加载时，这条连接不会掉进 route.final（Available）再回头解析节点域名。
-node_dns_resolver:
-  # 节点域名解析不能只依赖单个 DoH。这个组由生成器配置为
-  # domestic + domestic-backup 并行请求，任一路不可用时仍能启动节点。
-  server: domestic-bootstrap
-  timeout: 2s
-
-# DoH 解析器模板。每项展开为 443 端口、/dns-query 路径、启用 TLS 的 https
-# 服务器；同一组内的解析器在每次查询时并行竞速（evaluate ×N → 未污染的
-# NOERROR 竞速 → NXDOMAIN ×N → SERVFAIL），timeout 是单路上限。
-# 每一路竞速都会去掉 EDNS Client Subnet，让解析器只看连接的真实来源：
-# 国内 DoH 看到家里的地址，代理 DoH 看到节点出口，而不是应用自己塞的前缀。
-#
-# server 一律写 IP，避免"解析器自己需要被解析"的自举问题。
-#
-# domestic 不写 detour：DNS 服务器不带 detour 时本身就等价于一个空直连
-# outbound，显式写 detour: direct 反而会被核心拒绝（"detour to an empty
-# direct outbound makes no sense"，check 不报错、启动时才 FATAL）。
-# 也不能用 type: local：桌面 TUN 的 dns_mode=hijack 会把系统 DNS 指向 TUN
-# 自身，local 解析器会递归查询 sing-box 自己并静默超时；strict_route 的 WFP
-# 过滤器还会拦截非 TUN 接口上的 53 端口，所以直连 DNS 一律走 443 上的 DoH。
-#
-# proxy 按 proxy_detours 为每个出口各展开一组，tag 为 <tag>-<后缀>，空后缀
-# 即 google/cloudflare 本身。解析出口必须与连接出口一致：面板里单独挑了节点
-# 之后，解析仍走 Available 会拿到另一地的 CDN 边缘，取流绕远。能在面板里
-# 独立于 Available 切换的分组都列在这里。when_referenced 的分组在该端没有
-# 生成时跳过（桌面端没有 Google Play）。Spotify 默认直连，规则上单独指定
-# dns: domestic，不在此列。出口不在此列表中时使用 Available 的解析器。
-# proxy_rewrite_ttl 把代理侧答案的 TTL 改成这个秒数，避免选择器换节点后
-# 还拿着上一个出口的 CDN 边缘（YouTube/Twitch 会因此 403）。
-dns_upstreams:
-  timeout: 2s
-  proxy_rewrite_ttl: 60
-  # 国内解析器对下列地址返回的 NOERROR 视为失败：0.0.0.0/8（整段"本网络"，
-  # 实测 idqqimg.com / myqcloud.com 会返回 0.0.0.1 这种黑洞地址）、回环、
-  # 组播/保留，以及公开记录里反复出现的 DNS 污染地址。另一路仍可胜出；
-  # 两路都是黑洞则 SERVFAIL。240.0.0.0/4 已覆盖 243.185.187.0/24 那组保留地址。
-  domestic_reject_answers:
-    - 0.0.0.0/8
-    - 127.0.0.0/8
-    - 198.18.0.0/15
-    - 240.0.0.0/4
-    - 4.36.66.178/32
-    - 8.7.198.45/32
-    - 37.61.54.158/32
-    - 46.82.174.68/32
-    - 59.24.3.173/32
-    - 64.33.88.161/32
-    - 64.33.99.47/32
-    - 64.66.163.251/32
-    - 78.16.49.15/32
-    - 93.46.8.89/32
-    - 159.106.121.75/32
-    - 203.98.7.65/32
-  domestic:
-    - {tag: domestic, server: 223.5.5.5, server_name: dns.alidns.com}
-    - {tag: domestic-backup, server: 1.12.12.12, server_name: doh.pub}
-  proxy:
-    - {tag: google, server: 8.8.8.8, server_name: dns.google}
-    - {tag: cloudflare, server: 1.1.1.1, server_name: cloudflare-dns.com}
-  proxy_detours:
-    Available: ""
-    AI: ai
-    YouTube: youtube
-    Twitch: twitch
-    Emby: emby
-    Telegram: telegram
-    Google Play: play
-
-config:
-  experimental:
-    cache_file:
-      enabled: true
-      # 1.14 起 DNS 缓存需要显式启用持久化；否则 cache_file 只保存规则集
-      # 等核心状态，重启后节点域名解析仍会从头开始。
-      store_dns: true
-      # 1.15 的缓存写缓冲定期落盘，降低移动端频繁写盘开销。
-      flush_interval: 1m
-    # reF1nd performs a second URLTest request so connection setup cost does
-    # not dominate the reported delay.
-    urltest_unified_delay: true
-  log:
-    level: warn
-    timestamp: true
-  dns:
-    # 正常情况下 final 不可达：生成器会把 final 展开成无条件的竞速块放在
-    # DNS 规则末尾，以 SERVFAIL 收尾。保留 final 只是规则改坏时的安全网。
-    final: google
-    strategy: ipv4_only
-    reverse_mapping: true
-    # 单次查询最多等待 3 秒；所有竞速块均在 2 秒内结束。
-    timeout: 3s
-    # 手机应用会同时产生大量短域名查询；扩大缓存可避免反复建立 DoH 请求。
-    cache_capacity: 4096
-    # reF1nd：缓存时把过短的 TTL 抬到 60 秒。每次缓存未命中都要经代理发起
-    # 两路 DoH 竞速，CDN 常见的 10–30 秒 TTL 会让同一域名反复查询；60 秒内
-    # 地址变化对代理与直连都无影响。
-    min_cache_ttl: 60
-    # 实测（2026-10-10，本机临时测量脚本，未随仓库提交）：国内域名真实 TTL
-    # 低至 6–120 秒，CDN 8–72 秒，而 api.bilibili.com 559 秒、
-    # file.myqcloud.com 可达 3000 秒以上。上限设为 1800 秒让稳定记录不再
-    # 每 5 分钟重解析一次；代理侧答案由 dns_upstreams.proxy_rewrite_ttl
-    # 单独压到 60 秒，换节点/换网络后 CDN 边缘仍会在一分钟内跟上。
-    max_cache_ttl: 1800
-    # 乐观缓存：TTL 过期后立刻返回旧地址并在后台刷新，而不是让应用等一次
-    # 代理 DoH 竞速。实测把上游解析次数从 15.7 次/分降到 3.2 次/分（5 分钟
-    # A/B），热查询 p99 不变（0.77→0.67ms）。
-    # 代价是 TTL 刚过期的窗口内可能返回上一个地址；对已建连的会话与
-    # 已缓存的 CDN 边缘影响很小，换来的是冷启动抖动基本消失。
-    optimistic:
-      enabled: true
-      timeout: 3d
-  http_clients:
-    # 规则集通过代理下载，域名也用代理侧解析：国内解析器给出的是面向国内的
-    # CDN 边缘，经由海外出口回连会绕远甚至失败。
-    - tag: rule-set-downloader
-      detour: Available
-      domain_resolver: google
-  route:
-    auto_detect_interface: true
-    default_http_client: rule-set-downloader
-    default_domain_resolver:
-      server: domestic-bootstrap
-      timeout: 2s
-    final: Available
-
-selectors:
-  available: Available
-  ai: AI
-  direct: direct
-  # AI 分组地区白名单：ai: auto 只把命中这些地区的节点放进 AI 组
-  # （ai: true 也只放宽 insecure 限制，地区门槛不变）。只收录 Claude/
-  # ChatGPT 等官方支持的地区；香港/大陆被上游封锁。未识别地区（Others）
-  # 默认不进入，除非订阅用 ai_include 按节点名显式纳入（自建 ppflight-*
-  # 这类不含地区关键词的节点），写错地区名等于收不进节点。
-  # 列表顺序即优先级：分组默认选中第一个地区（美国）里最靠前的节点，
-  # 其余地区仅作备用；组内同一地区的节点保持订阅原序，ai_include 进来的
-  # Others 节点排在最后。
+groups:
+  # AI 分组只收这些地区的节点，顺序即优先级（默认选中第一个地区最靠前的节点）。
   ai_regions: [US, JP, SG, TW]
-  # 冷门地区池：把未识别地区（Others）的分散节点收进一个名为 Other 的
-  # selector，供面板手动选用；它同时是 Available 与 AI 分组的成员（AI 里
-  # 排在白名单节点之后）。不加入业务分组：业务分组逐项跟随 Available，
-  # 而 Other 里全是未识别地区的节点，列进去会让一次误选把 YouTube/
-  # Telegram 的流量交给未经地区审核的出口。置空则不生成该分组。
-  other: Other
-  interrupt_exist_connections: true
-  # 业务分组：成员为 Available 及其全部条目，默认跟随 Available，需要时
-  # 可在面板里单独挑节点而不影响其他流量。
-  # direct: last 在成员末尾追加 direct；direct: default 把 direct 放在首位
-  # 并作为默认。when_referenced: true 的分组只在 profile 规则引用时生成。
-  groups:
+  # 业务分组：成员是 Available 加各订阅，默认跟随 Available，可在面板单独换节点。
+  # direct: first 把直连放在最前并作为默认，direct: last 把直连追加在末尾。
+  services:
     - {tag: Emby, direct: last}
     - {tag: YouTube}
-    # Spotify 账号地区校验看出口 IP，机房段会被判成"资料与所在地区不符"
-    # 而拒绝播放，所以默认直连，代理节点仍可在面板里切换。
-    - {tag: Spotify, direct: default}
-    # Telegram/Twitch/Google Play 只走代理，流量不能悄悄退回直连。
+    - {tag: Spotify, direct: first}
     - {tag: Telegram}
     - {tag: Twitch}
-    - {tag: Google Play, when_referenced: true}
+    - {tag: Google Play, only: android}
 
-rule_sets:
-  - tag: china-direct
-    type: local
-    format: source
-    path: config/rule-sets/china-direct.json
-  - tag: ai-domains
-    type: local
-    format: source
-    path: config/rule-sets/ai-domains.json
-  - tag: emby-domains
-    type: local
-    format: source
-    path: config/rule-sets/emby-domains.json
-  - tag: direct-cdn
-    type: local
-    format: source
-    path: config/rule-sets/direct-cdn.json
-  - tag: spotify-direct
-    type: local
-    format: source
-    path: config/rule-sets/spotify-direct.json
-  - tag: geosite-cn
-    type: remote
-    format: binary
-    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs
-    update_interval: 1d
-    http_client: rule-set-downloader
-    initial_path: runtime/rule-set-cache/geosite-cn.srs
-  - tag: geoip-cn
-    type: remote
-    format: binary
-    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs
-    update_interval: 1d
-    http_client: rule-set-downloader
-    initial_path: runtime/rule-set-cache/geoip-cn.srs
-  - tag:
-      - geosite-geolocation-!cn
-      - geosite-anthropic
-      - geosite-openai
-      - geosite-telegram
-      - geosite-twitch
-      - geosite-youtube
-      - geosite-category-ads-all
-    type: remote
-    format: binary
-    url: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{tag}.srs
-    update_interval: 1d
-    http_client: rule-set-downloader
-    initial_path: runtime/rule-set-cache/{tag}.srs
+rule_set_urls:
+  geosite: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{tag}.srs
+  geoip: https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/{tag}.srs
 
-# 路由规则按顺序匹配，越靠前优先级越高。含域名匹配（domain*/rule_set）的
-# 规则会自动生成同序的 DNS 规则：route 使用该出口的解析器（direct →
-# domestic），reject 返回 NXDOMAIN。规则上写 dns: <解析器> 覆盖，写
-# dns: false 不生成 DNS 规则。相邻且解析器相同的规则会合并成一个竞速块，
-# 所以同解析器的规则尽量排在一起。
-route:
-  pre_rules:
-    - port: 53
-      action: hijack-dns
-    # 系统 53 端口已被劫持。公共 DoH 的固定 IP 若放行，浏览器和系统会自己解析，
-    # 国内域名也会拿到海外边缘。核心自己的 8.8.8.8/1.1.1.1 查询带 detour，不经
-    # 路由，不会被这里丢掉。223.5.5.5 与 1.12.12.12 是国内 DoH，由生成器另固定直连。
-    - port: 443
-      ip_cidr:
-        - 1.1.1.1/32
-        - 1.0.0.1/32
-        - 8.8.8.8/32
-        - 8.8.4.4/32
-        - 9.9.9.9/32
-        - 149.112.112.112/32
-        - 208.67.222.222/32
-        - 208.67.220.220/32
-        - 223.6.6.6/32
-        - 120.53.53.53/32
-      action: reject
-      method: drop
-      dns: false
-    # DoT。Android 若把私人 DNS 设成「指定主机名」，系统不会在 853 失败后回落到
-    # 被劫持的 53，手机会表现为没有网络；自动或关闭才是这套配置的用法。
-    - port: 853
-      action: reject
-      method: drop
-      dns: false
-    - action: sniff
-      timeout: 300ms
-    - protocol: dns
-      action: hijack-dns
-    # IP 会变的公共 DoH 主机名。放在 sniff 之后才能看到 SNI；对应的 DNS 查询
-    # 直接 NXDOMAIN，查询本身也不会再发给任何解析器。
-    - domain_suffix:
-        - dns.google
-        - dns.google.com
-        - cloudflare-dns.com
-        - one.one.one.one
-        - dns.quad9.net
-        - dns.nextdns.io
-        - dns.adguard-dns.com
-        - dns.alidns.com
-        - doh.pub
-        - dns.pub
-      action: reject
-      method: drop
-    # Never route packets addressed to the TUN itself back into direct.
-    # The DNS peer is handled by hijack-dns above; other ports must be dropped.
-    - ip_cidr: [172.18.0.0/30, 'fdfe:dcba:9876::/126']
-      action: reject
-      method: drop
-    - ip_is_private: true
-      action: route
-      outbound: direct
-    - ip_version: 6
-      action: reject
-    - protocol: [bittorrent]
-      action: route
-      outbound: direct
-    # SSH 一律直连。route.final 是 Available，而多数机场出口封 22 端口：走代理时
-    # TCP 能建连，但服务器会在 kex_exchange_identification 阶段立刻断开（报
-    # "Connection closed by ... port 22"；连 github.com:22 也一样），所有 ssh 都失败。
-    #
-    # 放在 pre_rules 末尾（而不是 sniff 之前）是有意的：前面几条守卫必须先跑——
-    # TUN 自身网段要拒（否则到 TUN 的 22 端口会被送去直连再兜回来）、IPv6 字面量
-    # 要拒（桌面策略整体不用 IPv6）。这样一条规则就够，不必重复这些判断。
-    # 实测 sniff 对真实 SSH 客户端不增加延迟：客户端建连后立刻发 banner，嗅探
-    # 在收到首包时就结束，不会等满 300ms。
-    - port: 22
-      action: route
-      outbound: direct
-      dns: false
-  business_rules:
-    # 播放清单和 googlevideo 取流绑在同一个出口上，拆开就会 403。
-    # 本地后缀在 geosite-youtube 下载完成前就生效，并且必须排在后面的
-    # google.com / googleapis.com / googleusercontent.com 之前。
-    # 官方 geosite-youtube 把整个 ggpht.com 和 yt3.googleusercontent.com
-    # 算进 YouTube；只写 yt3/yt4.ggpht.com 会让其余封面和播放器资源掉进通用 Google 规则。
-    - domain_suffix:
-        - youtube.com
-        - youtu.be
-        - yt.be
-        - youtube-nocookie.com
-        - youtubekids.com
-        - ytimg.com
-        - googlevideo.com
-        - ggpht.com
-        - youtubei.googleapis.com
-        - youtube.googleapis.com
-        - youtubeembeddedplayer.googleapis.com
-        - yt3.googleusercontent.com
-        - wide-youtube.l.google.com
-        - youtube-ui.l.google.com
-      action: route
-      outbound: YouTube
-    # youtube.com.hk 这类国家域名不是 youtube.com 的后缀，交给官方规则集。
-    # 与上一条出口相同且相邻，生成时会合并成同一个 DNS 竞速块。
-    - rule_set: [geosite-youtube]
-      action: route
-      outbound: YouTube
-    # Twitch 直播取流对节点质量敏感（twitch.tv、ttvnw.net、jtvnw.net 等），
-    # 必须排在 geosite-geolocation-!cn 之前，否则会被通用海外规则先摘走。
-    - rule_set: [geosite-twitch]
-      action: route
-      outbound: Twitch
-    # AI 走 AI 分组（只含 selectors.ai_regions 白名单地区的节点）。
-    # geosite-anthropic 覆盖 claude.com/claude.dev/clau.de/claudemcp* 等
-    # 新域名，若漏到 geosite-geolocation-!cn 会从 Available（默认香港节点）
-    # 出站，触发 Anthropic 的地区封锁。ai-domains 里的
-    # generativelanguage.googleapis.com 等同时命中通用 Google 后缀，
-    # 所以也必须排在通用 Google 规则之前。
-    - rule_set: [geosite-anthropic, geosite-openai, ai-domains]
-      action: route
-      outbound: AI
-    - rule_set: [emby-domains]
-      action: route
-      outbound: Emby
-    # Telegram clients use both domain names and bare data-centre IPs.
-    # Keep the domain path explicit so DNS and routing agree with the IP rule
-    # below, including when an app has not yet connected to a data centre.
-    - rule_set: [geosite-telegram]
-      action: route
-      outbound: Telegram
-    # 页面、账号和 CDN 会拆到这些域名上。写在 geosite-cn / geoip-cn 之前，
-    # 国内规则集或污染地址就不能把它们送去直连。ggpht 已归 YouTube。
-    - domain_suffix:
-        - google.com
-        - google.com.hk
-        - gmail.com
-        - gstatic.com
-        - googleapis.com
-        - googleusercontent.com
-      action: route
-      outbound: Available
-    # 数据中心 IPv4，与 https://core.telegram.org/resources/cidr.txt 对齐
-    # （含 91.105.192.0/23）。不写 IPv6：桌面更早的规则会拒绝 IPv6，安卓
-    # TUN 不接管 IPv6，DNS 又是 ipv4_only，客户端使用 A 记录。
-    - ip_cidr:
-        - 91.105.192.0/23
-        - 91.108.4.0/22
-        - 91.108.8.0/22
-        - 91.108.12.0/22
-        - 91.108.16.0/22
-        - 91.108.20.0/22
-        - 91.108.56.0/22
-        - 149.154.160.0/20
-        - 185.76.151.0/24
-      action: route
-      outbound: Telegram
-  domestic_rules:
-    # 自建 Emby（Cloudflare 代理，AliDNS 给出的 anycast 地址直连可达）。
-    # 两者都不在 emby-domains 名单里，不会被上方的 Emby 规则抢走。
-    - domain_suffix: [emby.kingemby.com, media.wybcs.work]
-      action: route
-      outbound: direct
-    - domain_suffix:
-        - time.windows.com
-        - time.nist.gov
-        - ntp.org
-        - time.apple.com
-        - time.android.com
-        - time.google.com
-      action: route
-      outbound: direct
-    - rule_set: [direct-cdn]
-      action: route
-      outbound: direct
-    # Spotify 整条链路（账号/API、图片、音频 CDN）交给 Spotify 分组（默认
-    # direct）。DNS 始终走国内解析器，切到代理后仅 CDN 边缘略偏。
-    - rule_set: [spotify-direct]
-      action: route
-      outbound: Spotify
-      dns: domestic
-    # B 站 PCDN（MCDN）取流节点。手机端 playurl 下发的主地址和第一备用都是
-    # 这类节点（URL 里带 os=mcdn，端口 8082/4483），普通 CDN（upos-*.bilivideo.com，
-    # os=coso1bv，443）只排最后一条备用。PCDN 节点是家宽/移动网里的 P2P 节点，
-    # 除下载外还要参与对传：走 TUN 时对传建不起来，播放器会挂在主地址上等
-    # （表现为刷视频时卡死），关掉 SFA 反而正常——这正是"走代理才卡"的来源，
-    # 而不是 DNS 或分流把 B 站送进了代理（实测 api.bilibili.com 走的就是家庭 IP）。
-    # 这里直接 reject（DNS 同步 NXDOMAIN），播放器会立刻改用已签发的普通 CDN
-    # 备用地址，切换在毫秒级。reject 用默认方式（RST/ICMP 不可达）保证快速失败，
-    # 不要写 method: drop。只列 PCDN 边缘域，bilivideo.com/hdslb.com 本体保持直连；
-    # 以后新增节点域时，判断依据是取流 URL 里的 os=mcdn。
-    - domain_suffix:
-        - mcdn.bilivideo.cn
-        - mcdn.bilivideo.com
-        - szbdyd.com
-        - edge.mountaintoys.cn
-      action: reject
-    # 只保留 geosite-cn 还没加载时不能走代理的名字。.cn / .com.cn / .中国
-    # 由紧随其后的后缀规则覆盖，不再写进这个名单。
-    - rule_set: [china-direct]
-      action: route
-      outbound: direct
-    # 中国国家/地区顶级域名不应因 geosite 更新滞后而落入代理。
-    # 包括 .cn、.com.cn 以及"中国"的 punycode 表示。
-    - domain_suffix: [cn, xn--fiqs8s]
-      action: route
-      outbound: direct
-    - rule_set: [geosite-cn]
-      action: route
-      outbound: direct
-    # 广告拦截放在所有业务与国内直连规则之后：上游广告名单偶尔收录 AI、
-    # Emby、Telegram 与应用商店依赖的服务/CDN 主机，前面的规则已先放行它们。
-    - rule_set: [geosite-category-ads-all]
-      action: reject
-    - rule_set: [geosite-geolocation-!cn]
-      action: route
-      outbound: Available
-    - rule_set: [geoip-cn]
-      action: route
-      outbound: direct
-      dns: false
+config:
+  log: {level: warn, timestamp: true}
+
+  experimental:
+    cache_file: {enabled: true}        # 记住面板选中的节点，缓存远程规则集
+    urltest_unified_delay: true        # reF1nd：测速结果不含建连耗时
+
+  inbounds:
+    - only: desktop
+      type: tun
+      tag: tun-in
+      # IPv6 地址只为把 IPv6 流量收进来再由下面的规则拒绝，避免绕过代理。
+      address: [172.18.0.1/30, 'fdfe:dcba:9876::1/126']
+      auto_route: true
+      strict_route: true
+    - only: desktop
+      type: mixed
+      tag: mixed-in
+      listen: 127.0.0.1
+      listen_port: 7890
+    - only: android
+      type: tun
+      tag: tun-in
+      address: [172.18.0.1/30]
+      auto_route: true
+      # 局域网不进 TUN：手机开着 VPN 也能访问内网设备、拉取本机发布的配置。
+      # 172.16.0.0/12 里去掉了 TUN 自己所在的 172.18.0.0/16。
+      route_exclude_address:
+        - 10.0.0.0/8
+        - 172.16.0.0/15
+        - 172.19.0.0/16
+        - 172.20.0.0/14
+        - 172.24.0.0/13
+        - 192.168.0.0/16
+
+  dns:
+    servers:
+      # 国内两路直连 DoH。server 写 IP，省掉"解析器自己要先被解析"。
+      # 不要写 detour: direct（核心启动时拒绝），也不要用 type: local
+      # （TUN 把系统 DNS 指向自己，local 会查回 sing-box 自己）。
+      - {tag: alidns, type: https, server: 223.5.5.5, tls: {server_name: dns.alidns.com}}
+      - {tag: dnspod, type: https, server: 1.12.12.12, tls: {server_name: doh.pub}}
+      # 海外两路 DoH，经代理出去，拿到的是代理出口附近的 CDN 地址。
+      - {tag: google, type: https, server: 8.8.8.8, tls: {server_name: dns.google}, detour: Available}
+      - {tag: cloudflare, type: https, server: 1.1.1.1, tls: {server_name: cloudflare-dns.com}, detour: Available}
+      # reF1nd 的 group：组内同时查询，先成功的生效。只在同一信任级别内并发，
+      # 国内和海外绝不放进同一组（国内解析器对被墙域名又快又假）。
+      - {tag: domestic, type: group, servers: [alidns, dnspod]}
+      - {tag: proxy, type: group, servers: [google, cloudflare]}
+    # DNS 规则与下面的路由规则一一对应：走代理的域名用 proxy 解析，直连的
+    # 用 domestic 解析。两边顺序要保持一致。
+    rules:
+      - {rule_set: block, action: predefined, rcode: NXDOMAIN}
+      - only: desktop
+        rule_set: microsoft-store
+        server: proxy
+      - only: android
+        rule_set: google-play
+        server: proxy
+      - rule_set:
+          - geosite-youtube
+          - geosite-twitch
+          - geosite-anthropic
+          - geosite-openai
+          - ai
+          - emby
+          - geosite-telegram
+          - proxy
+          # Spotify 默认直连，但解析放在代理侧：open.spotify.com 在国内
+          # 解析器上是被污染的，代理侧答案直连、走代理都能用。
+          - spotify
+        server: proxy
+      - {rule_set: [direct, geosite-cn], server: domestic}
+      - {rule_set: geosite-category-ads-all, action: predefined, rcode: NXDOMAIN}
+      - {rule_set: geosite-geolocation-!cn, server: proxy}
+      # 名单外的域名以代理侧的答案为准：答案在中国大陆 IP 段内，说明是国内
+      # 站点，改用国内解析器的答案（CDN 就近，路由层按 geoip-cn 直连）；
+      # 否则直接采用代理侧的答案。
+      # 不能反过来拿国内解析器的答案做判断：它对被墙域名返回假地址，而且
+      # 假地址偶尔也落在大陆 IP 段内（实测 annas-archive.org → 118.184.78.78）。
+      # 更不能写成"名单外一律 domestic"——那正是"要挂代理的网站打不开"的成因。
+      - {action: evaluate, server: proxy}
+      - {match_response: true, rule_set: geoip-cn, server: domestic}
+      - {action: respond}
+    final: proxy
+    strategy: ipv4_only
+    # 记下"IP → 域名"，嗅探不出域名的连接也能按域名规则分流。
+    reverse_mapping: true
+
+  # 规则集通过代理下载（未指定 http_client 时使用第一个）。
+  http_clients:
+    - {tag: via-proxy, detour: Available}
+
+  route:
+    auto_detect_interface: true
+    # 节点域名、直连出站拨号时的域名，都用国内解析器，不依赖任何节点。
+    default_domain_resolver: domestic
+    rules:
+      - {action: sniff}
+      - {protocol: dns, action: hijack-dns}
+      # mixed 入站收到的是域名：先按上面的 DNS 规则解析成 IP，之后的分流就和
+      # TUN 进来的流量完全一样。
+      - {only: desktop, inbound: mixed-in, action: resolve}
+      - {ip_is_private: true, outbound: direct}
+      - {ip_version: 6, action: reject}
+      - {protocol: bittorrent, outbound: direct}
+      # SSH 直连：多数机场出口封 22 端口，走代理会在握手阶段被断开。
+      - {port: 22, outbound: direct}
+      - {rule_set: block, action: reject}
+
+      - only: desktop
+        process_name: [WinStore.App.exe, MicrosoftStore.exe, StoreExperienceHost.exe]
+        outbound: Available
+      - only: desktop
+        rule_set: microsoft-store
+        outbound: Available
+      - only: android
+        package_name: [com.android.vending, com.google.android.gms, com.google.android.gsf]
+        outbound: Google Play
+      - only: android
+        rule_set: google-play
+        outbound: Google Play
+
+      # 业务分组。必须排在 proxy 名单之前：youtubei.googleapis.com、
+      # generativelanguage.googleapis.com 等同时命中名单里的 googleapis.com。
+      - {rule_set: geosite-youtube, outbound: YouTube}
+      - {rule_set: geosite-twitch, outbound: Twitch}
+      - {rule_set: [geosite-anthropic, geosite-openai, ai], outbound: AI}
+      - {rule_set: emby, outbound: Emby}
+      - {rule_set: geosite-telegram, outbound: Telegram}
+      # Telegram 数据中心 IPv4（https://core.telegram.org/resources/cidr.txt）
+      - ip_cidr:
+          - 91.105.192.0/23
+          - 91.108.4.0/22
+          - 91.108.8.0/22
+          - 91.108.12.0/22
+          - 91.108.16.0/22
+          - 91.108.20.0/22
+          - 91.108.56.0/22
+          - 149.154.160.0/20
+          - 185.76.151.0/24
+        outbound: Telegram
+      - {rule_set: proxy, outbound: Available}
+      - {rule_set: spotify, outbound: Spotify}
+
+      - {rule_set: direct, outbound: direct}
+      - {rule_set: geosite-cn, outbound: direct}
+      # 广告拦截排在业务与直连名单之后：上游广告名单偶尔会收进它们依赖的主机。
+      - {rule_set: geosite-category-ads-all, action: reject}
+      - {rule_set: geosite-geolocation-!cn, outbound: Available}
+      - {rule_set: geoip-cn, outbound: direct}
+    final: Available

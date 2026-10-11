@@ -1,0 +1,35 @@
+# 直连名单：国内解析 + 直连出站。一行一个域名后缀，# 开头是注释。
+# 名单外的域名不需要写进来：国内解析结果落在中国大陆 IP 段的会自动直连。
+
+# 中国顶级域（.cn / .com.cn / .中国），不依赖 geosite-cn 的更新进度
+cn
+xn--fiqs8s
+
+# 自建 Emby（Cloudflare 代理，国内直连可达）
+emby.kingemby.com
+media.wybcs.work
+
+# 校时
+time.windows.com
+time.nist.gov
+ntp.org
+time.apple.com
+time.android.com
+time.google.com
+
+# 系统更新与游戏下载 CDN：国内有节点，直连更快
+windowsupdate.com
+update.microsoft.com
+windowsupdate.microsoft.com
+swcdn.apple.com
+iosapps.itunes.apple.com
+osxapps.itunes.apple.com
+cdn-apple.com
+mzstatic.com
+aaplimg.com
+steamcontent.com
+steamstatic.com
+steamcdn-a.akamaihd.net
+steamuserimages-a.akamaihd.net
+steamcloud-ugc.akamaihd.net
+steampipe.akamaized.net

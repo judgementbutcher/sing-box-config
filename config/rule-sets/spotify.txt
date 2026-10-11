@@ -1,0 +1,16 @@
+# Spotify 全链路 → Spotify 分组（默认直连：账号地区校验看出口 IP，机房段会被拒）
+spotify.com
+scdn.co
+spotifycdn.com
+spotifycdn.net
+pscdn.co
+spoti.fi
+audio-ak-spotify-com.akamaized.net
+audio-akp-spotify-com.akamaized.net
+audio-akp-bbr-spotify-com.akamaized.net
+audio4-ak-spotify-com.akamaized.net
+heads-ak-spotify-com.akamaized.net
+heads4-ak-spotify-com.akamaized.net
+spotify.com.edgesuite.net
+spotify.map.fastly.net
+spotify.map.fastlylb.net

@@ -1,0 +1,8 @@
+# 屏蔽名单：DNS 返回 NXDOMAIN，连接直接拒绝。
+# B 站 PCDN（取流 URL 带 os=mcdn）是家宽里的 P2P 节点，经 TUN 对传建不起来，
+# 播放器会卡在主地址上；拒掉后它立刻改用普通 CDN 备用地址。
+# 只列 PCDN 边缘域，bilivideo.com / hdslb.com 本体不要写进来。
+mcdn.bilivideo.cn
+mcdn.bilivideo.com
+szbdyd.com
+edge.mountaintoys.cn
