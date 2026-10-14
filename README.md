@@ -82,7 +82,7 @@ config:
 | `Available` | 各订阅（多节点订阅是同名分组，单节点订阅就是节点本身），外加 `Other` |
 | `AI` | `groups.ai_regions` 白名单地区的节点，按白名单顺序排列，外加 `Other` |
 | `Other` | 名字里识别不出地区的节点；不进业务分组 |
-| `groups.services` 里的业务分组 | `Available` 加各订阅，默认跟随 `Available`；`direct: first` 默认直连（Spotify），`direct: last` 把直连放在末尾（Emby） |
+| `groups.services` 里的业务分组 | 默认 `Available` 加各订阅，跟随 `Available` 的当前选择；`direct: first` 把直连放在最前并作为默认（Spotify），`direct: last` 把直连放在末尾（Emby）；`expand: true` 不引用 `Available`，而是展开成它的成员（各订阅分组与 `Other`） |
 
 所有分组都是手动选择器，第一个成员是默认值，选中的节点由 `cache_file` 记住。
 
@@ -123,7 +123,7 @@ TUN 是真实 IP 模式：客户端先拿到解析结果再发起连接，所以
 另外两处有意的选择：
 
 - 解析器都写 IP、不写 `detour: direct`（核心会拒绝启动），也不用 `type: local`（TUN 把系统 DNS 指向自己，`local` 会查回 sing-box）。
-- Spotify 默认直连，但解析放在代理侧：`open.spotify.com` 在国内解析器上是被污染的。网页播放器本身直连不通，要用它就把 `Spotify` 分组切到节点。
+- Spotify 默认直连（`expand: true` 把各订阅分组和 `Other` 展开摆在 `Spotify` 组里，随时可切），解析放在代理侧：`open.spotify.com` 在国内解析器上是被污染的。网页播放器本身直连不通，要用它就把 `Spotify` 分组切到节点。
 
 ## 发布
 

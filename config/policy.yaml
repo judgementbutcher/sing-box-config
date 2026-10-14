@@ -20,10 +20,13 @@ groups:
   ai_regions: [US, JP, SG, TW]
   # 业务分组：成员是 Available 加各订阅，默认跟随 Available，可在面板单独换节点。
   # direct: first 把直连放在最前并作为默认，direct: last 把直连追加在末尾。
+  # expand: true 不引用 Available，而是展开成它的成员（各订阅分组与 Other），
+  # 组里直接列出可选出口。Spotify 用这种写法：埃及区账号要求出口与账号地区一致，
+  # 默认直连，同时把各订阅节点和 Other 都摆在面板里随时可切。
   services:
     - {tag: Emby, direct: last}
     - {tag: YouTube}
-    - {tag: Spotify, direct: first}
+    - {tag: Spotify, direct: first, expand: true}
     - {tag: Telegram}
     - {tag: Twitch}
     - {tag: Google Play, only: android}

@@ -340,7 +340,13 @@ def build_outbounds(sources: Sequence[Source], groups: Mapping[str, Any]) -> lis
         direct = group.get("direct")
         if direct not in (None, "first", "last"):
             raise ValueError(f"分组 {group['tag']} 的 direct 只能是 first 或 last")
-        members = ["Available", *entries]
+        expand = group.get("expand")
+        if expand not in (None, True, False):
+            raise ValueError(f"分组 {group['tag']} 的 expand 只能是 true 或 false")
+        # 默认引用 Available 选择器本身（跟随 Available 的当前选择）；
+        # expand: true 则把 Available 展开成它的成员（各订阅分组与 Other），
+        # 让组里直接列出可选的出口，而不是套一层 Available。
+        members = [*entries, *extra] if expand else ["Available", *entries]
         if direct == "first":
             members.insert(0, "direct")
         elif direct == "last":

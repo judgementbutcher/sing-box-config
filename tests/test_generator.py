@@ -24,7 +24,7 @@ POLICY = {
         "ai_regions": ["US", "JP"],
         "services": [
             {"tag": "YouTube"},
-            {"tag": "Spotify", "direct": "first"},
+            {"tag": "Spotify", "direct": "first", "expand": True},
             {"tag": "Emby", "direct": "last"},
         ],
     },
@@ -237,7 +237,8 @@ def test_outbound_layout():
     assert tags["AI"]["outbounds"] == ["US 01", "JP 01", "Other"]
     assert tags["Other"]["outbounds"] == ["Mystery"]
     assert tags["YouTube"]["outbounds"] == ["Available", "Air", "SG-Home"]
-    assert tags["Spotify"]["outbounds"] == ["direct", "Available", "Air", "SG-Home"]
+    # expand: true 不引用 Available，而是把它展开成成员，直连排在最前作为默认。
+    assert tags["Spotify"]["outbounds"] == ["direct", "Air", "SG-Home", "Other"]
     assert tags["Emby"]["outbounds"] == ["Available", "Air", "SG-Home", "direct"]
     assert tags["Air"]["outbounds"] == ["JP 01", "US 01", "Mystery"]
 
@@ -246,6 +247,21 @@ def test_ai_group_falls_back_to_available_and_other_is_optional():
     outbounds = by_tag(build_outbounds([Source("Air", [node("HK 01"), node("HK 02")], [])], POLICY["groups"]))
     assert outbounds["AI"]["outbounds"] == ["Available"]
     assert "Other" not in outbounds
+
+
+def test_expand_group_lists_subscriptions_instead_of_available():
+    sources = [Source("Air", [node("JP 01")], ["JP 01"]), Source("SG-Home", [node("SG-Home")], [])]
+    outbounds = by_tag(build_outbounds(sources, {"services": [
+        {"tag": "Plain"},
+        {"tag": "Flat", "direct": "first", "expand": True},
+    ]}))
+    assert outbounds["Plain"]["outbounds"] == ["Available", "Air", "SG-Home"]
+    assert outbounds["Flat"]["outbounds"] == ["direct", "Air", "SG-Home"]
+
+
+def test_expand_group_rejects_non_boolean():
+    with pytest.raises(ValueError, match="expand"):
+        build_outbounds([Source("Air", [node("JP 01")], [])], {"services": [{"tag": "X", "expand": "yes"}]})
 
 
 # ---------------------------------------------------------------- 仓库里的 policy.yaml
