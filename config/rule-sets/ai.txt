@@ -31,9 +31,21 @@ anthropic.com.cdn.cloudflare.net
 #
 # 登录人机校验（claude.ai 登录页；Turnstile 见下面 challenges.cloudflare.com）
 hcaptcha.com
-# Claude Code 操作遥测：官方网络要求文档列出的两个 Datadog 上报主机
+# Claude Code 操作遥测：Datadog RUM / 日志上报。客户端二进制里同时声明了
+# 无区域、us3、us5、ap1、ap2、eu 六个 intake 主机，运行时按区域挑一个。
+# 注意 browser-intake-us5-datadoghq.com 这类名字的标签是
+# [browser-intake-us5-datadoghq, com]，注册域并不是 datadoghq.com，
+# 所以 domain_suffix: datadoghq.com 匹配不到它们，只能逐个列；
+# 只有 api.datadoghq.com 这种才落在 datadoghq.com 后缀下。
+# 漏一个就会掉进 geosite-geolocation-!cn（Available），与 API 出口不一致。
+browser-intake-datadoghq.com
+browser-intake-us3-datadoghq.com
 browser-intake-us5-datadoghq.com
+browser-intake-ap1-datadoghq.com
+browser-intake-ap2-datadoghq.com
+browser-intake-datadoghq.eu
 http-intake.logs.us5.datadoghq.com
+api.datadoghq.com
 # 特性开关（Feature flags）CDN
 cdn.growthbook.io
 # Sentry 错误上报。写整条 sentry.io：客户端 egress 表同时声明了 *.sentry.io
@@ -44,6 +56,11 @@ sentry.io
 statsigapi.net
 challenges.cloudflare.com
 client-api.arkoselabs.com
+# claude.ai 网页版的在线客服 widget（Intercom）。客户端二进制里带 mcp.intercom.com，
+# 但整条 intercom.io 也不贵：不写就会被 geosite-geolocation-!cn 收进 Available，
+# 客服请求和账号请求从两个国家出去。
+intercom.io
+intercomcdn.com
 perplexity.ai
 pplx.ai
 poe.com

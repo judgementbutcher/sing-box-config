@@ -160,6 +160,13 @@ config:
       - {rule_set: geosite-youtube, outbound: YouTube}
       - {rule_set: geosite-twitch, outbound: Twitch}
       - {rule_set: [geosite-anthropic, geosite-openai, ai], outbound: AI}
+      # Anthropic 自有 IP 段（RDAP: NET-160-79-104-0-1 / ANTHROPIC-V6）兜底。
+      # 放在 AI 域名规则正后面：域名没枚举到的（ECH、硬编码 IP、新域名）也能
+      # 进 AI 分组，不至于掉到 Available 造成"同一账号两个出口"。
+      # IPv6 段不列：上面已有 ip_version 6 → reject。ip_cidr 直接比对连接
+      # 目标 IP，sing-box 没有 IP-CIDR 的 no-resolve 字段，写了会启动失败。
+      - ip_cidr: ["160.79.104.0/21"]
+        outbound: AI
       - {rule_set: emby, outbound: Emby}
       - {rule_set: geosite-telegram, outbound: Telegram}
       # Telegram 数据中心 IPv4（https://core.telegram.org/resources/cidr.txt）
