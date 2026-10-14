@@ -1,8 +1,15 @@
 # AI 服务域名（geosite-anthropic / geosite-openai 之外的补充）→ AI 分组
 openai.com
+openai.org
 chatgpt.com
+chat.com
 oaistatic.com
 oaiusercontent.com
+sora.com
+openaiapi-site.azureedge.net
+# ChatGPT 的特性开关与资源登记接口
+featureassets.org
+prodregistryv2.org
 anthropic.com
 claude.ai
 claude.com
@@ -85,10 +92,25 @@ copilot.microsoft.com
 sydney.bing.com
 edgeservices.bing.com
 ai.google.dev
+ai.google
+deepmind.google
+labs.google
+jules.google
+antigravity.google
 gemini.google.com
+gemini.google
+bard.google.com
 aistudio.google.com
+ai.studio
 makersuite.google.com
 notebooklm.google.com
+notebooklm.google
 generativelanguage.googleapis.com
+aiplatform.googleapis.com
+cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
+alkalimakersuite-pa.clients6.google.com
+robinfrontend-pa.googleapis.com
+proactivebackend-pa.googleapis.com
 developerprofiles-pa.googleapis.com
 content-developerprofiles-pa.googleapis.com
