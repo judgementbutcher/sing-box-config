@@ -1,20 +1,8 @@
-# AI 服务域名（geosite-anthropic / geosite-openai 之外的补充）→ AI 分组
-openai.com
-openai.org
-chatgpt.com
-chat.com
-oaistatic.com
-oaiusercontent.com
-sora.com
+# AI 服务补充域名（geosite-anthropic / geosite-openai 之外的特定端点与特性接口）→ AI 分组
 openaiapi-site.azureedge.net
 # ChatGPT 的特性开关与资源登记接口
 featureassets.org
 prodregistryv2.org
-anthropic.com
-claude.ai
-claude.com
-claude.dev
-clau.de
 claudeusercontent.com
 claudemcpclient.com
 claudemcpcontent.com

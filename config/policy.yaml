@@ -98,7 +98,7 @@ config:
         rule_set: microsoft-store
         server: proxy
       - only: android
-        rule_set: google-play
+        rule_set: geosite-google-play
         server: proxy
       - rule_set:
           - geosite-youtube
@@ -111,9 +111,9 @@ config:
           - proxy
           # Spotify 默认直连，但解析放在代理侧：open.spotify.com 在国内
           # 解析器上是被污染的，代理侧答案直连、走代理都能用。
-          - spotify
+          - geosite-spotify
         server: proxy
-      - {rule_set: [direct, geosite-cn], server: domestic}
+      - {rule_set: [direct, geosite-private, geosite-cn], server: domestic}
       - {rule_set: geosite-category-ads-all, action: predefined, rcode: NXDOMAIN}
       - {rule_set: geosite-geolocation-!cn, server: proxy}
       # 名单外的域名以代理侧的答案为准：答案在中国大陆 IP 段内，说明是国内
@@ -165,7 +165,7 @@ config:
         package_name: [com.android.vending, com.google.android.gms, com.google.android.gsf]
         outbound: Google Play
       - only: android
-        rule_set: google-play
+        rule_set: geosite-google-play
         outbound: Google Play
 
       # 业务分组。必须排在 proxy 名单之前：youtubei.googleapis.com、
@@ -195,9 +195,10 @@ config:
           - 185.76.151.0/24
         outbound: Telegram
       - {rule_set: proxy, outbound: Available}
-      - {rule_set: spotify, outbound: Spotify}
+      - {rule_set: geosite-spotify, outbound: Spotify}
 
       - {rule_set: direct, outbound: direct}
+      - {rule_set: geosite-private, outbound: direct}
       - {rule_set: geosite-cn, outbound: direct}
       # 广告拦截排在业务与直连名单之后：上游广告名单偶尔会收进它们依赖的主机。
       - {rule_set: geosite-category-ads-all, action: reject}
