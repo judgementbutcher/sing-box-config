@@ -42,10 +42,11 @@ function Stop-Usage {
 function Get-PythonCommand {
     $venv = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $venv -PathType Leaf) { return @($venv) }
-    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($launcher) { return @($launcher.Source, "-3") }
-    $python = Get-Command python.exe -ErrorAction SilentlyContinue
+    # Respect the active PATH interpreter, including actions/setup-python.
+    $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($python) { return @($python.Source) }
+    $launcher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($launcher) { return @($launcher.Source, "-3") }
     throw "找不到 Python。请先运行 scripts\bootstrap\setup.bat。"
 }
 

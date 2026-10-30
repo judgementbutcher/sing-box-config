@@ -138,6 +138,101 @@ def test_menu_cancel_never_changes_state(query_manager, stdin):
     assert snapshot(root) == before
 
 
+@pytest.mark.parametrize("has_venv,available,selected,prefix", [
+    (True, ("python.exe", "py.exe"), "venv", []),
+    (False, ("python.exe", "py.exe"), "python.exe", []),
+    (False, ("py.exe",), "py.exe", ["-3"]),
+    (False, (), None, []),
+], ids=["project-venv", "path-python-before-launcher", "launcher-fallback", "missing-python"])
+def test_python_command_resolution_is_isolated_and_preserves_selected_interpreter(
+        tmp_path, has_venv, available, selected, prefix):
+    project = tmp_path / "isolated project"
+    project.mkdir()
+    venv_python = project / ".venv/Scripts/python.exe"
+    if has_venv:
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_bytes(b"")
+    commands = {name: [str(tmp_path / location / name) for location in ("first match", "second match")]
+                for name in available}
+    script = tmp_path / "python-command.ps1"
+    # Execute the real resolver without loading manager actions or the host PATH.
+    script.write_text("""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$errors=$null; $tokens=$null
+$tree=[Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors)
+$node=$tree.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PythonCommand'},$true)
+. ([scriptblock]::Create($node.Extent.Text))
+$ProjectRoot=$args[1]
+$script:commands=ConvertFrom-Json $env:PYTHON_COMMAND_STUBS
+$script:lookups=@()
+function Get-Command {
+  [CmdletBinding()]
+  param([string]$Name, [string]$CommandType)
+  $script:lookups += [pscustomobject]@{name=$Name; command_type=$CommandType}
+  foreach($source in $script:commands.$Name) {
+    [pscustomobject]@{Source=$source; CommandType='Application'}
+  }
+}
+try {
+  $command=@(Get-PythonCommand)
+  [pscustomobject]@{command=$command; lookups=$script:lookups; error=$null} | ConvertTo-Json -Depth 4 -Compress
+} catch {
+  [pscustomobject]@{command=@(); lookups=$script:lookups; error=$_.Exception.Message} | ConvertTo-Json -Depth 4 -Compress
+  exit 1
+}
+""", encoding="utf-8-sig")
+    before = snapshot(project)
+    result = powershell(script, str(MANAGER), str(project),
+                        env={"PYTHON_COMMAND_STUBS": json.dumps(commands)})
+    assert result.returncode == (1 if selected is None else 0), result.stdout + result.stderr
+    recorded = json.loads(result.stdout)
+    if selected is None:
+        assert recorded["command"] == []
+        assert "scripts\\bootstrap\\setup.bat" in recorded["error"]
+    else:
+        executable = str(venv_python) if selected == "venv" else commands[selected][0]
+        assert recorded["command"] == [executable, *prefix]
+        assert recorded["error"] is None
+    expected_lookups = [] if has_venv else ["python.exe"]
+    if not has_venv and "python.exe" not in available:
+        expected_lookups.append("py.exe")
+    assert [lookup["name"] for lookup in recorded["lookups"]] == expected_lookups
+    assert all(lookup["command_type"] == "Application" for lookup in recorded["lookups"])
+    assert snapshot(project) == before
+
+
+def test_manager_without_project_venv_uses_path_interpreter_end_to_end(tmp_path):
+    project = tmp_path / "isolated project"
+    script = project / "scripts/manage/manage.ps1"
+    script.parent.mkdir(parents=True)
+    shutil.copyfile(MANAGER, script)
+    package = project / "singbox_config"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "management.py").write_text(
+        "import json, os, sys\n"
+        "print(json.dumps({'python': sys.executable, 'argv': sys.orig_argv, 'cwd': os.getcwd()}))\n",
+        encoding="utf-8",
+    )
+    before = snapshot(project)
+    result = powershell(script, "-Action", "status", "-Json", "-NonInteractive", env={
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        "PYTHONPATH": "", "SING_BOX_CORE": "",
+    })
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = json.loads(result.stdout)
+    assert Path(recorded["python"]) == Path(sys.executable)
+    assert recorded["argv"][1:] == [
+        "-m", "singbox_config.management", "status",
+        "--config-root", str(project / "config"),
+        "--runtime-root", str(project / "runtime"),
+        "--output-root", str(project / "dist"), "--json",
+    ]
+    assert Path(recorded["cwd"]) == project
+    assert snapshot(project) == before
+
+
 @pytest.mark.parametrize("exit_code", [2, 10])
 def test_native_exit_codes_are_preserved_and_classified(tmp_path, exit_code):
     # Extract only helper definitions, so no manager action or production input runs.
