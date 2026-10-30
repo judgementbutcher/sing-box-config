@@ -1,104 +1,28 @@
-# AI 服务补充域名（geosite-anthropic / geosite-openai 之外的特定端点与特性接口）→ AI 分组
+# 非 Google AI 与共享第三方验证、遥测依赖。Google 生态在 google.txt。
+# persistent.oaistatic.com 的精确资源例外在 policy.yaml，子域名仍按 AI 分流。
+persistent.oaistatic.com
 openaiapi-site.azureedge.net
-# ChatGPT 的特性开关与资源登记接口
-featureassets.org
-prodregistryv2.org
-claudeusercontent.com
-claudemcpclient.com
-claudemcpcontent.com
-# Anthropic 自有域名：解析到 Anthropic 自己的 IP（160.79.104.10，与
-# anthropic.com / claude.ai 同一个），证书 CN 同名；桌面端会请求。
-claude.app
-claudestudio.com
-# Claude on Google Cloud 的 Anthropic 端点（客户端内置的 base URL）。
-claude.googleapis.com
-# Anthropic 的内部域名（staging / 演练环境），证书与 IP 都归属 Anthropic。
-# 客户端二进制里带着 beacon./preview.claude-ai.staging.ant.dev。
-ant.dev
-anthropic.auth0.com
-anthropic-com.ghost.io
-anthropic.com.cdn.cloudflare.net
-
-# ── 登录校验与遥测 ────────────────────────────────────────────────
-# 这些请求带设备/账号指纹，出口必须和 API 一致，否则在风控眼里是
-# "同一账号两个出口"。加进这里同时意味着它们不再被 geosite-category-ads-all
-# 拦截（AI 路由规则排在广告拦截之前）。
-#
-# 登录人机校验（claude.ai 登录页；Turnstile 见下面 challenges.cloudflare.com）
-hcaptcha.com
-# Claude Code 操作遥测：Datadog RUM / 日志上报。客户端二进制里同时声明了
-# 无区域、us3、us5、ap1、ap2、eu 六个 intake 主机，运行时按区域挑一个。
-# 注意 browser-intake-us5-datadoghq.com 这类名字的标签是
-# [browser-intake-us5-datadoghq, com]，注册域并不是 datadoghq.com，
-# 所以 domain_suffix: datadoghq.com 匹配不到它们，只能逐个列；
-# 只有 api.datadoghq.com 这种才落在 datadoghq.com 后缀下。
-# 漏一个就会掉进 geosite-geolocation-!cn（Available），与 API 出口不一致。
-browser-intake-datadoghq.com
-browser-intake-us3-datadoghq.com
-browser-intake-us5-datadoghq.com
-browser-intake-ap1-datadoghq.com
-browser-intake-ap2-datadoghq.com
-browser-intake-datadoghq.eu
-http-intake.logs.us5.datadoghq.com
-api.datadoghq.com
-# 特性开关（Feature flags）CDN
-cdn.growthbook.io
-# Sentry 错误上报。写整条 sentry.io：客户端 egress 表同时声明了 *.sentry.io
-# 与 sentry.io，DSN 主机 o1158394.ingest.us.sentry.io 只是其中一个；
-# 只写那一个的话换 DSN 或走别的区域 ingest 就漏了。代价是 sentry.io 本来
-# 被广告名单拦着，放开后全机器的 Sentry 遥测都不再被拦。
-sentry.io
-statsigapi.net
-challenges.cloudflare.com
+production-openaicom-storage.azureedge.net
+openaicom.imgix.net
+openaicomproductionae4b.blob.core.windows.net
+openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net
+webpubsub.azure.com
 client-api.arkoselabs.com
-# claude.ai 网页版的在线客服 widget（Intercom）。客户端二进制里带 mcp.intercom.com，
-# 但整条 intercom.io 也不贵：不写就会被 geosite-geolocation-!cn 收进 Available，
-# 客服请求和账号请求从两个国家出去。
-intercom.io
-intercomcdn.com
-perplexity.ai
-pplx.ai
-poe.com
+openai-api.arkoselabs.com
+chatgpt.livekit.cloud
+host.livekit.cloud
+turn.livekit.cloud
+crixet.com
+browser-intake-datadoghq.com
+o33249.ingest.sentry.io
+browser-intake-us5-datadoghq.com
+challenges.cloudflare.com
+cloudflareinsights.com
+sheerid.com
+sheerid.net
 grok.com
 x.ai
-mistral.ai
-replicate.com
-openrouter.ai
-groq.com
-cohere.ai
-together.ai
-phind.com
-cursor.com
-cursor.sh
-anysphere.co
-codeium.com
-windsurf.com
-exafunction.com
-githubcopilot.com
-copilot-proxy.githubusercontent.com
-copilot.microsoft.com
-sydney.bing.com
-edgeservices.bing.com
-ai.google.dev
-ai.google
-deepmind.google
-labs.google
-jules.google
-antigravity.google
-gemini.google.com
-gemini.google
-bard.google.com
-aistudio.google.com
-ai.studio
-makersuite.google.com
-notebooklm.google.com
-notebooklm.google
-generativelanguage.googleapis.com
-aiplatform.googleapis.com
-cloudcode-pa.googleapis.com
-daily-cloudcode-pa.googleapis.com
-alkalimakersuite-pa.clients6.google.com
-robinfrontend-pa.googleapis.com
-proactivebackend-pa.googleapis.com
-developerprofiles-pa.googleapis.com
-content-developerprofiles-pa.googleapis.com
+meta.ai
+ai.meta.com
+perplexity.ai
+poe.com

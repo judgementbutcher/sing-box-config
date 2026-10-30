@@ -1,0 +1,16 @@
+# Claude 专属域名。与 geosite-anthropic 合用，并先于普通 AI / Google 名单匹配。
+# 主站显式保留，降低上游规则集变动对核心覆盖的影响。
+claude.ai
+claude.com
+anthropic.com
+claudeusercontent.com
+claudemcpclient.com
+claudemcpcontent.com
+claude.app
+claudestudio.com
+claude.googleapis.com
+ant.dev
+servd-anthropic-website.b-cdn.net
+anthropic-com.ghost.io
+anthropic.com.cdn.cloudflare.net
+anthropic.auth0.com

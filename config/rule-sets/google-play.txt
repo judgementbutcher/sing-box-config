@@ -1,0 +1,9 @@
+# Android Play 的明确主机；与 geosite-google-play 合用并先于宽泛 Google/YouTube。
+play.google.com
+googleplay.com
+play-fe.googleapis.com
+play.googleapis.com
+play-games.googleusercontent.com
+play-lh.googleusercontent.com
+redirector.c.play.google.com
+xn--ngstr-lra8j.com

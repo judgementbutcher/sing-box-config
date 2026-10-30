@@ -5,6 +5,7 @@ config/local/
 # Runtime output, logs and backups
 runtime/
 dist/
+dist-provider/
 logs/
 backups/
 validation/
@@ -23,6 +24,12 @@ cache.*.db
 .venv/
 __pycache__/
 *.pyc
+/.pytest_cache/
+/build/
+*.egg-info/
+
+# Machine-local assistant settings; shared instructions remain public
+.claude/settings.local.json
 
 # Local-only documentation
 README.local.md

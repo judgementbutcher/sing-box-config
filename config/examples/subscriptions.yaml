@@ -9,9 +9,11 @@
 #   exclude         按节点名排除（正则，不区分大小写）。流量、到期时间等信息条目默认保留在分组末尾
 #   allow_insecure  允许订阅里关闭了 TLS 证书校验的节点（默认遇到就报错）
 #   use_hosts       Clash 订阅：按它自带的 hosts 表改写节点域名
-#   ai              auto（默认）= 白名单地区且证书校验正常的节点进 AI 分组；
-#                   true = 白名单地区的节点全部进（含关闭校验的）；false = 都不进
-#   ai_include      按节点名额外放进 AI 分组（正则），用于名字里没有地区的节点
+#   ai              auto（默认）或 true = 按白名单地区 / ai_include 筛选；false = 都不进
+#                   AI 默认排除 insecure 节点；allow_insecure 本身不改变这项筛选
+#   ai_include      按节点名补充 AI 候选（正则），用于名字里没有地区的节点，仍需通过 insecure 筛选
+#   ai_allow_insecure 仅为本来源列出的原始完整节点名豁免 AI 的 insecure 筛选（字符串列表，不是正则）
+#                   仍需 allow_insecure: true；ai: false 时特例不生效
 subscriptions:
   # 最简写法：subscriptions/example.url.txt 里放一行订阅链接。
   - name: example

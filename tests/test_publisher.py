@@ -12,6 +12,8 @@ from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+import pytest
+
 from singbox_config.publisher import (
     ROUTE_PROBE_TIMEOUT,
     PublisherServer,
@@ -58,6 +60,48 @@ def test_credentials_persist_until_explicit_rotation(tmp_path):
     assert rotated["password"] != first["password"]
 
 
+def test_publication_info_hides_secrets_until_explicit_reveal(tmp_path, capsys):
+    from singbox_config.publisher import print_publication_info
+
+    credentials = {"username": "sfa", "password": "private-test-marker"}
+    logfile = tmp_path / "custom.log"
+    print_publication_info("192.0.2.10", 18080, credentials, access_log=logfile)
+    text = capsys.readouterr().out
+    assert "private-test-marker" not in text and "?token=" not in text
+    assert "show-info" in text and str(logfile) in text
+    print_publication_info("192.0.2.10", 18080, credentials, reveal=True)
+    assert "private-test-marker" in capsys.readouterr().out
+
+
+def test_show_info_does_not_create_credentials_or_probe_server(tmp_path, monkeypatch, capsys):
+    from singbox_config import publisher
+
+    path = tmp_path / "secrets" / "publisher.json"
+    monkeypatch.setattr(publisher, "publisher_running", lambda *_a: pytest.fail("unexpected HTTP probe"))
+    args = ["--show-info", "--credentials", str(path), "--advertise-host", "192.0.2.10"]
+    assert publisher.main(args) == 1
+    assert not path.parent.exists()
+    path.parent.mkdir()
+    body = json.dumps({"username": "sfa", "password": "private-test-marker"})
+    path.write_text(body, encoding="utf-8")
+    before = path.stat().st_mtime_ns
+    assert publisher.main(args) == 0
+    assert path.read_text(encoding="utf-8") == body
+    assert path.stat().st_mtime_ns == before
+    assert list(path.parent.iterdir()) == [path]
+    assert "private-test-marker" in capsys.readouterr().out
+
+
+def test_show_info_rejects_invalid_credentials_without_echoing_contents(tmp_path, capsys):
+    from singbox_config import publisher
+
+    path = tmp_path / "publisher.json"
+    path.write_text("private-test-marker-invalid-json", encoding="utf-8")
+    assert publisher.main(["--show-info", "--credentials", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "private-test-marker" not in captured.out + captured.err
+
+
 def test_publication_urls_embed_credentials_only_where_required():
     credentials = {"username": "sfa", "password": "tok/en+with=specials"}
     local = "127.0.0.1:18080/desktop/config.json"
@@ -65,7 +109,9 @@ def test_publication_urls_embed_credentials_only_where_required():
     android = "192.0.2.10:18080/android/config.json"
     authenticated = publication_urls("192.0.2.10", 18080, credentials)
     assert authenticated["桌面/SFW（本机首选）"] == f"http://{local}"
-    assert authenticated["桌面/SFW（局域网）"] == f"http://{lan}"
+    desktop_parts = urlsplit(authenticated["桌面/SFW（局域网）"])
+    assert f"{desktop_parts.netloc}{desktop_parts.path}" == lan
+    assert unquote(desktop_parts.query) == f"token={credentials['password']}"
     # The Android link carries its password as a query parameter: assert the
     # parts instead of one literal URL so the public-repository check does not
     # mistake this fixture for a leaked subscription link.

@@ -1,11 +1,19 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet("menu", "all", "check", "add", "remove", "disable", "enable", "publisher", "show-info", "rotate-credentials")]
     [string]$Action = "menu",
     [switch]$Offline,
     [string]$Name,
     [string]$Link,
-    [string]$AdvertiseHost
+    [string]$AdvertiseHost,
+    [string]$BuildId,
+    [switch]$Legacy,
+    [string]$ConfigRoot,
+    [string]$RuntimeRoot,
+    [string]$OutputRoot,
+    [switch]$NonInteractive,
+    [switch]$Json,
+    [string]$Domain,
+    [string]$Platform = "desktop"
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,17 +23,21 @@ Set-Location -LiteralPath $ProjectRoot
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
-
-$LocalRoot = Join-Path $ProjectRoot "config\local"
-$Subscriptions = Join-Path $LocalRoot "subscriptions.yaml"
-$OutputRoot = Join-Path $ProjectRoot "dist"
-$RuntimeRoot = Join-Path $ProjectRoot "runtime"
-$Platforms = @("desktop", "android")
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONUNBUFFERED = "1"
+if (-not $ConfigRoot) { $ConfigRoot = Join-Path $ProjectRoot "config" }
+if (-not $RuntimeRoot) { $RuntimeRoot = Join-Path $ProjectRoot "runtime" }
+if (-not $OutputRoot) { $OutputRoot = Join-Path $ProjectRoot "dist" }
 $PreferredCoreVersion = "1.15.0-alpha.11-reF1nd"
-$PublisherPort = 18080
-$Utf8 = [Text.UTF8Encoding]::new($false)
+$ReadOnlyActions = @("status", "doctor", "sources", "history", "explain", "lint", "help")
+$Actions = @("menu", "all", "check", "add", "remove", "disable", "enable", "maintain", "rollback", "recover", "publisher", "show-info", "rotate-credentials") + $ReadOnlyActions
 
-# ---------------------------------------------------------------- 生成与校验
+function Stop-Usage {
+    param([string]$Message)
+    $errorObject = [ArgumentException]::new($Message)
+    $errorObject.Data["ExitCode"] = 2
+    throw $errorObject
+}
 
 function Get-PythonCommand {
     $venv = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
@@ -37,442 +49,407 @@ function Get-PythonCommand {
     throw "找不到 Python。请先运行 scripts\bootstrap\setup.bat。"
 }
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Value)
+    # Windows argv escaping, including quotes and trailing backslashes.
+    return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+
 function Invoke-Python {
-    param([string[]]$Arguments)
+    param([string[]]$Arguments, [switch]$Capture, [switch]$Foreground)
     $python = @(Get-PythonCommand)
-    $executable = $python[0]
     $prefix = @($python | Select-Object -Skip 1)
-    & $executable @prefix @Arguments | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Python 命令失败（退出码 $LASTEXITCODE）。" }
+    if ($Foreground) {
+        & $python[0] @prefix @Arguments | Out-Host
+        $code = $LASTEXITCODE
+    } else {
+        $start = New-Object System.Diagnostics.ProcessStartInfo
+        $start.FileName = $python[0]
+        $start.Arguments = (($prefix + $Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join " ")
+        $start.WorkingDirectory = $ProjectRoot
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $start
+        $started = $false
+        try {
+            [void]$process.Start()
+            $started = $true
+            if ($Capture) {
+                $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                $process.WaitForExit()
+                $stdout = $stdoutTask.GetAwaiter().GetResult()
+                $stderr = $stderrTask.GetAwaiter().GetResult()
+                if ($stderr) { [Console]::Error.Write($stderr) }
+            } else {
+                # Drain both streams concurrently; stderr must remain data in PS 5.1.
+                $stdoutTask = $process.StandardOutput.ReadLineAsync()
+                $stderrTask = $process.StandardError.ReadLineAsync()
+                while ($null -ne $stdoutTask -or $null -ne $stderrTask) {
+                    if ($null -ne $stdoutTask -and $stdoutTask.IsCompleted) {
+                        $line = $stdoutTask.GetAwaiter().GetResult()
+                        if ($null -eq $line) { $stdoutTask = $null }
+                        else { Write-Host $line; $stdoutTask = $process.StandardOutput.ReadLineAsync() }
+                    }
+                    if ($null -ne $stderrTask -and $stderrTask.IsCompleted) {
+                        $line = $stderrTask.GetAwaiter().GetResult()
+                        if ($null -eq $line) { $stderrTask = $null }
+                        else { [Console]::Error.WriteLine($line); $stderrTask = $process.StandardError.ReadLineAsync() }
+                    }
+                    $pending = @()
+                    if ($null -ne $stdoutTask) { $pending += $stdoutTask }
+                    if ($null -ne $stderrTask) { $pending += $stderrTask }
+                    if ($pending.Count) { [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending, 250) }
+                }
+            }
+            $process.WaitForExit()
+            $code = $process.ExitCode
+        } finally {
+            if ($started -and -not $process.HasExited) {
+                try { $process.Kill(); $process.WaitForExit() } catch {}
+            }
+            $process.Dispose()
+        }
+    }
+    if ($code -ne 0) {
+        $message = "操作失败（退出码 $code）；未收到成功结果，请勿假定已更新。"
+        if ($code -eq 10) { $message = "活动版本已提交，但导出或清单同步未完成。请进入「诊断与修复 → 完成同步恢复」；成功前勿导入 dist。" }
+        elseif ($code -eq 2) { $message = "命令参数有误；尚不能据此判断发生了配置提交。请检查参数或运行 -Action help。" }
+        $errorObject = [InvalidOperationException]::new($message)
+        $errorObject.Data["ExitCode"] = $code
+        throw $errorObject
+    }
+    if ($Capture) { return $stdout }
 }
 
 function Get-CoreExecutable {
-    if ($env:SING_BOX_CORE -and (Test-Path -LiteralPath $env:SING_BOX_CORE -PathType Leaf)) {
-        return (Resolve-Path -LiteralPath $env:SING_BOX_CORE).Path
-    }
-    $cores = Join-Path $RuntimeRoot "cores"
-    if (Test-Path -LiteralPath $cores) {
-        $preferred = Join-Path $cores $PreferredCoreVersion
-        if (Test-Path -LiteralPath $preferred) {
-            $candidate = Get-ChildItem -LiteralPath $preferred -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if ($candidate) { return $candidate.FullName }
+    param([switch]$Optional)
+    if ($env:SING_BOX_CORE) { return $env:SING_BOX_CORE }
+    $directory = Join-Path $ProjectRoot "runtime\cores\$PreferredCoreVersion"
+    $candidate = Get-ChildItem -LiteralPath $directory -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($candidate) { return $candidate.FullName }
+    if (-not $Optional) { throw "未找到指定版本 CLI 核心。请安装到 runtime\cores\$PreferredCoreVersion 或用 SING_BOX_CORE 指定。不会自动下载或替换核心。" }
+}
+
+function Invoke-Query {
+    param([string]$Command, [switch]$AsObject)
+    $arguments = @("-m", "singbox_config.management", $Command,
+        "--config-root", $ConfigRoot, "--runtime-root", $RuntimeRoot, "--output-root", $OutputRoot)
+    $core = Get-CoreExecutable -Optional
+    if ($core) { $arguments += @("--core", $core) }
+    if ($Command -eq "explain") {
+        $selectedDomain = $Domain
+        if (-not $selectedDomain) {
+            if ($NonInteractive) { Stop-Usage "explain 需要 -Domain；-NonInteractive 不会询问输入。" }
+            $selectedDomain = (Read-Host "查询域名（回车取消）").Trim()
+            if (-not $selectedDomain) { return }
         }
-        $candidate = Get-ChildItem -LiteralPath $cores -Filter "sing-box.exe" -File -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($candidate) { return $candidate.FullName }
+        $arguments += @("--domain=$selectedDomain", "--platform", $Platform)
     }
-    $command = Get-Command sing-box.exe -ErrorAction SilentlyContinue
-    if ($command) { return $command.Source }
-    return $null
+    $arguments += "--json"
+    $text = Invoke-Python -Arguments $arguments -Capture
+    if ($AsObject) { return ($text | ConvertFrom-Json) }
+    if ($Json) { Write-Output $text.TrimEnd(); return }
+    Show-QueryResult -Command $Command -Data ($text | ConvertFrom-Json)
 }
 
-function Resolve-ValidationCore {
-    # 返回 @{ Path = <可用核心路径，不可用为 $null>; Version = <版本行>; Reason = <不可用原因> }。
-    # Get-CoreExecutable 找不到指定版本时会退回到别的 sing-box.exe，甚至 PATH 上的
-    # Program Files 那个 Electron 桩（静默 exit 0）。不核对版本就拿来 check，
-    # 会把核心根本没解析的配置报成"通过"。
-    $core = Get-CoreExecutable
-    if (-not $core) {
-        return @{ Path = $null; Version = ""; Reason = "未找到 $PreferredCoreVersion CLI 核心。请安装到 runtime\cores 或通过 SING_BOX_CORE 指定路径。" }
-    }
-    $versionOutput = @(& $core version 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        return @{ Path = $null; Version = ""; Reason = "无法运行核心：$core" }
-    }
-    $version = [string]($versionOutput | Select-Object -First 1)
-    if ($version -ne "sing-box version $PreferredCoreVersion") {
-        return @{ Path = $null; Version = $version; Reason = "核心版本不匹配：$version（要求 $PreferredCoreVersion）。请更新 runtime\cores 或 SING_BOX_CORE。" }
-    }
-    return @{ Path = $core; Version = $version; Reason = $null }
+function Format-State {
+    param([string]$State)
+    $labels = @{ valid="有效"; invalid="无效"; missing="缺失"; unknown="未知"; same="与发布版一致";
+        changed="有未发布修改"; synced="已同步"; stale="不同步"; matches_active="匹配活动版";
+        present_unverified="已找到/未执行校验"; unreadable="无法读取"; fresh="有效"; expired="已过期";
+        local_input="本地输入"; input_missing="输入缺失" }
+    if ($labels.ContainsKey($State)) { return $labels[$State] }
+    return $State
 }
 
-function Get-Sha256Hex {
-    param([Parameter(Mandatory)][string]$Path)
-    $stream = [IO.File]::OpenRead($Path)
-    try {
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
-        } finally {
-            $sha.Dispose()
+function Show-QueryResult {
+    param([string]$Command, $Data)
+    switch ($Command) {
+        "status" {
+            $build = if ($Data.active.build_id) { $Data.active.build_id } else { "无" }
+            Write-Host ("活动版本：{0}（{1}）    导出：{2}    工作配置：{3}" -f $build, (Format-State $Data.active.state), (Format-State $Data.exports.state), (Format-State $Data.working_config.state))
+            Write-Host ("订阅：{0} 启用 / {1} 停用    核心：{2} {3}" -f $Data.sources.enabled, $Data.sources.disabled, (Format-State $Data.core.state), $Data.core.version)
+            if ($Data.pending_recovery) { Write-Host "待恢复事务：有。请选 6 → 3 完成同步恢复；暂勿手动导入 dist。" -ForegroundColor Yellow }
+            Write-Host "发布/客户端状态：只读查询不探测网络；客户端当前版本与节点选择未知。"
         }
-    } finally {
-        $stream.Dispose()
-    }
-}
-
-function Publish-File {
-    # 同目录内先落临时文件再原子替换，发布器不会读到写了一半的配置。
-    param([string]$Source, [string]$Destination)
-    $parent = Split-Path -Parent $Destination
-    [IO.Directory]::CreateDirectory($parent) | Out-Null
-    $temporary = Join-Path $parent ((Split-Path -Leaf $Destination) + ".new-" + [Guid]::NewGuid().ToString("N"))
-    [IO.File]::Move($Source, $temporary)
-    try {
-        if (Test-Path -LiteralPath $Destination) {
-            $backup = $Destination + ".bak-" + [Guid]::NewGuid().ToString("N")
-            try {
-                [IO.File]::Replace($temporary, $Destination, $backup)
-            } finally {
-                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        "sources" {
+            $index = 0
+            foreach ($item in $Data.items) {
+                $index++
+                $state = if ($item.enabled) { "启用" } else { "停用" }
+                $count = if ($null -eq $item.node_count) { "未知" } else { "$($item.node_count)（活动快照）" }
+                Write-Host ("  [{0}] {1} | {2} | 节点 {3} | 缓存 {4}" -f $index, $item.name, $state, $count, (Format-State $item.cache_status))
+                if (@($item.required_by).Count) { Write-Host ("      依赖分组：" + ($item.required_by -join "、")) -ForegroundColor Yellow }
             }
-        } else {
-            [IO.File]::Move($temporary, $Destination)
+            if (-not $index) { Write-Host "暂无订阅。" }
         }
-    } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Invoke-Generate {
-    # 生成到临时目录 → 核心 check → 写验证标记 → 发布到 dist。任何一步失败 dist 都不变。
-    if (-not (Test-Path -LiteralPath $Subscriptions -PathType Leaf)) {
-        throw "找不到 config\local\subscriptions.yaml。用菜单里的 [添加订阅/节点]，或参考 config\examples\subscriptions.yaml 创建。"
-    }
-    $core = Resolve-ValidationCore
-    if (-not $core.Path) { throw $core.Reason }
-    $stage = Join-Path $RuntimeRoot ("manage-" + [Guid]::NewGuid().ToString("N"))
-    [IO.Directory]::CreateDirectory($stage) | Out-Null
-    try {
-        $arguments = @("-m", "singbox_config.generator", "all", "--output-dir", $stage)
-        if ($Offline) { $arguments += "--offline" }
-        Invoke-Python -Arguments $arguments
-        foreach ($platform in $Platforms) {
-            & $core.Path check -c (Join-Path $stage "$platform\config.json") | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "$platform 配置未通过 sing-box 核心校验。" }
-        }
-        foreach ($platform in $Platforms) {
-            $config = Join-Path $stage "$platform\config.json"
-            $stamp = Join-Path $stage "$platform\config.validated.json"
-            $metadata = [ordered]@{
-                schema_version = 1
-                sha256 = (Get-Sha256Hex -Path $config)
-                validated_at = [DateTimeOffset]::Now.ToString("o")
-                validator = [string]$core.Version
-            } | ConvertTo-Json
-            [IO.File]::WriteAllText($stamp, $metadata + [Environment]::NewLine, $Utf8)
-            Publish-File -Source $config -Destination (Join-Path $OutputRoot "$platform\config.json")
-            Publish-File -Source $stamp -Destination (Join-Path $OutputRoot "$platform\config.validated.json")
-            Write-Host "[完成] $platform 配置已校验并发布。" -ForegroundColor Green
-        }
-    } finally {
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Invoke-Check {
-    $ok = $true
-    $core = Resolve-ValidationCore
-    if ($core.Path) {
-        Write-Host "核心校验：$($core.Path)" -ForegroundColor DarkGray
-    } else {
-        # 摘要校验只能证明文件没被改过，不能证明核心能加载它。
-        Write-Host "无法进行核心校验：$($core.Reason)" -ForegroundColor Yellow
-        $ok = $false
-    }
-    foreach ($platform in $Platforms) {
-        $config = Join-Path $OutputRoot "$platform\config.json"
-        $stamp = Join-Path $OutputRoot "$platform\config.validated.json"
-        $problem = ""
-        if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
-            $problem = "缺少 config.json"
-        } elseif (-not (Test-Path -LiteralPath $stamp -PathType Leaf)) {
-            $problem = "缺少 config.validated.json"
-        } else {
-            try {
-                $metadata = Get-Content -LiteralPath $stamp -Raw -Encoding UTF8 | ConvertFrom-Json
-                if ((Get-Sha256Hex -Path $config) -ine [string]$metadata.sha256) { $problem = "验证摘要不匹配" }
-            } catch {
-                $problem = "验证文件损坏"
+        "history" {
+            $index = 0
+            foreach ($item in $Data.items) {
+                $index++
+                $state = if ($item.valid) { "有效" } else { "无效/不完整" }
+                $current = if ($item.active) { "当前" } else { "历史" }
+                $kind = if ($item.legacy) { "旧快照" } else { "release" }
+                Write-Host ("  [{0}] {1} | {2}/{3}/{4} | {5} {6}" -f $index, $item.build_id, $state, $current, $kind, $item.created_at, $item.origin)
             }
+            if (-not $index) { Write-Host "暂无历史版本。" }
         }
-        if (-not $problem -and $core.Path) {
-            & $core.Path check -c $config | Out-Host
-            if ($LASTEXITCODE -ne 0) { $problem = "核心校验失败" }
+        "lint" {
+            Write-Host ("规则结构检查：错误 {0} / 警告 {1} / 提示 {2}" -f $Data.counts.error, $Data.counts.warning, $Data.counts.info)
+            $messages = @{ required_source_unavailable="依赖的订阅不存在或已停用"; invalid_domain_suffix="请检查域名后缀格式";
+                duplicate_suffix="同一名单中重复"; cross_list_overlap="跨名单重叠，按规则顺序决定优先级";
+                suffix_covered="已被更宽的本地后缀覆盖"; unresolved_rule_set="规则集定义缺失或无法解析";
+                unresolved_dns_reference="DNS 引用了未知目标"; unresolved_final="默认目标不存在"; unresolved_reference="规则引用的目标不存在" }
+            foreach ($item in $Data.issues) {
+                $message = $messages[$item.code]
+                if (-not $message) { $message = $item.message }
+                $details = @($item.platform, $item.section, $item.domain, $item.file, $item.source, $item.target, $item.server) | Where-Object { $_ }
+                Write-Host ("  [{0}] {1}：{2}" -f $item.severity, $message, ($details -join " / "))
+            }
+            Write-Host "仅静态结构检查；重叠可能是有意设计，不代表业务不可用，也不是实际连通性测试。"
         }
-        if ($problem) {
-            Write-Host ("{0,-8} {1}" -f $platform, $problem) -ForegroundColor Red
-            $ok = $false
-        } else {
-            Write-Host ("{0,-8} 有效（{1}）" -f $platform, $metadata.validator) -ForegroundColor Green
+        "explain" {
+            Write-Host ("域名：{0}    平台：{1}    依据：{2}" -f $Data.domain, $Data.platform, $Data.basis)
+            foreach ($kind in @("route", "A", "AAAA", "HTTPS")) {
+                $result = if ($kind -eq "route") { $Data.route } else { $Data.dns.$kind }
+                $certainty = if ($result.certainty -eq "conditional") { "条件分流，前序条件未确认" } else { "静态输入可确定（非实际出口）" }
+                Write-Host "  $kind：$certainty"
+                foreach ($candidate in $result.candidates) {
+                    $target = @($candidate.outbound, $candidate.server, $candidate.rcode, $candidate.target) | Where-Object { $null -ne $_ }
+                    Write-Host ("    候选规则 {0}：{1} → {2}" -f $candidate.rule_index, $candidate.action, ($target -join "/"))
+                }
+                if ($result.candidate) {
+                    $target = @($result.candidate.outbound, $result.candidate.server, $result.candidate.rcode, $result.candidate.target) | Where-Object { $null -ne $_ }
+                    Write-Host ("    静态候选：规则 {0} / {1} / {2}" -f $result.candidate.rule_index, $result.candidate.action, ($target -join "/"))
+                }
+            }
+            Write-Host "客户端实际选择与远端出口未知；不执行 DNS 查询、协议探测或自动切换节点。"
         }
     }
-    if (-not $ok) { throw "已发布的配置没有全部通过检查。" }
+    foreach ($warning in $Data.warnings) { Write-Host "提示：$warning" -ForegroundColor Yellow }
 }
 
-# ---------------------------------------------------------------- 订阅清单
-
-function Get-ManifestEntries {
-    # 逐条切出清单里的订阅块。块的结尾不含紧挨下一条的注释和空行，
-    # 删除一条时不会连带删掉下一条的说明。
-    param([string]$Text)
-    $pattern = '(?ms)^  - name:[ \t]*(?<raw>[^\r\n]*?)[ \t]*\r?$.*?(?=(?:^[ \t]*(?:#[^\n]*)?\r?\n)*(?:^  - name:|\z))'
-    foreach ($match in [Regex]::Matches($Text, $pattern)) {
-        $value = $match.Groups['raw'].Value
-        if ($value -match "^'(.*)'$") { $value = $Matches[1].Replace("''", "'") }
-        elseif ($value -match '^"(.*)"$') { $value = $Matches[1] }
-        [pscustomobject]@{
-            Name = $value
-            Index = $match.Index
-            Block = $match.Value
-            Enabled = $match.Value -notmatch '(?m)^\s+enabled:\s*false\s*$'
-        }
+function Invoke-Release {
+    param([string]$Command, [string[]]$Extra = @(), [switch]$UseOffline)
+    $arguments = @("-m", "singbox_config.release_manager", $Command,
+        "--config-root", $ConfigRoot, "--runtime-root", $RuntimeRoot, "--output-root", $OutputRoot)
+    if ($Command -notin @("list", "recover", "sources")) { $arguments += @("--core", (Get-CoreExecutable)) }
+    $offlineMode = $Offline
+    if ($PSBoundParameters.ContainsKey("UseOffline")) { $offlineMode = $UseOffline }
+    if ($offlineMode) { $arguments += "--offline" }
+    Write-Host "执行：$Command。生成/维护/回退会校验并激活两端；失败时请以提交状态为准。" -ForegroundColor Cyan
+    Write-Host "执行前可取消；执行中中断不能保证未提交。若关闭窗口或 Ctrl+C，请先查 -Action status，有待恢复事务再运行 recover。" -ForegroundColor Yellow
+    Invoke-Python -Arguments ($arguments + $Extra)
+    if ($Command -notin @("list", "sources", "check")) {
+        Write-Host "操作完成。配置发布成功不等于客户端已刷新；请分别在 SFW / SFA 刷新并核对。" -ForegroundColor Green
     }
 }
 
-function Save-Manifest {
-    # 写入新清单并重新生成；生成失败就恢复原清单。
-    param([string]$Original, [string]$Updated)
-    [IO.File]::WriteAllText($Subscriptions, $Updated, $Utf8)
+function Confirm-Change {
+    param([string]$Message)
+    Write-Host $Message -ForegroundColor Yellow
+    return ((Read-Host "输入 y 确认；回车或其他输入取消").Trim().ToLowerInvariant() -eq "y")
+}
+
+function Show-HomeStatus {
     try {
-        Invoke-Generate
-    } catch {
-        if (-not $Original) {
-            Remove-Item -LiteralPath $Subscriptions -Force -ErrorAction SilentlyContinue
-        } else {
-            [IO.File]::WriteAllText($Subscriptions, $Original, $Utf8)
-        }
-        throw
-    }
+        $status = Invoke-Query -Command status -AsObject
+        Show-QueryResult -Command status -Data $status
+    } catch { Write-Host "首页状态读取失败：$($_.Exception.Message)；仍可查看帮助或诊断。" -ForegroundColor Yellow }
+}
+
+function Show-Sources {
+    $data = Invoke-Query -Command sources -AsObject
+    $items = @($data.items)
+    Show-QueryResult -Command sources -Data $data
+    return $items
 }
 
 function Invoke-Add {
-    $nameValue = if ($Name) { $Name.Trim() } else { (Read-Host "名称（面板里显示的名字）").Trim() }
-    $linkValue = if ($Link) { $Link.Trim() } else { (Read-Host "订阅链接或单节点 URI").Trim() }
-    if (-not $nameValue) { throw "名称不能为空。" }
-    # 订阅格式不用选：生成器读到内容后自动识别 sing-box JSON / Clash / URI 列表。
-    if ($linkValue -match '^https?://\S+$') {
-        $suffix = ".url.txt"
-    } elseif ($linkValue -match '(?i)^(anytls|hy2|hysteria2|ss|trojan|tuic|vless|vmess)://\S+$') {
-        $suffix = ".txt"
-    } else {
-        throw "链接必须是 http(s) 订阅地址，或 anytls/hysteria2/ss/trojan/tuic/vless/vmess 节点 URI。"
-    }
-    $original = $null
-    if (Test-Path -LiteralPath $Subscriptions -PathType Leaf) {
-        $original = Get-Content -Raw -Encoding UTF8 -LiteralPath $Subscriptions
-    }
-    $text = if ($original) { $original.TrimEnd() } else { "subscriptions:" }
-    if (@(Get-ManifestEntries -Text $text | Where-Object { $_.Name -eq $nameValue }).Count) {
-        throw "名称 [$nameValue] 已存在，请换一个。"
-    }
-    $stem = [Regex]::Replace($nameValue, '[\\/:*?"<>|\s]+', '_').Trim('_', '.')
-    if (-not $stem) { $stem = "node" }
-    $file = Join-Path $LocalRoot "subscriptions\$stem$suffix"
-    if (Test-Path -LiteralPath $file) { throw "文件已存在：$file" }
-    [IO.Directory]::CreateDirectory((Split-Path -Parent $file)) | Out-Null
-    [IO.File]::WriteAllText($file, $linkValue + "`n", $Utf8)
-    $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $block = "$nl$nl  - name: '$($nameValue.Replace("'", "''"))'$nl    path: 'subscriptions/$($stem.Replace("'", "''"))$suffix'$nl"
-    try {
-        Save-Manifest -Original $original -Updated ($text + $block)
-    } catch {
-        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-        throw
-    }
-    Write-Host "[完成] 已添加 [$nameValue]。排除节点、AI 分组等选项见 config\examples\subscriptions.yaml。" -ForegroundColor Green
+    param([switch]$Confirm)
+    $selectedName = $Name
+    $selectedLink = $Link
+    if ($NonInteractive -and (-not $selectedName -or -not $selectedLink)) { Stop-Usage "add 需要 -Name 与 -Link。" }
+    if (-not $selectedName -or -not $selectedLink) { $Confirm = $true }
+    if (-not $selectedName) { $selectedName = (Read-Host "订阅名称（回车取消）").Trim() }
+    if (-not $selectedName) { return }
+    if (-not $selectedLink) { $selectedLink = (Read-Host "订阅链接或单节点 URI（敏感信息，回车取消）").Trim() }
+    if (-not $selectedLink) { return }
+    if ($Confirm -and -not (Confirm-Change "添加「$selectedName」将立即重新生成并激活两端配置；不会替你刷新客户端。")) { return }
+    Invoke-Release -Command add -Extra @("--name=$selectedName", "--link=$selectedLink")
 }
 
 function Invoke-Maintenance {
-    param([ValidateSet("remove", "disable", "enable")][string]$Mode, [string]$SelectedName)
-    $original = Get-Content -Raw -Encoding UTF8 -LiteralPath $Subscriptions
-    $target = if ($SelectedName) { $SelectedName } else { (Read-Host "订阅名称").Trim() }
-    $entry = Get-ManifestEntries -Text $original | Where-Object { $_.Name -eq $target } | Select-Object -First 1
-    if (-not $entry) { throw "清单里没有 [$target]。" }
-    $nl = if ($original.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $block = ""
-    if ($Mode -ne "remove") {
-        # enabled 默认为 true：启用就是删掉这一行，停用就是在 name 下面加一行。
-        $lines = @($entry.Block -split '\r?\n' | Where-Object { $_ -notmatch '^\s+enabled:' })
-        if ($Mode -eq "disable") {
-            $lines = @($lines[0], "    enabled: false") + @($lines | Select-Object -Skip 1)
-        }
-        $block = $lines -join $nl
+    param([string]$Mode, [string]$SelectedName, [switch]$Confirm)
+    if (-not $SelectedName) {
+        if ($NonInteractive) { Stop-Usage "$Mode 需要 -Name。" }
+        $SelectedName = (Read-Host "订阅名称（回车取消）").Trim()
+        if (-not $SelectedName) { return }
+        $Confirm = $true
     }
-    $updated = $original.Remove($entry.Index, $entry.Block.Length).Insert($entry.Index, $block).TrimEnd() + $nl
-    Save-Manifest -Original $original -Updated $updated
-    if ($Mode -eq "remove" -and $entry.Block -match '(?m)^\s+path:\s*(.+?)\s*$') {
-        $relative = $Matches[1].Trim("'", '"').Replace("''", "'") -replace '/', '\'
-        $file = [IO.Path]::GetFullPath((Join-Path $LocalRoot $relative))
-        if ($file.StartsWith($LocalRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-        }
-    }
-    $done = @{ remove = "删除"; disable = "停用"; enable = "启用" }[$Mode]
-    Write-Host "[完成] 已$done [$target]。" -ForegroundColor Green
+    if ($Confirm -and -not (Confirm-Change "对「$SelectedName」执行 $Mode，会立即重新生成并激活两端。依赖它的固定分组可能阻止发布；删除仅移除清单，不删除输入文件。")) { return }
+    Invoke-Release -Command $Mode -Extra @("--name=$SelectedName")
 }
 
 function Show-MaintenanceMenu {
-    $entries = @(Get-ManifestEntries -Text (Get-Content -Raw -Encoding UTF8 -LiteralPath $Subscriptions))
-    if (-not $entries.Count) { throw "订阅清单是空的。" }
-    Write-Host ""
-    for ($i = 0; $i -lt $entries.Count; $i++) {
-        $state = if ($entries[$i].Enabled) { "" } else { "（已停用）" }
-        Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $entries[$i].Name, $state)
-    }
+    if ($NonInteractive) { Stop-Usage "maintain 是交互菜单；请改用 add/remove/disable/enable 并提供必要参数。" }
+    $items = @(Show-Sources)
+    $selection = (Read-Host "输入编号或完整订阅名；a 添加；回车返回").Trim()
+    if (-not $selection) { return }
+    if ($selection -eq "a") { Invoke-Add -Confirm; return }
     $number = 0
-    $choice = (Read-Host "选择订阅（回车返回）").Trim()
-    if (-not [int]::TryParse($choice, [ref]$number) -or $number -lt 1 -or $number -gt $entries.Count) { return }
-    $target = $entries[$number - 1].Name
-    $mode = @{ "1" = "remove"; "2" = "disable"; "3" = "enable" }[(Read-Host "对 [$target] 执行：1 删除  2 停用  3 启用（回车返回）").Trim()]
-    if ($mode) { Invoke-Maintenance -Mode $mode -SelectedName $target }
+    if ([int]::TryParse($selection, [ref]$number) -and $number -ge 1 -and $number -le $items.Count) { $selection = $items[$number - 1].name }
+    if (-not ($items | Where-Object name -EQ $selection)) { Write-Host "没有找到该订阅。" -ForegroundColor Yellow; return }
+    $mode = @{ "1" = "remove"; "2" = "disable"; "3" = "enable" }[(Read-Host "1 删除  2 停用  3 启用（回车返回）").Trim()]
+    if ($mode) { Invoke-Maintenance -Mode $mode -SelectedName $selection -Confirm }
 }
 
-# ---------------------------------------------------------------- 发布器
-
-function Get-TcpBindError {
-    param([Parameter(Mandatory)][int]$Port)
-    $listener = $null
-    try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
-        $listener.Start()
-        return 0
-    } catch [System.Net.Sockets.SocketException] {
-        $code = $_.Exception.NativeErrorCode
-        if (-not $code) { $code = $_.Exception.ErrorCode }
-        if ($code -eq 10048 -or $code -eq 10013) { return $code }
-        return 10013
-    } catch {
-        return 10013
-    } finally {
-        if ($listener) { $listener.Stop() }
+function Invoke-Rollback {
+    param([switch]$Confirm)
+    $target = $BuildId
+    $isLegacy = [bool]$Legacy
+    if (-not $target) {
+        if ($NonInteractive) { Stop-Usage "rollback 需要 -BuildId。" }
+        $data = Invoke-Query -Command history -AsObject
+        $items = @($data.items)
+        Show-QueryResult -Command history -Data $data
+        if (-not $items.Count) { Write-Host "没有可列出的历史版本；仍可输入完整 ID。" }
+        $target = (Read-Host "输入编号或完整 build_id（旧快照 backups:名称；回车返回）").Trim()
+        if (-not $target) { return }
+        $number = 0
+        if ([int]::TryParse($target, [ref]$number) -and $number -ge 1 -and $number -le $items.Count) {
+            $item = $items[$number - 1]
+            if (-not $item.valid) { Write-Host "该版本无效或不完整，不能回退。" -ForegroundColor Yellow; return }
+            $target = $item.build_id
+            $isLegacy = [bool]$item.legacy
+        }
+        $Confirm = $true
     }
-}
-
-function Invoke-Elevated {
-    param([string]$Command)
-    $elevated = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
-        "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $Command
-    )
-    if ($elevated.ExitCode -ne 0) { throw "管理员进程返回退出码 $($elevated.ExitCode)" }
-}
-
-function Enable-PublisherPort {
-    # 10048 = 端口已有监听者，发布器自己会报告。10013 = 端口被 Windows（WinNAT）保留：
-    # 申请管理员权限把它留给发布器，而不是换端口——手机里存的链接带着端口号。
-    $code = Get-TcpBindError -Port $PublisherPort
-    if ($code -eq 0 -or $code -eq 10048) { return }
-    Write-Host "端口 $PublisherPort 被 Windows 保留（WinError $code），需要管理员权限把它留给发布器。请在弹出的授权窗口里允许。" -ForegroundColor Yellow
-    $command = @"
-`$ErrorActionPreference = 'Stop'
-`$service = Get-Service -Name winnat -ErrorAction SilentlyContinue
-`$wasRunning = `$service -and `$service.Status -eq 'Running'
-if (`$wasRunning) { Stop-Service -Name winnat -Force }
-`$add = (& netsh interface ipv4 add excludedportrange protocol=tcp startport=$PublisherPort numberofports=1 2>&1 | Out-String).Trim()
-if (`$LASTEXITCODE -ne 0 -and `$add -notmatch 'exists') {
-    if (`$wasRunning) { Start-Service -Name winnat }
-    throw `$add
-}
-if (`$wasRunning) { Start-Service -Name winnat }
-"@
-    try {
-        Invoke-Elevated -Command $command
-    } catch {
-        throw "未能取得管理员权限，端口 $PublisherPort 仍然无法绑定。$($_.Exception.Message)"
-    }
-    $again = Get-TcpBindError -Port $PublisherPort
-    if ($again -ne 0 -and $again -ne 10048) { throw "授权之后端口 $PublisherPort 仍无法绑定（Windows 错误 $again）。" }
-    Write-Host "已让 Windows 保留 TCP $PublisherPort 给发布器。" -ForegroundColor Green
-}
-
-function Enable-PublisherFirewall {
-    $displayName = "sing-box Android publisher (LAN)"
-    $rule = $null
-    $portFilter = $null
-    try {
-        $rule = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue) | Select-Object -First 1
-        if ($rule) { $portFilter = @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue) }
-    } catch {
-        $rule = $null
-    }
-    $profiles = if ($rule) { [string]$rule.Profile } else { "" }
-    $portAllowed = @($portFilter | Where-Object {
-        $_.Protocol -eq "TCP" -and @($_.LocalPort) -contains "$PublisherPort"
-    }).Count -gt 0
-    if ($rule -and $rule.Enabled -eq "True" -and $rule.Direction -eq "Inbound" -and
-        $rule.Action -eq "Allow" -and $profiles -match "(Private.*Public|Public.*Private|Any)" -and $portAllowed) {
-        return
-    }
-    $command = @"
-`$ErrorActionPreference = 'Stop'
-`$name = '$displayName'
-if (Get-NetFirewallRule -DisplayName `$name -ErrorAction SilentlyContinue) {
-    Set-NetFirewallRule -DisplayName `$name -Enabled True -Direction Inbound -Action Allow -Profile Private,Public -Protocol TCP -LocalPort $PublisherPort | Out-Null
-} else {
-    New-NetFirewallRule -DisplayName `$name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $PublisherPort -Profile Private,Public | Out-Null
-}
-"@
-    try {
-        Invoke-Elevated -Command $command
-        Write-Host "已允许 Private/Public 网络访问 TCP $PublisherPort。" -ForegroundColor Green
-    } catch {
-        Write-Warning "无法自动配置 Windows 防火墙。请以管理员身份允许 Private/Public 网络的 TCP $PublisherPort，否则手机访问不到发布链接。"
-    }
+    if ($target.StartsWith("backups:")) { $isLegacy = $true; $target = $target.Substring(8) }
+    if ($Confirm -and -not (Confirm-Change "回退到 $target：只恢复发布配置及版本缓存，不恢复工作策略、订阅清单或客户端节点选择；完成后需刷新客户端。")) { return }
+    $extra = @("--build-id=$target")
+    if ($isLegacy) { $extra += "--legacy" }
+    Invoke-Release -Command rollback -Extra $extra
 }
 
 function Invoke-Publisher {
     param([string[]]$Extra = @())
-    if (-not $Extra.Count) {
-        Enable-PublisherPort
-        Enable-PublisherFirewall
+    foreach ($entry in @(@($ConfigRoot, "config"), @($RuntimeRoot, "runtime"), @($OutputRoot, "dist"))) {
+        $actual = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($entry[0])).TrimEnd('\', '/')
+        $expected = [IO.Path]::GetFullPath((Join-Path $ProjectRoot $entry[1])).TrimEnd('\', '/')
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actual, $expected)) {
+            Stop-Usage "自定义根目录下禁止发布、查看或轮换凭据，避免使用生产凭据/日志。隔离测试请直接调用 python -m singbox_config.publisher，并显式提供 --credentials、--access-log 及全部配置/运行目录参数。"
+        }
     }
-    if ($AdvertiseHost) {
-        # 自动探测到的地址不对时（多网卡、虚拟网卡）手动指定手机能访问到的局域网地址：
-        # -Action publisher -AdvertiseHost 192.168.1.31
-        $Extra = @("--advertise-host", $AdvertiseHost) + $Extra
-    }
-    Invoke-Python -Arguments (@("-m", "singbox_config.publisher") + $Extra)
+    $arguments = @("-m", "singbox_config.publisher", "--runtime-root", $RuntimeRoot,
+        "--desktop-config", (Join-Path $OutputRoot "desktop\config.json"), "--desktop-stamp", (Join-Path $OutputRoot "desktop\config.validated.json"),
+        "--android-config", (Join-Path $OutputRoot "android\config.json"), "--android-stamp", (Join-Path $OutputRoot "android\config.validated.json"))
+    if ($AdvertiseHost) { $arguments += @("--advertise-host=$AdvertiseHost") }
+    if (-not $Extra.Count) { Write-Host "发布器在当前窗口前台运行；Ctrl+C 停止。发布期间请另开管理窗口更新配置。不会修改防火墙或客户端；导入链接请另选「查看敏感导入信息」。" -ForegroundColor Cyan }
+    Invoke-Python -Arguments ($arguments + $Extra) -Foreground:($Extra.Count -eq 0)
 }
 
-# ---------------------------------------------------------------- 入口
+function Show-Help {
+    $helpData = [ordered]@{
+        description = "中文终端管理；菜单确认后执行，完整 CLI 参数保持直接执行。"
+        readonly = $ReadOnlyActions
+        commands = @("all [-Offline]", "add -Name 名称 -Link 链接", "remove/disable/enable -Name 名称", "rollback -BuildId ID [-Legacy]", "recover", "check", "publisher", "show-info", "rotate-credentials")
+        examples = @("-Action status -Json -NonInteractive", "-Action explain -Domain example.com -Platform android -Json -NonInteractive", "-Action all -Offline -NonInteractive")
+        exit_codes = @{ success = 0; failure = 1; arguments = 2; committed_pending_recovery = 10 }
+        notes = @("-Json 仅支持只读查询；缺少必要参数时 -NonInteractive 返回 2。", "check 可能完成待恢复同步，并非只读；doctor/status/lint 不修改发布状态。", "更新/订阅维护/回退立即发布两端配置，但不刷新客户端、不控制核心。", "发布保持前台运行；启动不显示敏感信息，show-info 和轮换结果会显示完整导入信息。", "自定义根目录禁止 publisher/show-info/rotate-credentials，避免误用生产凭据或日志。")
+    }
+    if ($Json) { $helpData | ConvertTo-Json -Depth 6; return }
+    Write-Host "用法：.\scripts\manage\manage.ps1 -Action <动作> [参数]"
+    Write-Host ("只读：" + ($ReadOnlyActions -join " / "))
+    foreach ($command in $helpData.commands) { Write-Host "  $command" }
+    foreach ($note in $helpData.notes) { Write-Host "提示：$note" }
+    Write-Host "查询和发布事务可用 -ConfigRoot/-RuntimeRoot/-OutputRoot 指定隔离目录；自定义根目录禁止 publisher/show-info/rotate-credentials，避免误用生产凭据。"
+    Write-Host "退出码 0 成功、1 失败、2 参数错误、10 已提交待同步。"
+}
 
 function Invoke-Action {
     param([string]$ActionName)
     switch ($ActionName) {
-        "all"                { Invoke-Generate }
-        "check"              { Invoke-Check }
+        "all"                { Invoke-Release -Command all }
+        "check"              { Invoke-Release -Command check }
+        "recover"            { Invoke-Release -Command recover }
         "add"                { Invoke-Add }
         "remove"             { Invoke-Maintenance -Mode remove -SelectedName $Name }
         "disable"            { Invoke-Maintenance -Mode disable -SelectedName $Name }
         "enable"             { Invoke-Maintenance -Mode enable -SelectedName $Name }
         "maintain"           { Show-MaintenanceMenu }
+        "rollback"           { Invoke-Rollback }
         "publisher"          { Invoke-Publisher }
         "show-info"          { Invoke-Publisher -Extra @("--show-info") }
         "rotate-credentials" { Invoke-Publisher -Extra @("--rotate-credentials") }
+        "help"               { Show-Help }
+        "doctor"             {
+            if ($Json) {
+                $result = [ordered]@{ status = (Invoke-Query -Command status -AsObject); lint = (Invoke-Query -Command lint -AsObject) }
+                $result | ConvertTo-Json -Depth 30
+            } else { Invoke-Query -Command status; Invoke-Query -Command lint }
+        }
+        default { Invoke-Query -Command $ActionName }
     }
-}
-
-$Menu = [ordered]@{
-    "1" = @("all", "更新配置（桌面 + 安卓）")
-    "2" = @("check", "检查已发布的配置")
-    "3" = @("add", "添加订阅/节点")
-    "4" = @("maintain", "删除/停用/启用订阅")
-    "5" = @("publisher", "启动发布（显示地址和凭据）")
-    "6" = @("show-info", "查看发布地址和凭据")
-    "7" = @("rotate-credentials", "轮换发布凭据")
 }
 
 try {
-    if ($Action -ne "menu") {
-        Invoke-Action -ActionName $Action
-        exit 0
-    }
+    $Action = $Action.ToLowerInvariant()
+    $Platform = $Platform.ToLowerInvariant()
+    if ($Action -notin $Actions) { Stop-Usage "未知动作：$Action。请运行 -Action help。" }
+    if ($Platform -notin @("desktop", "android")) { Stop-Usage "-Platform 仅支持 desktop 或 android。" }
+    if ($Json -and $Action -notin $ReadOnlyActions) { Stop-Usage "-Json 仅支持 status/doctor/sources/history/explain/lint/help。" }
+    if ($Json) { $NonInteractive = $true }
+    if ($NonInteractive -and $Action -in @("menu", "maintain")) { Stop-Usage "-NonInteractive 需要明确的非菜单 -Action。" }
+    if ($Action -ne "menu") { Invoke-Action -ActionName $Action; exit 0 }
     while ($true) {
-        Write-Host ""
-        Write-Host "============ sing-box 配置与发布 ============"
-        foreach ($key in $Menu.Keys) { Write-Host ("  [{0}] {1}" -f $key, $Menu[$key][1]) }
-        Write-Host "  [q] 退出"
+        Write-Host "`n============ sing-box 配置与发布 ============" -ForegroundColor Cyan
+        Show-HomeStatus
+        Write-Host "  [1] 更新配置        [2] 订阅管理        [3] 分流查询与检查"
+        Write-Host "  [4] 发布与设备导入  [5] 历史版本与回退  [6] 诊断与修复"
+        Write-Host "  [0/q] 退出         [h] 命令行帮助"
         $choice = (Read-Host "请选择").Trim().ToLowerInvariant()
-        if ($choice -eq "q") { break }
-        if (-not $Menu.Contains($choice)) { continue }
+        if ($choice -in @("0", "q")) { break }
         try {
-            Invoke-Action -ActionName $Menu[$choice][0]
-        } catch {
-            Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
-        }
+            switch ($choice) {
+                "1" {
+                    $mode = (Read-Host "1 在线更新  2 离线复用完整缓存（回车返回）").Trim()
+                    if ($mode -in @("1", "2") -and (Confirm-Change "将生成、校验并立即激活桌面和安卓配置。离线不延长缓存有效期；完成后请在 SFW/SFA 各自刷新。")) { Invoke-Release -Command all -UseOffline:($mode -eq "2") }
+                }
+                "2" { Show-MaintenanceMenu }
+                "3" {
+                    $mode = (Read-Host "1 查询域名分流（静态解释，非实际出口）  2 检查规则（回车返回）").Trim()
+                    if ($mode -eq "1") { Invoke-Query -Command explain }
+                    elseif ($mode -eq "2") { Invoke-Query -Command lint }
+                }
+                "4" {
+                    $mode = (Read-Host "1 启动前台发布  2 查看敏感导入信息  3 轮换凭据（回车返回）").Trim()
+                    if ($mode -eq "1" -and (Confirm-Change "将在当前窗口持续提供配置下载；仅在可信局域网使用，Ctrl+C 停止。")) { Invoke-Publisher }
+                    elseif ($mode -eq "2") { Invoke-Publisher -Extra @("--show-info") }
+                    elseif ($mode -eq "3" -and (Confirm-Change "必须先停止发布器；轮换会使旧密码和旧导入链接失效，需要重新导入并启动服务。")) { Invoke-Publisher -Extra @("--rotate-credentials") }
+                }
+                "5" { Invoke-Rollback -Confirm }
+                "6" {
+                    $mode = (Read-Host "1 只读诊断  2 核心检查（可能恢复同步）  3 完成同步恢复（回车返回）").Trim()
+                    if ($mode -eq "1") { Invoke-Action -ActionName doctor }
+                    elseif ($mode -eq "2" -and (Confirm-Change "核心检查可能先完成待恢复事务并写入工作清单/dist；仅查看请改选只读诊断。")) { Invoke-Release -Command check }
+                    elseif ($mode -eq "3" -and (Confirm-Change "将完成已提交事务的清单/导出同步；不覆盖外部冲突，不修改客户端。")) { Invoke-Release -Command recover }
+                }
+                "h" { Show-Help }
+                default { Write-Host "无效选项，请输入菜单编号；回车不会执行任何修改。" -ForegroundColor Yellow }
+            }
+        } catch { Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red }
     }
 } catch {
-    Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+    $exitCode = 1
+    if ($_.Exception.Data.Contains("ExitCode")) { $exitCode = [int]$_.Exception.Data["ExitCode"] }
+    if ($Json) { [ordered]@{ error = $_.Exception.Message; exit_code = $exitCode } | ConvertTo-Json -Compress }
+    else { Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red }
+    exit $exitCode
 }

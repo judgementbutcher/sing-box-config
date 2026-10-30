@@ -22,6 +22,7 @@ FORBIDDEN_PARTS = {
     ".venv",
     "cores",
     "dist",
+    "dist-provider",
     "runtime",
     "subscriptions",
 }
@@ -42,11 +43,15 @@ def public_candidates() -> list[str]:
 
 
 def forbidden_path(path_text: str) -> bool:
-    path = PurePosixPath(path_text)
+    normalized = path_text.casefold()
+    path = PurePosixPath(normalized)
     return (
-        path_text in LEGACY_FORBIDDEN_ROOT_FILES
+        normalized in {value.casefold() for value in LEGACY_FORBIDDEN_ROOT_FILES}
         or path.parts[:2] == ("config", "local")
-        or path_text == "docs/README.local.md"
+        or normalized == "docs/readme.local.md"
+        or normalized == ".claude/settings.local.json"
+        or path.parts[:1] in {(".pytest_cache",), ("build",)}
+        or any(part.endswith(".egg-info") for part in path.parts)
         or bool(FORBIDDEN_PARTS.intersection(path.parts))
         or path.suffix.lower() in FORBIDDEN_SUFFIXES
     )

@@ -1,207 +1,471 @@
-# sing-box 配置策略。
-#
-# config 一节就是最终的 sing-box 配置（YAML 写法），写什么就生成什么。
-# 生成器只额外做三件事：
-#   1. 带 only: desktop / only: android 的条目只保留在对应平台；
-#   2. 用订阅生成 outbounds（节点 + 下面 groups 描述的分组）；
-#   3. 规则里引用到的规则集自动补进 route.rule_set：config/rule-sets 下有
-#      同名 .txt 就内嵌，否则按 rule_set_urls 的地址远程下载。
-#
-# 只想改某个域名的走向，不用动这个文件，往 config/rule-sets 的名单里加一行：
-#   direct.txt 直连    proxy.txt 走代理    block.txt 屏蔽
-
-subscription:
-  cache_max_age: 3d                    # 下载失败时可用的缓存最长保留时间
-  timeout_seconds: 20
-  retry_proxy: http://127.0.0.1:7890   # 直连下载失败后，改走本机代理再试一次
-
+# 配置与分流策略。上游规则在构建阶段完整内嵌，最终配置可独立启动。
+subscription: {cache_max_age: 3d, timeout_seconds: 20, retry_proxy: 'http://127.0.0.1:7890'}
+# 全部分组手动选择；Claude 严格受信，通用 AI 保留既有豁免。
 groups:
-  # AI 分组只收这些地区的节点，顺序即优先级（默认选中第一个地区最靠前的节点）。
   ai_regions: [US, JP, SG, TW]
-  # 业务分组：成员是 Available 加各订阅，默认跟随 Available，可在面板单独换节点。
-  # direct: first 把直连放在最前并作为默认，direct: last 把直连追加在末尾。
-  # expand: true 不引用 Available，而是展开成它的成员（各订阅分组与 Other），
-  # 组里直接列出可选出口。Spotify 用这种写法：埃及区账号要求出口与账号地区一致，
-  # 默认直连，同时把各订阅节点和 Other 都摆在面板里随时可切。
   services:
-    - {tag: Emby, direct: last}
-    - {tag: YouTube}
-    - {tag: Spotify, direct: first, expand: true}
-    - {tag: Telegram}
-    - {tag: Twitch}
-    - {tag: Google Play, only: android}
-
-rule_set_urls:
-  geosite: https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{tag}.srs
-  geoip: https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/{tag}.srs
-
+  - tag: Claude
+    filter: trusted
+    default: Aether-US-CHI-v6
+    candidates:
+    - {source: Aether-US, names: [Aether-US-CHI-v6, Aether-US-SFO-v6, Aether-US-ATL-v6, Aether-US-LAX-v4]}
+    - {source: CloudLeadInno-US, names: [CloudLeadInno-US]}
+  - tag: Google
+    default: AI
+    members:
+    - AI
+    - Available
+    - Claude
+    - {source: Meow-US, names: [Meow-US-hy2, Meow-US-vless]}
+    - {source: Aether-US, names: [Aether-US-LAX-v4, Aether-US-CHI-v6, Aether-US-SFO-v6, Aether-US-ATL-v6]}
+    - {source: CloudLeadInno-US, names: [CloudLeadInno-US]}
+  - {tag: Aether-前置, outbounds: [Aether-前置-西部数据, Aether-前置-备用]}
+  - tag: Aether-前置-西部数据
+    filter: aether_transit
+    type: selector
+    candidates:
+    - {source: 西部数据, regions: [HK, JP, TW]}
+  - tag: Aether-前置-备用
+    filter: aether_transit
+    type: selector
+    candidates:
+    - {source: 羽迹, regions: [HK, JP, TW, SG], names: [台湾1, 台湾2, 台湾3, 日本1, 香港-1, 香港-2, 香港-3, 香港-4, 日本2, 日本3, 日本-东京, 台湾-台南, 新加坡2, 新加坡3]}
+  - {tag: Emby, direct: last}
+  - {tag: YouTube}
+  - {tag: Spotify, direct: first, expand: true}
+  - {tag: Telegram}
+  - {tag: Twitch}
+  - tag: Google Play
+    only: android
+    default: Available
+    members:
+    - Available
+    - {source: Meow-US, names: [Meow-US-hy2, Meow-US-vless]}
+    - {source: Aether-US, names: [Aether-US-LAX-v4, Aether-US-CHI-v6, Aether-US-SFO-v6, Aether-US-ATL-v6]}
+    - {source: CloudLeadInno-US, names: [CloudLeadInno-US]}
+    - Claude
+# 构建下载地址；离线仅复用已校验 release 的规则快照。
+rule_set_urls: {geosite: 'https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/{tag}.srs', geoip: 'https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/{tag}.srs'}
 config:
   log: {level: warn, timestamp: true}
-
   experimental:
-    cache_file:
-      enabled: true
-      store_dns: true                  # 记住面板选中的节点，缓存远程规则集，持久化 DNS 缓存记录
-    urltest_unified_delay: true        # reF1nd：测速结果不含建连耗时
-
+    cache_file: {enabled: true, store_fakeip: true, store_dns: true}
+    urltest_unified_delay: true
   inbounds:
-    - only: desktop
-      type: tun
-      tag: tun-in
-      # IPv6 地址只为把 IPv6 流量收进来再由下面的规则拒绝，避免绕过代理。
-      address: [172.18.0.1/30, 'fdfe:dcba:9876::1/126']
-      auto_route: true
-      strict_route: true
-      endpoint_independent_nat: true   # FullCone NAT，优化游戏联机、语音通话与 P2P
-    - only: desktop
-      type: mixed
-      tag: mixed-in
-      listen: 127.0.0.1
-      listen_port: 7890
-    - only: android
-      type: tun
-      tag: tun-in
-      address: [172.18.0.1/30]
-      auto_route: true
-      endpoint_independent_nat: true   # FullCone NAT，优化语音通话与 P2P
-      # 局域网不进 TUN：手机开着 VPN 也能访问内网设备、拉取本机发布的配置。
-      # 172.16.0.0/12 里去掉了 TUN 自己所在的 172.18.0.0/16。
-      route_exclude_address:
-        - 10.0.0.0/8
-        - 172.16.0.0/15
-        - 172.19.0.0/16
-        - 172.20.0.0/14
-        - 172.24.0.0/13
-        - 192.168.0.0/16
-
+  - {only: desktop, type: tun, tag: tun-in, address: [172.18.0.1/30, 'fdfe:dcba:9876::1/126'], auto_route: true, strict_route: true}
+  - {only: desktop, type: mixed, tag: mixed-in, listen: 127.0.0.1, listen_port: 7890}
+  - only: android
+    type: tun
+    tag: tun-in
+    address: [172.18.0.1/30, 'fdfe:dcba:9876::1/126']
+    mtu: 1400
+    auto_route: true
+    strict_route: true
+  # Fake-IP 保留业务域名；真实解析和非地址查询跟随对应业务分组。
   dns:
-    # 乐观缓存：在缓存过期后优先 0ms 返回旧解析结果并在后台异步刷新，消除重复解析延迟。
-    optimistic: true
+    optimistic: {enabled: true, timeout: 1m}
+    timeout: 3s
     servers:
-      # 国内两路直连 DoH。server 写 IP，省掉"解析器自己要先被解析"。
-      # 不要写 detour: direct（核心启动时拒绝），也不要用 type: local
-      # （TUN 把系统 DNS 指向自己，local 会查回 sing-box 自己）。
-      - {tag: alidns, type: https, server: 223.5.5.5, tls: {server_name: dns.alidns.com}}
-      - {tag: dnspod, type: https, server: 1.12.12.12, tls: {server_name: doh.pub}}
-      # 海外两路 DoH，经代理出去，拿到的是代理出口附近的 CDN 地址。
-      - {tag: google, type: https, server: 8.8.8.8, tls: {server_name: dns.google}, detour: Available}
-      - {tag: cloudflare, type: https, server: 1.1.1.1, tls: {server_name: cloudflare-dns.com}, detour: Available}
-      # reF1nd 的 group：组内同时查询，先成功的生效。只在同一信任级别内并发，
-      # 国内和海外绝不放进同一组（国内解析器对被墙域名又快又假）。
-      - {tag: domestic, type: group, servers: [alidns, dnspod]}
-      - {tag: proxy, type: group, servers: [google, cloudflare]}
-    # DNS 规则与下面的路由规则一一对应：走代理的域名用 proxy 解析，直连的
-    # 用 domestic 解析。两边顺序要保持一致。
+    - tag: alidns
+      type: https
+      server: 223.5.5.5
+      tls: {server_name: dns.alidns.com}
+    - tag: dnspod
+      type: https
+      server: 1.12.12.12
+      tls: {server_name: doh.pub}
+    - tag: google-proxy-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Available
+    - tag: cloudflare-proxy-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Available
+    - tag: google-proxy-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Available
+    - tag: cloudflare-proxy-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Available
+    - {tag: proxy, type: group, servers: [google-proxy-v6, cloudflare-proxy-v6, google-proxy-v4, cloudflare-proxy-v4]}
+    # Claude 的资源跟随 Aether-US 手动分组；DNS 与连接使用同一出口，提供双栈 DoH。
+    - tag: google-aether-resources-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Aether-US
+    - tag: cloudflare-aether-resources-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Aether-US
+    - tag: google-aether-resources-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Aether-US
+    - tag: cloudflare-aether-resources-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Aether-US
+    - {tag: aether-resources, type: group, servers: [google-aether-resources-v6, cloudflare-aether-resources-v6, google-aether-resources-v4,
+        cloudflare-aether-resources-v4]}
+    - tag: google-claude-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Claude
+    - tag: cloudflare-claude-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Claude
+    - tag: google-claude-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Claude
+    - tag: cloudflare-claude-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Claude
+    - {tag: claude, type: group, servers: [google-claude-v6, cloudflare-claude-v6, google-claude-v4, cloudflare-claude-v4]}
+    - tag: google-google-services-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Google
+    - tag: cloudflare-google-services-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Google
+    - tag: google-google-services-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Google
+    - tag: cloudflare-google-services-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Google
+    - {tag: google-services, type: group, servers: [google-google-services-v6, cloudflare-google-services-v6, google-google-services-v4,
+        cloudflare-google-services-v4]}
+    - tag: google-ai-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: AI
+    - tag: cloudflare-ai-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: AI
+    - tag: google-ai-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: AI
+    - tag: cloudflare-ai-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: AI
+    - {tag: ai, type: group, servers: [google-ai-v6, cloudflare-ai-v6, google-ai-v4, cloudflare-ai-v4]}
+    - tag: google-youtube-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: YouTube
+    - tag: cloudflare-youtube-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: YouTube
+    - tag: google-youtube-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: YouTube
+    - tag: cloudflare-youtube-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: YouTube
+    - {tag: youtube, type: group, servers: [google-youtube-v6, cloudflare-youtube-v6, google-youtube-v4, cloudflare-youtube-v4]}
+    - tag: google-twitch-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Twitch
+    - tag: cloudflare-twitch-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Twitch
+    - tag: google-twitch-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Twitch
+    - tag: cloudflare-twitch-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Twitch
+    - {tag: twitch, type: group, servers: [google-twitch-v6, cloudflare-twitch-v6, google-twitch-v4, cloudflare-twitch-v4]}
+    - tag: google-emby-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Emby
+    - tag: cloudflare-emby-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Emby
+    - tag: google-emby-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Emby
+    - tag: cloudflare-emby-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Emby
+    - {tag: emby, type: group, servers: [google-emby-v6, cloudflare-emby-v6, google-emby-v4, cloudflare-emby-v4]}
+    - tag: google-telegram-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Telegram
+    - tag: cloudflare-telegram-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Telegram
+    - tag: google-telegram-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Telegram
+    - tag: cloudflare-telegram-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Telegram
+    - {tag: telegram, type: group, servers: [google-telegram-v6, cloudflare-telegram-v6, google-telegram-v4, cloudflare-telegram-v4]}
+    - only: android
+      tag: google-google-play-v6
+      type: https
+      server: 2001:4860:4860::8888
+      tls: {server_name: dns.google}
+      detour: Google Play
+    - only: android
+      tag: cloudflare-google-play-v6
+      type: https
+      server: 2606:4700:4700::1111
+      tls: {server_name: cloudflare-dns.com}
+      detour: Google Play
+    - only: android
+      tag: google-google-play-v4
+      type: https
+      server: 8.8.8.8
+      tls: {server_name: dns.google}
+      detour: Google Play
+    - only: android
+      tag: cloudflare-google-play-v4
+      type: https
+      server: 1.1.1.1
+      tls: {server_name: cloudflare-dns.com}
+      detour: Google Play
+    - {only: android, tag: google-play, type: group, servers: [google-google-play-v6, cloudflare-google-play-v6, google-google-play-v4,
+        cloudflare-google-play-v4]}
+    - {tag: domestic, type: group, servers: [alidns, dnspod]}
+    - {tag: fakeip-ai, type: fakeip, inet4_range: 198.18.0.0/15}
+    # 精确资源、Claude、Play、视频和校时先于宽泛 Google/AI；国内与海外解析器分开。
     rules:
-      - {rule_set: block, action: predefined, rcode: NXDOMAIN}
-      - only: desktop
-        rule_set: microsoft-store
-        server: proxy
-      - only: android
-        rule_set: geosite-google-play
-        server: proxy
-      - rule_set:
-          - geosite-youtube
-          - geosite-twitch
-          - geosite-anthropic
-          - geosite-openai
-          - ai
-          - emby
-          - geosite-telegram
-          - proxy
-          # Spotify 默认直连，但解析放在代理侧：open.spotify.com 在国内
-          # 解析器上是被污染的，代理侧答案直连、走代理都能用。
-          - geosite-spotify
-        server: proxy
-      - {rule_set: [direct, geosite-private, geosite-cn], server: domestic}
-      - {rule_set: geosite-category-ads-all, action: predefined, rcode: NXDOMAIN}
-      - {rule_set: geosite-geolocation-!cn, server: proxy}
-      # 名单外的域名以代理侧的答案为准：答案在中国大陆 IP 段内，说明是国内
-      # 站点，改用国内解析器的答案（CDN 就近，路由层按 geoip-cn 直连）；
-      # 否则直接采用代理侧的答案。
-      # 不能反过来拿国内解析器的答案做判断：它对被墙域名返回假地址，而且
-      # 假地址偶尔也落在大陆 IP 段内（实测 annas-archive.org → 118.184.78.78）。
-      # 更不能写成"名单外一律 domestic"——那正是"要挂代理的网站打不开"的成因。
-      - {action: evaluate, server: proxy}
-      - {match_response: true, rule_set: geoip-cn, server: domestic}
-      - {action: respond}
+    - {rule_set: block, action: predefined, rcode: NXDOMAIN}
+    - {domain: &claude-ipv4-resources [downloads.claude.ai, servd-anthropic-website.b-cdn.net], server: aether-resources}
+    - {domain: &public-ai-resources [persistent.oaistatic.com, dl.google.com], server: proxy}
+    - {rule_set: [geosite-anthropic, claude], query_type: [HTTPS, SVCB], action: predefined, rcode: NOERROR}
+    - {rule_set: [geosite-anthropic, claude], query_type: [A, AAAA], server: fakeip-ai}
+    - {rule_set: [geosite-anthropic, claude], server: claude}
+    - {only: desktop, rule_set: microsoft-store, server: proxy}
+    - {only: android, rule_set: [geosite-google-play, google-play], query_type: [HTTPS, SVCB], action: predefined, rcode: NOERROR}
+    - {only: android, rule_set: [geosite-google-play, google-play], query_type: [A, AAAA], server: fakeip-ai}
+    - {only: android, rule_set: [geosite-google-play, google-play], server: google-play}
+    - domain_suffix:
+      - youtube.com
+      - youtu.be
+      - yt.be
+      - youtube-nocookie.com
+      - youtubekids.com
+      - ytimg.com
+      - googlevideo.com
+      - youtubei.googleapis.com
+      - youtube.googleapis.com
+      - yt3.ggpht.com
+      - yt4.ggpht.com
+      - yt3.googleusercontent.com
+      - yt4.googleusercontent.com
+      server: youtube
+    - {rule_set: geosite-youtube, server: youtube}
+    - {rule_set: geosite-twitch, server: twitch}
+    - {domain_suffix: [time.google.com], server: domestic}
+    - {rule_set: [geosite-google, google], query_type: [HTTPS, SVCB], action: predefined, rcode: NOERROR}
+    - {rule_set: [geosite-google, google], query_type: [A, AAAA], server: fakeip-ai}
+    - {rule_set: [geosite-google, google], server: google-services}
+    - {rule_set: [geosite-openai, ai], query_type: [HTTPS, SVCB], action: predefined, rcode: NOERROR}
+    - {rule_set: [geosite-openai, ai], query_type: [A, AAAA], server: fakeip-ai}
+    - {rule_set: [geosite-openai, ai], server: ai}
+    - {query_type: [AAAA], action: predefined, rcode: NOERROR}
+    - {rule_set: emby, server: emby}
+    - {rule_set: geosite-telegram, server: telegram}
+    - {rule_set: geosite-spotify, server: proxy}
+    - {rule_set: proxy, server: proxy}
+    - {rule_set: [direct, geosite-private, geosite-cn], server: domestic}
+    - {rule_set: geosite-category-ads-all, action: predefined, rcode: NXDOMAIN}
+    - {rule_set: geosite-geolocation-!cn, server: proxy}
+    - {action: evaluate, server: proxy}
+    - {match_response: true, rule_set: geoip-cn, server: domestic}
+    - {action: respond}
     final: proxy
     strategy: ipv4_only
-    # 记下"IP → 域名"，嗅探不出域名的连接也能按域名规则分流。
     reverse_mapping: true
-
-  # 规则集通过代理下载（未指定 http_client 时使用第一个）。
-  http_clients:
-    - {tag: via-proxy, detour: Available}
-
+  # 业务先于国内兜底和通用广告；DNS 与路由共同维护相同的域名优先关系。
   route:
     auto_detect_interface: true
-    # 节点域名、直连出站拨号时的域名，都用国内解析器，不依赖任何节点。
-    default_domain_resolver: domestic
+    default_domain_resolver: {server: domestic, timeout: 2s}
     rules:
-      - {action: sniff}
-      - {protocol: dns, action: hijack-dns}
-      # mixed 入站收到的是域名：先按上面的 DNS 规则解析成 IP，之后的分流就和
-      # TUN 进来的流量完全一样。
-      - {only: desktop, inbound: mixed-in, action: resolve}
-      - {ip_is_private: true, outbound: direct}
-      - {ip_version: 6, action: reject}
-      - {protocol: bittorrent, outbound: direct}
-      # SSH 直连：多数机场出口封 22 端口，走代理会在握手阶段被断开。
-      - {port: 22, outbound: direct}
-      # NTP 校时直连：避免部分设备硬编码 IP 的 UDP 123 走代理被机场拦截导致时间错乱。
-      - {network: udp, port: 123, outbound: direct}
-      # 阻断 QUIC/UDP 443：强制所有 HTTP/3 握手即刻回退至 TCP (TLS 1.3)，杜绝代理侧初次加载卡顿与丢包。
-      - {network: udp, port: 443, action: reject}
-      - {rule_set: block, action: reject}
-
-      - only: desktop
-        process_name: [WinStore.App.exe, MicrosoftStore.exe, StoreExperienceHost.exe]
-        outbound: Available
-      - only: desktop
-        rule_set: microsoft-store
-        outbound: Available
-      - only: android
-        package_name: [com.android.vending, com.google.android.gms, com.google.android.gsf]
-        outbound: Google Play
-      - only: android
-        rule_set: geosite-google-play
-        outbound: Google Play
-
-      # 业务分组。必须排在 proxy 名单之前：youtubei.googleapis.com、
-      # generativelanguage.googleapis.com 等同时命中名单里的 googleapis.com。
-      - {rule_set: geosite-youtube, outbound: YouTube}
-      - {rule_set: geosite-twitch, outbound: Twitch}
-      - {rule_set: [geosite-anthropic, geosite-openai, ai], outbound: AI}
-      # Anthropic 自有 IP 段（RDAP: NET-160-79-104-0-1 / ANTHROPIC-V6）兜底。
-      # 放在 AI 域名规则正后面：域名没枚举到的（ECH、硬编码 IP、新域名）也能
-      # 进 AI 分组，不至于掉到 Available 造成"同一账号两个出口"。
-      # IPv6 段不列：上面已有 ip_version 6 → reject。ip_cidr 直接比对连接
-      # 目标 IP，sing-box 没有 IP-CIDR 的 no-resolve 字段，写了会启动失败。
-      - ip_cidr: ["160.79.104.0/21"]
-        outbound: AI
-      - {rule_set: emby, outbound: Emby}
-      - {rule_set: geosite-telegram, outbound: Telegram}
-      # Telegram 数据中心 IPv4（https://core.telegram.org/resources/cidr.txt）
-      - ip_cidr:
-          - 91.105.192.0/23
-          - 91.108.4.0/22
-          - 91.108.8.0/22
-          - 91.108.12.0/22
-          - 91.108.16.0/22
-          - 91.108.20.0/22
-          - 91.108.56.0/22
-          - 149.154.160.0/20
-          - 185.76.151.0/24
-        outbound: Telegram
-      - {rule_set: proxy, outbound: Available}
-      - {rule_set: geosite-spotify, outbound: Spotify}
-
-      - {rule_set: direct, outbound: direct}
-      - {rule_set: geosite-private, outbound: direct}
-      - {rule_set: geosite-cn, outbound: direct}
-      # 广告拦截排在业务与直连名单之后：上游广告名单偶尔会收进它们依赖的主机。
-      - {rule_set: geosite-category-ads-all, action: reject}
-      - {rule_set: geosite-geolocation-!cn, outbound: Available}
-      - {rule_set: geoip-cn, outbound: direct}
+    - {action: sniff}
+    # 端口兜底避免未识别的 TCP/UDP DNS 落到局域网或国内直连。
+    - {type: logical, mode: or, rules: [{protocol: dns}, {port: 53}], action: hijack-dns}
+    # 在所有业务/私网/国内直连规则前阻断 STUN 与外部 DoT/DoQ。
+    # STUN 使用协议识别，覆盖非标准端口；853 同时覆盖 TCP 和 UDP。
+    - {protocol: stun, action: reject}
+    - {port: 853, action: reject}
+    - {rule_set: block, action: reject}
+    - {domain: *claude-ipv4-resources, network: udp, port: 443, action: reject}
+    - {domain: *claude-ipv4-resources, ip_version: 6, action: reject}
+    - {domain: *claude-ipv4-resources, outbound: Aether-US}
+    - {domain: *public-ai-resources, network: udp, port: 443, action: reject}
+    - {domain: *public-ai-resources, ip_version: 6, action: reject}
+    - {domain: *public-ai-resources, outbound: Available}
+    - {network: udp, port: 443, rule_set: [geosite-anthropic, claude], action: reject}
+    - {network: udp, port: 443, ip_cidr: [160.79.104.0/21, '2607:6bc0::/32'], action: reject}
+    - {only: android, package_name: [com.anthropic.claude], network: udp, port: 443, action: reject}
+    - {rule_set: [geosite-anthropic, claude], outbound: Claude}
+    - {ip_cidr: [160.79.104.0/21, '2607:6bc0::/32'], outbound: Claude}
+    - {only: android, package_name: [com.anthropic.claude], outbound: Claude}
+    - {ip_is_private: true, outbound: direct}
+    - {protocol: bittorrent, outbound: direct}
+    - {network: udp, port: 123, outbound: direct}
+    - {only: desktop, process_name: [WinStore.App.exe, MicrosoftStore.exe, StoreExperienceHost.exe], outbound: Available}
+    - {only: desktop, rule_set: microsoft-store, outbound: Available}
+    - {only: android, network: udp, port: 443, rule_set: [geosite-google-play, google-play], action: reject}
+    - {only: android, rule_set: [geosite-google-play, google-play], outbound: Google Play}
+    - {only: android, package_name: [com.android.vending], network: udp, port: 443, action: reject}
+    - {only: android, package_name: [com.android.vending], outbound: Google Play}
+    - domain_suffix:
+      - youtube.com
+      - youtu.be
+      - yt.be
+      - youtube-nocookie.com
+      - youtubekids.com
+      - ytimg.com
+      - googlevideo.com
+      - youtubei.googleapis.com
+      - youtube.googleapis.com
+      - yt3.ggpht.com
+      - yt4.ggpht.com
+      - yt3.googleusercontent.com
+      - yt4.googleusercontent.com
+      network: udp
+      port: 443
+      action: reject
+    - domain_suffix:
+      - youtube.com
+      - youtu.be
+      - yt.be
+      - youtube-nocookie.com
+      - youtubekids.com
+      - ytimg.com
+      - googlevideo.com
+      - youtubei.googleapis.com
+      - youtube.googleapis.com
+      - yt3.ggpht.com
+      - yt4.ggpht.com
+      - yt3.googleusercontent.com
+      - yt4.googleusercontent.com
+      ip_version: 6
+      action: reject
+    - {network: udp, port: 443, rule_set: geosite-youtube, action: reject}
+    - {ip_version: 6, rule_set: geosite-youtube, action: reject}
+    - domain_suffix:
+      - youtube.com
+      - youtu.be
+      - yt.be
+      - youtube-nocookie.com
+      - youtubekids.com
+      - ytimg.com
+      - googlevideo.com
+      - youtubei.googleapis.com
+      - youtube.googleapis.com
+      - yt3.ggpht.com
+      - yt4.ggpht.com
+      - yt3.googleusercontent.com
+      - yt4.googleusercontent.com
+      outbound: YouTube
+    - {rule_set: geosite-youtube, outbound: YouTube}
+    - {network: udp, port: 443, rule_set: geosite-twitch, action: reject}
+    - {ip_version: 6, rule_set: geosite-twitch, action: reject}
+    - {rule_set: geosite-twitch, outbound: Twitch}
+    - {domain_suffix: [time.google.com], outbound: direct}
+    - {network: udp, port: 443, rule_set: [geosite-google, google], action: reject}
+    - {rule_set: [geosite-google, google], outbound: Google}
+    - {network: udp, port: 443, rule_set: [geosite-openai, ai], action: reject}
+    - {rule_set: [geosite-openai, ai], outbound: AI}
+    - {rule_set: emby, outbound: Emby}
+    - {rule_set: geosite-telegram, outbound: Telegram}
+    - ip_cidr:
+      - 91.105.192.0/23
+      - 91.108.4.0/22
+      - 91.108.8.0/22
+      - 91.108.12.0/22
+      - 91.108.16.0/22
+      - 91.108.20.0/22
+      - 91.108.56.0/22
+      - 149.154.160.0/20
+      - 185.76.151.0/24
+      - 2001:b28:f23d::/48
+      - 2001:b28:f23f::/48
+      - 2001:67c:4e8::/48
+      - 2001:b28:f23c::/48
+      - 2a0a:f280::/32
+      outbound: Telegram
+    - {rule_set: geosite-spotify, outbound: Spotify}
+    - {rule_set: proxy, outbound: Available}
+    - {only: android, package_name: [com.google.android.gms, com.google.android.gsf], outbound: Google Play}
+    - {only: desktop, inbound: mixed-in, action: resolve}
+    - {ip_is_private: true, outbound: direct}
+    - {rule_set: direct, outbound: direct}
+    - {rule_set: geosite-private, outbound: direct}
+    - {rule_set: geosite-cn, outbound: direct}
+    - {rule_set: geoip-cn, outbound: direct}
+    - {network: udp, port: 443, action: reject}
+    - {ip_version: 6, action: reject}
+    - {rule_set: geosite-category-ads-all, action: reject}
+    - {rule_set: geosite-geolocation-!cn, outbound: Available}
     final: Available

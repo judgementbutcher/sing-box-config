@@ -1,12 +1,6 @@
 # 代理名单：代理侧解析 + 走 Available。一行一个域名后缀，# 开头是注释。
 # 只有被直连名单或 geosite-cn 收走、却需要走代理的域名才用写进来；
 # 其他海外域名本来就走代理。
-
-# Google 通用域名：geosite-cn 里收有 dl.google.com、fonts.googleapis.com 等
-# "国内可达"的 Google 域名，写在这里保证 Google 全家都走代理。
-google.com
-google.com.hk
-gmail.com
-gstatic.com
-googleapis.com
-googleusercontent.com
+#
+# Google 账号生态域名归入 google.txt，Android Play 域名归入 google-play.txt。如需强制特定域名走代理，可直接在此追加：
+proxy-list.invalid

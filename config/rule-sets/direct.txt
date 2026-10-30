@@ -1,23 +1,13 @@
-# 直连名单：国内解析 + 直连出站。一行一个域名后缀，# 开头是注释。
-# 名单外的域名不需要写进来：国内解析结果落在中国大陆 IP 段的会自动直连。
-
-# 中国顶级域（.cn / .com.cn / .中国），不依赖 geosite-cn 的更新进度
 cn
 xn--fiqs8s
-
-# 自建 Emby（Cloudflare 代理，国内直连可达）
 emby.kingemby.com
 media.wybcs.work
-
-# 校时
 time.windows.com
 time.nist.gov
 ntp.org
 time.apple.com
 time.android.com
 time.google.com
-
-# 系统更新与游戏下载 CDN：国内有节点，直连更快
 windowsupdate.com
 update.microsoft.com
 windowsupdate.microsoft.com
@@ -33,3 +23,31 @@ steamcdn-a.akamaihd.net
 steamuserimages-a.akamaihd.net
 steamcloud-ugc.akamaihd.net
 steampipe.akamaized.net
+umeng.com
+umengcloud.com
+jpush.cn
+jpush.io
+getui.com
+gepush.com
+igexin.com
+bugly.qq.com
+talkingdata.net
+mob.com
+amap.com
+autonavi.com
+alipayobjects.com
+alicdn.com
+qpic.cn
+gtimg.com
+xiaomi.com
+mi.com
+mi-img.com
+huawei.com
+dbankcdn.com
+vmall.com
+oppo.com
+coloros.com
+vivo.com
+honor.com
+hihonor.com
+flyme.cn

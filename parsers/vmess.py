@@ -72,7 +72,7 @@ def parse_uri(uri: str) -> Dict[str, Any]:
         "domain_resolver": "local",
     }
 
-    if parse_bool(data.get("tls")):
+    if str(data.get("tls") or "").strip().lower() == "tls" or parse_bool(data.get("tls")):
         tls_obj: Dict[str, Any] = {
             "enabled": True,
             "server_name": first_non_empty(

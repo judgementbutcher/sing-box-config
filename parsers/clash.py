@@ -44,6 +44,18 @@ def parse_alpn(value: Any) -> List[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
+def parse_hysteria2_ports(value: Any) -> List[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else str(value).split(",")
+    ports: List[str] = []
+    for item in items:
+        port = str(item).strip().replace("-", ":")
+        if port:
+            ports.append(port)
+    return ports
+
+
 def first_mapping_value(mapping: Dict[str, Any], *keys: str) -> Optional[str]:
     for key in keys:
         value = mapping.get(key)
@@ -389,8 +401,9 @@ def clash_hysteria2_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     server = node.get("server")
     port = node.get("port")
+    ports = parse_hysteria2_ports(node.get("ports") or node.get("mport"))
     password = node.get("password")
-    if not server or not port or password is None:
+    if not server or (not port and not ports) or password is None:
         return None
 
     tls_obj: Dict[str, Any] = {
@@ -408,13 +421,16 @@ def clash_hysteria2_to_singbox(node: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "type": "hysteria2",
         "tag": name,
         "server": server,
-        "server_port": int(port),
         "password": str(password),
         "domain_resolver": "local",
         "tls": tls_obj,
         "_meta_name": name,
         "_meta_region": detect_region(name),
     }
+    if ports:
+        outbound["server_ports"] = ports
+    else:
+        outbound["server_port"] = int(port)
 
     obfs_type = first_non_empty(node.get("obfs"), node.get("obfs-type"), node.get("obfs_type"))
     obfs_password = first_non_empty(node.get("obfs-password"), node.get("obfs_password"))

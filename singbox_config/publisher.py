@@ -18,10 +18,11 @@ from contextlib import closing
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from ipaddress import IPv4Address, IPv4Network, ip_network
+from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, quote, urlsplit
+from .release_manager import FileLock, ReleaseError, active_release, validate_release, _legacy_check
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,12 +179,16 @@ def log_event(message: str, log_path: Path | None = None) -> None:
         pass
 
 
+def read_credentials(path: Path) -> dict[str, str]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and data.get("username") and data.get("password"):
+        return {"username": str(data["username"]), "password": str(data["password"])}
+    raise ValueError("发布凭据格式无效；请检查私有凭据文件，不要公开其内容。")
+
+
 def load_or_create_credentials(path: Path, rotate: bool = False) -> dict[str, str]:
     if path.is_file() and not rotate:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("username") and data.get("password"):
-            return {"username": str(data["username"]), "password": str(data["password"])}
-        raise ValueError(f"发布凭据格式无效: {path}")
+        return read_credentials(path)
     credentials = {
         "username": "sfa",
         "password": secrets.token_urlsafe(24),
@@ -279,11 +284,13 @@ class ValidatedConfigStore:
 
 def publication_urls(host: str, port: int, credentials: Mapping[str, str] | None = None) -> dict[str, str]:
     android = f"http://{host}:{port}/android/config.json"
+    desktop = f"http://{host}:{port}/desktop/config.json"
     if credentials:
         android = f"{android}?token={quote(str(credentials['password']), safe='')}"
+        desktop = f"{desktop}?token={quote(str(credentials['password']), safe='')}"
     return {
         "桌面/SFW（本机首选）": f"http://127.0.0.1:{port}/desktop/config.json",
-        "桌面/SFW（局域网）": f"http://{host}:{port}/desktop/config.json",
+        "桌面/SFW（局域网）": desktop,
         "安卓/SFA": android,
     }
 
@@ -295,22 +302,32 @@ def print_publication_info(
     *,
     source: str = "",
     warning: str = "",
+    reveal: bool = False,
+    access_log: Path = DEFAULT_ACCESS_LOG,
 ) -> None:
-    print("\n配置发布地址与凭据：", flush=True)
-    for name, url in publication_urls(host, port, credentials).items():
+    print("\n配置发布信息：", flush=True)
+    if reveal:
+        print("  注意：以下链接和凭据可读取含节点密钥的配置，不要截图或公开分享。", flush=True)
+    for name, url in publication_urls(host, port, credentials if reveal else None).items():
+        if not reveal and name != "桌面/SFW（本机首选）":
+            url += " （仅路径，导入还需要访问令牌）"
         print(f"  {name}: {url}", flush=True)
-    print(f"  用户名: {credentials['username']}", flush=True)
-    print(f"  密码:   {credentials['password']}", flush=True)
+    if reveal:
+        print(f"  用户名: {credentials['username']}", flush=True)
+        print(f"  密码:   {credentials['password']}", flush=True)
+        print("  安卓链接已附带访问令牌，可直接粘贴。", flush=True)
+    else:
+        print("  凭据已隐藏。请在另一个管理窗口选择“发布与设备导入 → 显示导入链接”，", flush=True)
+        print("  或运行 manage.ps1 -Action show-info；不会轮换现有凭据。", flush=True)
     if source:
         print(f"  地址来源: {source}", flush=True)
     if warning:
         print(f"  警告: {warning}", flush=True)
-    print("  安卓链接已附带访问令牌，可直接粘贴；客户端若分开填写，请用上面的用户名和密码。", flush=True)
-    print("  桌面链接不需要认证。", flush=True)
-    print("  手机与电脑必须在同一局域网（同一 Wi-Fi/热点），且地址不是 TUN/虚拟网卡地址。", flush=True)
+    print("  仅回环桌面访问免认证；其他电脑请使用带令牌链接或手动导入。", flush=True)
+    print("  手机/外部设备与电脑必须在同一局域网（同一 Wi-Fi/热点），且地址不是 TUN/虚拟网卡地址。", flush=True)
     print("  若 SFA 报 EOF 或连接被重置：先在 SFA 内断开 VPN 再导入/刷新；", flush=True)
     print("  也可把 dist\\android\\config.json 传到手机作为本地配置导入（一次性）。", flush=True)
-    print(f"  拉取记录与中断原因: {DEFAULT_ACCESS_LOG}", flush=True)
+    print(f"  拉取记录与中断原因: {access_log}", flush=True)
 
 
 def parse_excluded_tcp_ranges(output: str) -> tuple[tuple[int, int], ...]:
@@ -448,10 +465,16 @@ class PublisherHandler(BaseHTTPRequestHandler):
 
     def serve(self, include_body: bool) -> None:
         request_path = urlsplit(self.path).path
+        # Resolve the pointer once for the entire request, including healthz.
+        try:
+            paths, build_id = self.app.config_paths()
+        except (OSError, ValueError, ReleaseError, KeyError, TypeError):
+            self.send_text_error(HTTPStatus.SERVICE_UNAVAILABLE, "活动版本完整性检查失败", include_body)
+            return
         if request_path == "/healthz":
             results = {
                 path: self.app.store.snapshot(config_path, stamp_path).ok
-                for path, (config_path, stamp_path) in self.app.paths.items()
+                for path, (config_path, stamp_path) in paths.items()
             }
             body = json.dumps({"ok": all(results.values()), "configs": results}).encode("utf-8")
             status = HTTPStatus.OK if all(results.values()) else HTTPStatus.SERVICE_UNAVAILABLE
@@ -463,14 +486,11 @@ class PublisherHandler(BaseHTTPRequestHandler):
             if include_body:
                 self.wfile.write(body)
             return
-        item = self.app.paths.get(request_path)
+        item = paths.get(request_path)
         if item is None:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        # SFW's remote-config updater does not send HTTP Basic Auth headers.
-        # Keep Android protected, but allow the desktop endpoint so published
-        # configs can be refreshed directly from SFW.
-        if request_path != "/desktop/config.json" and not self.authenticated():
+        if not self.desktop_loopback_exemption(request_path, self.client_address[0]) and not self.authenticated():
             self.challenge()
             return
         config_path, stamp_path = item
@@ -485,9 +505,18 @@ class PublisherHandler(BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Sing-Box-Config-SHA256", snapshot.sha256)
+        if build_id:
+            self.send_header("X-Sing-Box-Build-ID", build_id)
         self.end_headers()
         if include_body:
             self.wfile.write(body)
+
+    @staticmethod
+    def desktop_loopback_exemption(path: str, address: str) -> bool:
+        try:
+            return path == "/desktop/config.json" and ip_address(address).is_loopback
+        except ValueError:
+            return False
 
     def do_GET(self) -> None:  # noqa: N802
         self.serve(True)
@@ -510,6 +539,7 @@ class PublisherServer(ThreadingHTTPServer):
         desktop_stamp: Path,
         credentials: Mapping[str, str],
         access_log: Path | None = None,
+        runtime_root: Path | None = None,
     ):
         super().__init__(address, PublisherHandler)
         self.paths = {
@@ -520,6 +550,24 @@ class PublisherServer(ThreadingHTTPServer):
         self.password = credentials["password"]
         self.store = ValidatedConfigStore()
         self.access_log = access_log if access_log is not None else DEFAULT_ACCESS_LOG
+        self.runtime_root = runtime_root
+        self._release_lock = threading.RLock()
+        self._checked_release: Path | None = None
+
+    def config_paths(self) -> tuple[dict[str, tuple[Path, Path]], str]:
+        if self.runtime_root is None:
+            return self.paths, ""
+        with self._release_lock:
+            release = active_release(self.runtime_root, validate=False)
+            if release is None:
+                _legacy_check(self.paths["/desktop/config.json"][0].parent.parent)
+                return self.paths, ""
+            if release != self._checked_release:
+                validate_release(release)
+                self.store = ValidatedConfigStore()
+                self._checked_release = release
+            return {f"/{p}/config.json": (release / p / "config.json", release / p / "config.validated.json")
+                    for p in ("desktop", "android")}, release.name
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Log a phone aborting its own fetch in one line instead of a traceback."""
@@ -569,22 +617,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--desktop-stamp", type=Path, default=DEFAULT_DESKTOP_STAMP)
     parser.add_argument("--credentials", type=Path, default=DEFAULT_CREDENTIALS)
     parser.add_argument("--access-log", type=Path, default=DEFAULT_ACCESS_LOG)
+    parser.add_argument("--runtime-root", type=Path, default=ROOT / "runtime")
     parser.add_argument("--rotate-credentials", action="store_true")
     parser.add_argument("--show-info", action="store_true")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    credentials = load_or_create_credentials(args.credentials.resolve(), rotate=args.rotate_credentials)
+def _main(args: argparse.Namespace) -> int:
+    if args.rotate_credentials and publisher_running("127.0.0.1", args.port):
+        print("拒绝轮换：请先停止现有发布器，再轮换并重新启动。凭据未更改。", flush=True)
+        return 1
+    if args.show_info and not args.rotate_credentials:
+        if not args.credentials.is_file():
+            print("尚无发布凭据。请先启动发布器；查看信息不会创建凭据或启动服务。", flush=True)
+            return 1
+        credentials = read_credentials(args.credentials.resolve())
+    else:
+        credentials = load_or_create_credentials(args.credentials.resolve(), rotate=args.rotate_credentials)
     address_host, source, warning = resolve_advertised_host(args)
     port = args.port
     if args.rotate_credentials or args.show_info:
-        print_publication_info(address_host, port, credentials, source=source, warning=warning)
-        if publisher_running("127.0.0.1", port):
-            print("状态: 发布服务正在监听；请确认手机与电脑处于可互访的网络。", flush=True)
+        print_publication_info(address_host, port, credentials, source=source, warning=warning,
+                               reveal=True, access_log=args.access_log)
+        if args.rotate_credentials:
+            print("凭据已轮换。请重新启动发布器，并更新所有设备保存的远程导入链接。", flush=True)
         else:
-            print("状态: 发布服务未运行。请先在管理菜单中选择“启动发布”，并保持该窗口运行。", flush=True)
+            print("仅显示导入信息，未发送 HTTP 探针；地址不代表服务正在运行或手机已可访问。", flush=True)
         return 0
 
     if publisher_running("127.0.0.1", port):
@@ -605,18 +663,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.desktop_stamp.resolve(),
             credentials,
             args.access_log.resolve(),
+            args.runtime_root.resolve(),
         )
     except OSError as exc:
         blocked = next((f"{start}-{end}" for start, end in excluded_tcp_ranges() if start <= port <= end), "")
         where = f"它落在 Windows 保留段 {blocked}。" if blocked else ""
         print(
             f"状态: 无法监听 {args.host}:{port}（{exc}）。{where}"
-            "发布端口保持不变。请允许管理脚本的管理员授权，让 Windows 把这个端口留出来。",
+            "发布端口保持不变。请手动诊断端口占用/保留和防火墙；不会自动修改 WinNAT。",
             flush=True,
         )
         return 1
-    print_publication_info(address_host, server.server_port, credentials, source=source, warning=warning)
-    print("状态: 发布服务正在监听。按 Ctrl+C 停止发布。\n", flush=True)
+    print_publication_info(address_host, server.server_port, credentials, source=source, warning=warning,
+                           access_log=args.access_log)
+    print("状态: 发布服务正在监听。本窗口保持前台运行；继续管理请另开窗口，Ctrl+C 停止发布。\n", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -624,6 +684,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         server.server_close()
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.show_info and not args.rotate_credentials:
+            return _main(args)
+        # Shared by startup and rotation, held for the server lifetime. Another
+        # server with the same credentials cannot evade rotation via a new port.
+        with FileLock(args.credentials.resolve().with_suffix(".lock")):
+            return _main(args)
+    except (OSError, ValueError, ReleaseError) as exc:
+        print(f"发布器操作未完成：{type(exc).__name__}。请检查凭据文件、路径权限和服务占用；"
+              "不会输出敏感异常内容。", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
